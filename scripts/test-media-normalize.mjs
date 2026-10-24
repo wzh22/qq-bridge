@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   MEDIA_DEFAULTS,
   describeImage,
@@ -23,6 +24,7 @@ import {
   sniffImage
 } from '../src/media-normalize.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
+import { resolveFfmpeg } from '../src/voice-core.js';
 
 let failures = 0;
 let skipped = 0;
@@ -50,9 +52,13 @@ const FAKE_GATEWAY_PNG = Buffer.from(
 );
 
 const hasFfmpeg = (() => {
-  try { return spawnSync('ffmpeg', ['-v', 'error', '-version'], { stdio: 'ignore' }).status === 0; }
+  // 用 resolveFfmpeg 而不是裸 'ffmpeg'：它会去找仓库内的便携版 tools/ffmpeg/ffmpeg.exe，
+  // 否则「仓库自带 ffmpeg」这件事在测试里完全体现不出来，两个真 ffmpeg 用例会永远 SKIP。
+  const exe = resolveFfmpeg({});
+  try { return spawnSync(exe, ['-v', 'error', '-version'], { stdio: 'ignore' }).status === 0; }
   catch { return false; }
 })();
+const ffmpegBin = resolveFfmpeg({});
 
 // ── 1. 格式/帧数探测（纯函数） ─────────────────────────────────────────────
 await test('sniffImage 认出 PNG 并读取尺寸/透明通道', async () => {
@@ -157,8 +163,13 @@ await test('normalizeImageForModel：压不动的垃圾字节 ⇒ ok:false 且�
 });
 
 // ── 4. 真实 ffmpeg：抽帧拼图 / 降采样（没装 ffmpeg 就跳过） ─────────────────
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qqb-media-test-'));
-const ff = (args) => spawnSync('ffmpeg', ['-v', 'error', '-y', ...args], { stdio: 'ignore' });
+// 夹具目录：**不能**用 os.tmpdir() —— 本机实测 ffmpeg 子进程写不进 %TEMP%
+// （Permission denied；node 自己却能写），两个真 ffmpeg 用例于是永远 SKIP。
+// 放在仓库 state/ 下，与 media-normalize 默认临时工作区同一盘、同一权限上下文。
+const tmpRoot = path.join(fileURLToPath(new URL('..', import.meta.url)), 'state');
+fs.mkdirSync(tmpRoot, { recursive: true });
+const tmp = fs.mkdtempSync(path.join(tmpRoot, 'qqb-media-test-'));
+const ff = (args) => spawnSync(ffmpegBin, ['-v', 'error', '-y', ...args], { stdio: 'ignore' });
 
 await test('真实动图 → 抽帧拼图（单张 JPEG + 帧数说明）', async () => {
   if (!hasFfmpeg) throw skip('本机没有 ffmpeg');
@@ -199,19 +210,46 @@ await test('真实大图（3000×2000）→ 降采样到长边上限以内', asy
   assert.match(out.note, /→/);
 });
 
-await test('抽帧失败（ffmpeg 超时/不可用）也不崩：退回首帧 + 说明', async () => {
-  // 注意：不能靠「把 ffmpegPath 指到不存在的文件」来模拟不可用 —— resolveFfmpeg 在候选路径
-  // 都不存在时会回退到 PATH 里的 ffmpeg（这是语音功能就有的既定行为）。这里用 1ms 硬超时
-  // 让调用必然失败，验证的是**失败路径的契约**：不抛异常、小图按原样提供、note 说清原因。
-  const out = await normalizeImageForModel(GIF_2, 'image/gif', {
+await test('抽帧失败（ffmpeg 超时/不可用）→ 纯 JS 兜底仍出网格', async () => {
+  // 不能靠「把 ffmpegPath 指到不存在的文件」来模拟不可用 —— resolveFfmpeg 在候选路径
+  // 都不存在时会继续找环境变量 / 仓库内便携版 / PATH（这是语音功能就有的既定行为）。
+  // 这里用 1ms 硬超时让 ffmpeg 必然失败，验证的是失败路径的契约：
+  // ① 有兜底时，GIF 仍要拼成网格（2026-10-24 新增的零依赖路径）；
+  // ② 兜底关掉时，退回「小图按原样提供 + 说明只提供首帧」。
+  const withFallback = await normalizeImageForModel(GIF_2, 'image/gif', {
     ...MEDIA_DEFAULTS, tmpDir: tmp, timeoutMs: 1
   });
-  assert.equal(out.ok, true);
-  assert.equal(out.buffer, GIF_2, '压不动时小图按原样提供（不阻断对话）');
-  assert.match(out.note, /只提供首帧/);
+  assert.equal(withFallback.ok, true);
+  assert.equal(withFallback.mimeType, 'image/png', '兜底产物是纯 JS 编码的 PNG');
+  assert.match(withFallback.note, /动图 2 帧/);
+  assert.match(withFallback.note, /网格/);
+  assert.equal(sniffImage(withFallback.buffer)?.frames, 1, '拼图结果必须是单帧');
+
+  const withoutFallback = await normalizeImageForModel(GIF_2, 'image/gif', {
+    ...MEDIA_DEFAULTS, tmpDir: tmp, timeoutMs: 1, jsGifFallback: false
+  });
+  assert.equal(withoutFallback.ok, true);
+  assert.equal(withoutFallback.buffer, GIF_2, '兜底关掉时压不动的小图按原样提供（不阻断对话）');
+  assert.match(withoutFallback.note, /只提供首帧/);
 });
 
 // ── 5. 桥接集成：出图出口会归一化，收藏表情仍拿原始字节 ────────────────────
+await test('normalizeImageForModel：默认临时目录必须让 ffmpeg 真的写得进去', async () => {
+  // 回归：2026-10-24 实测本机 %TEMP% 对 ffmpeg 子进程是 Permission denied（node 自己却能写），
+  // 于是 makeTempWorkspace 默认放 os.tmpdir() 时，**装了 ffmpeg 也必然失败**，
+  // 日志里只有一句「ffmpeg 退出码 1」，看不出是权限问题。
+  // 这里不加 tmpDir，直接用默认选择逻辑，断言拼图真的成功且来自 ffmpeg（JPEG）。
+  if (!hasFfmpeg) throw skip('本机没有 ffmpeg');
+  const gif = path.join(tmp, 'default-dir.gif');
+  const made = ff(['-f', 'lavfi', '-i', 'testsrc2=size=120x90:rate=6:duration=1', '-vf',
+    'split[a][b];[a]palettegen[p];[b][p]paletteuse', gif]);
+  if (made.status !== 0) throw skip('ffmpeg 生成夹具失败');
+  const out = await normalizeImageForModel(fs.readFileSync(gif), 'image/gif', { ...MEDIA_DEFAULTS });
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.mimeType, 'image/jpeg', '默认目录下 ffmpeg 必须能写出 JPEG，而不是退到纯 JS 的 PNG');
+  assert.match(out.note, /网格/);
+});
+
 await test('桥接 fetchMediaData 走归一化，且拿得到 mimeType/data', async () => {
   const h = await bridgeHarness();
   try {

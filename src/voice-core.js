@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 /** 网关能直接吃进去的音频扩展名（SnowLuma 会自动转 SILK）。 */
 export const AUDIO_EXTS = [
@@ -329,18 +330,23 @@ export function resolveAudioProcessing({ volume = 1, normalize = false, loudness
 }
 
 /**
- * 定位 ffmpeg：显式参数 → 环境变量 → PATH。
+ * 定位 ffmpeg：显式参数 → 环境变量 → 仓库内便携版 → PATH。
  *
  * 优先级按**实现**写文档：config.json 的 socialV2.voice.ffmpegPath 是"这台机器上 ffmpeg 在哪"的
  * 显式配置，比环境变量更具体，所以参数优先（旧注释写成"环境变量 → 参数"，与代码相反，
  * 照着注释去改代码就会把用户的显式配置降级成环境变量兜底）。
  *
- * 只返回**确实存在**的文件路径。两个候选都没 stat 成功时返回裸命令名 'ffmpeg'，交给 spawn 按 PATH
+ * 「仓库内便携版」（2026-10-24 新增）：`<repo>/tools/ffmpeg/ffmpeg.exe`。
+ * 起因是本机 `where ffmpeg` 为空，动图抽帧全线退化成首帧（state/bridge.log 有据）。
+ * 让仓库自带一份，拷贝整个目录就能用，也不必污染系统 PATH —— 但**显式配置仍然优先**，
+ * 想用系统的 ffmpeg 只要写 config 或设 FFMPEG_PATH 即可。
+ *
+ * 只返回**确实存在**的文件路径。所有候选都没 stat 成功时返回裸命令名 'ffmpeg'，交给 spawn 按 PATH
  * 解析；旧实现在这种情况下返回 `candidates[0]`，哪怕那个路径根本不存在 —— 调用方于是拿到一句
  * 无信息量的"启动失败"，而不是 ENOENT 分支里那句"请设置 FFMPEG_PATH 或在 config.json 里指定"。
  */
 export function resolveFfmpeg({ ffmpegPath = null, envVar = 'FFMPEG_PATH' } = {}) {
-  const candidates = [ffmpegPath, process.env[envVar]].filter(Boolean);
+  const candidates = [ffmpegPath, process.env[envVar], ...portableFfmpegCandidates()].filter(Boolean);
   for (const c of candidates) {
     try {
       if (fs.statSync(c).isFile()) return c;
@@ -349,6 +355,23 @@ export function resolveFfmpeg({ ffmpegPath = null, envVar = 'FFMPEG_PATH' } = {}
   // PATH 里找（不真正执行，交给 spawn 时再报错）；绝不再回退到不存在的候选路径。
   return 'ffmpeg';
 }
+
+/**
+ * 仓库内便携版 ffmpeg 的候选路径（只算路径，不保证存在）。
+ *
+ * 兼容两种目录布局：源码运行（src/ 的上一级）与将来可能的分发布局。
+ * `fileURLToPath` 而不是 `new URL().pathname`：Windows 盘符会被编码成 /E:/…，stat 必然失败。
+ */
+function portableFfmpegCandidates() {
+  const exe = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  let here = '';
+  try { here = path.dirname(fileURLToPath(import.meta.url)); } catch { return []; }
+  return [
+    path.join(here, '..', 'tools', 'ffmpeg', exe),
+    path.join(here, '..', 'tools', exe)
+  ];
+}
+
 
 /**
  * 用 ffmpeg 调整音量/响度，产出**新文件**。

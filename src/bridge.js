@@ -7611,6 +7611,7 @@ async function main() {
       gifFrames: m.gifFrames,
       gifTile: m.gifTile,
       timeoutMs: m.normalizeTimeoutMs,
+      jsGifFallback: m.jsGifFallback !== false,
       ffmpegPath: process.env.FFMPEG_PATH || cfg.socialV2?.voice?.ffmpegPath || null
     };
   })();

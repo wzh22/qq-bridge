@@ -27,14 +27,17 @@
 // · **ffmpeg 缺失也不硬塞**：超线又压不动的，宁可回一句「太大，看不了」，也不发注定被 DSH 丢掉
 //   的字节（那样模型只会看到一行看不懂的错误）。
 //
-// 依赖：只用 node 内置 + voice-core 的 resolveFfmpeg（ffmpeg 定位的唯一实现）。
+// 依赖：只用 node 内置 + voice-core 的 resolveFfmpeg（ffmpeg 定位的唯一实现）
+//       + gif-codec.js 的纯 JS GIF 解码（ffmpeg 不可用时的零依赖兜底）。
 // 子进程一律 `stdio: 'ignore'` + 写文件：受限沙箱里 pipe 会 EPERM（见 voice-core.js 开头的说明）。
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { resolveFfmpeg } from './voice-core.js';
+import { gifToGrid } from './gif-codec.js';
 
 /** 默认值集中一处，bridge.js 只做 config 覆盖（见 modelMediaLimits）。 */
 export const MEDIA_DEFAULTS = Object.freeze({
@@ -48,7 +51,10 @@ export const MEDIA_DEFAULTS = Object.freeze({
   // 每一格的目标宽度（px）：240 一格，3×2 拼图约 736×492，实测 92 KB。
   gifTile: 240,
   // 单张 ffmpeg 调用的硬超时。实测 200 帧 GIF 拼图 269 ms、4K 重编码 < 1 s，25 s 是兜底。
-  timeoutMs: 25000
+  timeoutMs: 25000,
+  // 纯 JS GIF 解码兜底（ffmpeg 没装/被拦/超时时用）。默认开：它没有外部依赖，
+  // 关掉只会让「没 ffmpeg 的机器」重新退回「只看第一帧」的老毛病。
+  jsGifFallback: true
 });
 
 /** 硬上限：不管 config 怎么写，都不允许超过 DSH 的实测炸栈线下沿。 */
@@ -311,8 +317,65 @@ function runFfmpeg(ffmpeg, args, { timeoutMs = MEDIA_DEFAULTS.timeoutMs } = {}) 
   });
 }
 
+/**
+ * 建一个临时工作区放 ffmpeg 的输入/输出文件。
+ *
+ * ⚠️ 为什么默认不用 os.tmpdir()（2026-10-24 实测）：
+ *   本机上 **node 能写 `%TEMP%`，但 ffmpeg / cmd.exe 等子进程写不进去**：
+ *       cmd.exe /c echo hi > %TEMP%\... → 退出码 1，文件不存在
+ *       ffmpeg -i ... %TEMP%\out.gif    → "Permission denied"
+ *   同一台机器换到 E:\ 下（仓库 state/tmp）就正常。这不是 node 的权限问题，
+ *   而是子进程继承了不同的令牌/完整性上下文（%TEMP% 的 ACL 还带 CodexSandboxUsers 条目）。
+ *   结果就是：**装了 ffmpeg 也白装** —— 拼图必然在写输出文件那一步失败，
+ *   日志里只留下 "ffmpeg 退出码 1"，看不出真正原因。
+ *
+ * 所以候选顺序改成「调用方指定 → 仓库内 state/tmp → 系统临时目录」，
+ * 且**先自己写一个探针文件**确认这个目录真的可写再交给 ffmpeg（懒探测 + 进程内缓存，
+ * 每台机器只多一次 stat 成本）。全都不可写才退回 os.tmpdir()，让原错误照常暴露。
+ */
+const WRITABLE_CACHE = new Map();
+
+function probeWritable(dir) {
+  if (WRITABLE_CACHE.has(dir)) return WRITABLE_CACHE.get(dir);
+  let ok = false;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const probe = path.join(dir, `.qqb-probe-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(probe, 'ok');
+    fs.rmSync(probe, { force: true });
+    ok = true;
+  } catch { ok = false; }
+  WRITABLE_CACHE.set(dir, ok);
+  return ok;
+}
+
+/** 仓库内临时目录候选（源码运行：src/ 的上一级）。 */
+function repoTmpCandidates() {
+  const out = [];
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    out.push(path.join(here, '..', 'state', 'tmp'));
+    out.push(path.join(here, '..', 'tmp'));
+  } catch {}
+  return out;
+}
+
+function pickTempBase(tmpDir) {
+  const candidates = [
+    tmpDir ? path.resolve(tmpDir) : null,
+    ...repoTmpCandidates(),
+    os.tmpdir()
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    // 显式指定的目录不做可写性过滤：调用方指定就该用它，失败要暴露出来。
+    if (tmpDir && dir === path.resolve(tmpDir)) return dir;
+    if (probeWritable(dir)) return dir;
+  }
+  return candidates[candidates.length - 1];
+}
+
 function makeTempWorkspace(tmpDir) {
-  const base = tmpDir ? path.resolve(tmpDir) : os.tmpdir();
+  const base = pickTempBase(tmpDir);
   fs.mkdirSync(base, { recursive: true });
   return fs.mkdtempSync(path.join(base, 'qqb-media-'));
 }
@@ -332,6 +395,39 @@ function readIfExists(file) {
     if (!stat.isFile() || stat.size === 0) return null;
     return fs.readFileSync(file);
   } catch { return null; }
+}
+
+/**
+ * 纯 JS 兜底：GIF → 多格 PNG（不需要 ffmpeg）。
+ *
+ * 就地做而不 spawn 子进程，所以没有任何 PATH / EPERM / 沙箱问题。
+ * 解不了（非 GIF、损坏、实在压不小）一律返回 null，让调用方走原来的降级路径 ——
+ * 绝不因为兜底失败把一张本来能看的图变成错误。
+ *
+ * @returns 与 normalizeImageForModel 相同形状的成功结果，或 null
+ */
+function tryJsGifGrid(buf, layout, tileWidth, maxBytes, bytes) {
+  try {
+    const grid = gifToGrid(buf, {
+      cols: layout.cols,
+      rows: layout.rows,
+      sampleFrames: layout.sampleFrames,
+      tileWidth,
+      maxBytes
+    });
+    if (!grid.buffer || grid.buffer.length > maxBytes) return null;
+    const seconds = (grid.durationMs / 1000).toFixed(1);
+    // 与 ffmpeg 路径的 note 保持同一句式，前端/提示词不需要区分是哪条路产出。
+    return {
+      ok: true,
+      buffer: grid.buffer,
+      mimeType: 'image/png',
+      note: `动图 ${grid.totalFrames} 帧/${seconds}s，已抽 ${grid.sampleFrames} 帧拼成 ${grid.cols}×${grid.rows} 网格，行优先 左上→右下；原图 ${(bytes / 1024 / 1024).toFixed(2)}MB`
+    };
+  } catch {
+    // 解码失败是正常的降级条件，不是错误：交给调用方的「首帧/拒绝」逻辑。
+    return null;
+  }
 }
 
 // ── 主入口 ──────────────────────────────────────────────────────────────
@@ -392,16 +488,25 @@ export async function normalizeImageForModel(buf, mimeType, opts = {}) {
           note: `动图 ${layout.totalFrames} 帧/${seconds}s，已抽 ${layout.sampleFrames} 帧拼成 ${layout.cols}×${layout.rows} 网格，行优先 左上→右下；原图 ${(bytes / 1024 / 1024).toFixed(2)}MB`
         };
       }
-      // 拼图失败（没 ffmpeg / 超时 / 还是太大）：退化到「能看多少算多少」。
+      const ffmpegError = run.ok ? '输出仍超限' : run.error;
+
+      // ffmpeg 这条路走不通（没装 / 被拦 / 超时 / 压不小）：GIF 还有一条零依赖的纯 JS 解码。
+      // 2026-10-24 实测：本机就是「找不到 ffmpeg」，于是所有 GIF 都退化成首帧或整张不提供。
+      if (opts.jsGifFallback !== false && info.format === 'gif') {
+        const js = tryJsGifGrid(buf, layout, tileWidth, maxBytes, bytes);
+        if (js) return js;
+      }
+
+      // 拼图失败：退化到「能看多少算多少」。
       if (bytes <= maxBytes) {
         return {
           ok: true,
           buffer: buf,
           mimeType: mimeType || 'image/gif',
-          note: `动图 ${layout.totalFrames} 帧（抽帧拼图失败：${run.ok ? '输出仍超限' : run.error}，只提供首帧）`
+          note: `动图 ${layout.totalFrames} 帧（抽帧拼图失败：${ffmpegError}，只提供首帧）`
         };
       }
-      return { ok: false, error: `动图 ${(bytes / 1024 / 1024).toFixed(2)}MB 无法压缩（${run.ok ? '输出仍超限' : run.error}）` };
+      return { ok: false, error: `动图 ${(bytes / 1024 / 1024).toFixed(2)}MB 无法压缩（${ffmpegError}）` };
     }
 
     // action === 'shrink'：静态图降采样 + 重编码，最多试三轮（逐步缩小尺寸/降质量）。

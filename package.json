@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "node src/bridge.js",
+    "fetch:ffmpeg": "node scripts/fetch-ffmpeg.mjs",
     "test:audit": "node scripts/test-audit.mjs",
     "test:token": "node scripts/test-token-economy.mjs && node scripts/test-reply-wait.mjs && node scripts/test-qq-model-view.mjs && node scripts/test-qq-preset-contract.mjs",
     "test:tokens": "node scripts/test-token-usage.mjs",
@@ -22,6 +23,10 @@
     "test:regressions": "node scripts/test-audit-regressions.mjs",
     "test:media-search": "node scripts/test-media-search.mjs",
     "test:media-normalize": "node scripts/test-media-normalize.mjs",
+    "test:gif": "node scripts/test-gif-codec.mjs",
+    "test:gif:e2e": "node scripts/test-gif-e2e.mjs",
+    "test:gif:all": "node scripts/test-gif-codec.mjs && node scripts/test-gif-e2e.mjs",
+    "test:media:all": "node scripts/test-media-normalize.mjs && node scripts/test-gif-codec.mjs && node scripts/test-gif-e2e.mjs",
     "test:issues": "node scripts/test-issue-regressions.mjs",
     "test-wait:e2e": "node scripts/test-dsh-v2-wait.mjs",
     "test-vision": "node scripts/test-vision-media.mjs",

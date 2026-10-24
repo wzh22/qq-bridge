@@ -66,3 +66,11 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# 便携版 ffmpeg（约 77 MB，跨平台二进制不入库；用 `npm run fetch:ffmpeg` 现场下载）
+# 缺失时桥接仍有纯 JS 的 GIF 解码兜底，但语音音量处理会不可用。
+/tools/ffmpeg/
+/tools/_dl/
+
+# 媒体归一化的临时工作区（makeTempWorkspace 默认落在 state/tmp，避免用 %TEMP%）
+/state/tmp/
+
