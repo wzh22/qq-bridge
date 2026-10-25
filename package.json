@@ -43,6 +43,8 @@
     "test-console": "node scripts/test-console.mjs",
     "test:console-ui": "node scripts/test-console-ui.mjs",
     "test:preset-prompt": "node scripts/test-preset-prompt.mjs",
+    "test:preset-sync": "node scripts/test-preset-install-sync.mjs",
+    "test:preset-sync:offline": "node scripts/test-preset-install-sync.mjs --offline",
     "test:role-card": "node scripts/test-role-card.mjs",
     "preview:console": "node scripts/console-ui-fixture.mjs",
     "verify:adaptation": "node scripts/verify-dsh-021-adaptation.mjs",

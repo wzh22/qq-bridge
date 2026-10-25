@@ -114,3 +114,14 @@ audio/
 /roles/*.pre-finalize-*
 /roles/*.bak-*
 
+# profile 配置回滚备份（setup-dsh.mjs / 改 preset 前手动拷的 cordis.yml 等）。
+# 里面是**本机绝对路径**和当时的完整 profile 配置，既是机器专用、又能被本机重建。
+# 与上面两条同一个理由：留着是为回滚，不是为了发布。
+/preset-backup-*/
+/_preset-backup-*/
+/.preset-backup-*/
+
+# 一次性探查脚本：绑定了当次运行的端口/会话/产物，换个环境就跑不通。
+# 与上面「Local one-off dev/debug/patch scripts」同一条约定。
+/scripts/_probe-*.mjs
+
