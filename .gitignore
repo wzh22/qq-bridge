@@ -74,3 +74,28 @@ audio/
 # 媒体归一化的临时工作区（makeTempWorkspace 默认落在 state/tmp，避免用 %TEMP%）
 /state/tmp/
 
+# Local backups created before voice updates; may contain private configuration.
+/.voice-backup-*/
+
+
+/tools/gpt-sovits/
+
+# ── 本地模型 / 第三方运行时（体积巨大，绝不入库）──────────────────────────────
+# tools/ 整体 14.6 GB、约 5.7 万文件：ffmpeg(77MB)、gpt-sovits(13.5GB)、
+# rvc-aux(973MB 的 .pth/.onnx 模型)、tts-aux(Python site-packages)。
+# 这些都能按文档现场重建，入库只会把仓库撑爆且污染 diff。
+# 保留 tools/ 下的手写脚本（*.py/*.bat/*.ps1/*.vbs/*.md）作为复现指引。
+/tools/rvc-aux/
+/tools/tts-aux/
+/tools/**/models/
+*.pth
+*.onnx
+*.index
+*.safetensors
+*.ckpt
+
+# 角色卡 / 人格档案的本地备份与中间快照（含私人对话风格，且可由正本重建）
+/.roles-backup-*/
+/roles/*.pre-finalize-*
+/roles/*.bak-*
+
