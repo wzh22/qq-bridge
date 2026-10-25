@@ -35,6 +35,56 @@ export function dshPluginDirs() {
   return [home ? path.join(home, 'plugins') : null].filter((p) => p && fs.existsSync(p));
 }
 
+/**
+ * **profile 里安装的第三方插件包目录**（`~/.dsh/profiles/<name>/node_modules`）。
+ *
+ * 为什么必须扫这里（2026-10-25 实测）：守卫名单历来只对账 `@deepseek-ai/dsh-*`，
+ * 但本机 profile 装了 26 个第三方插件，其中 8 个用 `defineTool` 往**全局层**
+ * 注册了工具（`advanced_search`、`save_token_expand`、`univer_api`…）。
+ * 官方包里没有这些名字 ⇒ 扫描器把它们看不见 ⇒
+ *   ① 守卫漏覆盖，名字留在仿真会话 schema 里（真实发生过，见 tool-restrict.log）；
+ *   ② 一旦把名字补进守卫，不带本函数的扫描器又会把它们判成"拼错的假名"，
+ *      把人逼回去删掉 —— 正是注释里说过的最危险的误判方向。
+ * 所以扫描范围必须包含 profile 的 node_modules。
+ *
+ * 返回**具体包目录**（已展开 `@scope/name`），而不是 node_modules 根目录，
+ * 因为根目录里混着大量第三方插件的传递依赖，逐个当包扫会浪费大量 IO。
+ */
+export function dshProfilePackageDirs() {
+  const home = process.env.DSH_HOME
+    || (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.dsh') : null);
+  if (!home) return [];
+  const out = [];
+  const seen = new Set();
+  let profiles = [];
+  try { profiles = fs.readdirSync(path.join(home, 'profiles'), { withFileTypes: true }) } catch { return [] }
+  for (const p of profiles) {
+    if (!p.isDirectory()) continue;
+    const modules = path.join(home, 'profiles', p.name, 'node_modules');
+    let entries = [];
+    try { entries = fs.readdirSync(modules, { withFileTypes: true }) } catch { continue }
+    const push = (dir) => {
+      // junction/symlink（link: 依赖）也算：isDirectory() 对 junction 为 true。
+      if (seen.has(dir)) return;
+      seen.add(dir);
+      out.push(dir);
+    };
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('@')) {
+        let subs = [];
+        try { subs = fs.readdirSync(path.join(modules, e.name), { withFileTypes: true }) } catch { continue }
+        for (const s of subs) {
+          if (s.isDirectory()) push(path.join(modules, e.name, s.name));
+        }
+      } else if (/^(dsh-|@)/.test(e.name)) {
+        push(path.join(modules, e.name));
+      }
+    }
+  }
+  return out;
+}
+
 function walkFiles(dir, out = [], depth = 0, maxDepth = 5) {
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
@@ -55,8 +105,38 @@ function extractFromSource(text, source, add) {
   for (const m of text.matchAll(/\btoolName:\s*["']([^"']+)["']/g)) add(m[1], source);
   for (const m of text.matchAll(/\btoolName:\s*[^;\n]*?\.default\(\s*["']([^"']+)["']/g)) add(m[1], source);
   // 独立的一次性工具文件（defineTool 不挂在 .register( 上时的兜底）
-  for (const m of text.matchAll(/defineTool\(\{[\s\S]{0,200}?\bname:\s*["']([^"']+)["']/g)) {
+  // ⚠️ 必须允许**别名导入**：打包后的第三方插件普遍写成
+  //   `import { defineTool as defineTool12 } from "@deepseek-ai/dsh-tools"`
+  // 再 `return defineTool12({ name: 'univer_status', … })`。
+  // 只认字面量 `defineTool(` 会漏掉 univer-office 的全部 14 个工具名，
+  // 于是守卫里真实存在的 univer_status 被误判成假名。
+  for (const m of text.matchAll(/defineTool[0-9A-Za-z_$]*\(\{[\s\S]{0,200}?\bname:\s*["']([^"']+)["']/g)) {
     add(m[1], source);
+  }
+  // 直接传对象字面量的注册：`ctx.tools.register({ name: 'x', … })`
+  // （time-machine 用 `tctx.tools.register`，read-url / context-lens 用 `ctx.tools.register`）
+  //
+  // ⚠️ 必须锚定在 `.tools.register(`，不能写成裸 `.register(`：DSH 里还有
+  // slash 命令、locale、slot 三种同名 register，裸匹配会把**斜杠命令名**
+  // （`export` / `file` / `goal` / `plan`）当成工具名报成"漏隐藏的危险工具"——
+  // 那些名字根本没有对应工具，restrict 它们只会换来一串无意义的失败日志。
+  if (/\.tools\s*\.\s*register\s*\(/.test(text)) {
+    for (const m of text.matchAll(/\.tools\s*\.\s*register\(\s*\{[\s\S]{0,300}?\bname:\s*["']([^"']+)["']/g)) {
+      add(m[1], source);
+    }
+    // 第三种形态：**先造对象、再注册** —— `ctx.tools.register(readLinksTool(ctx, cfg))`。
+    // 工具名写在被调函数的 `return { name: 'x', … }` 里，上面两条规则都抓不到。
+    // 这里只跟着 register 的参数标识符去找同名函数，不做全文件乱扫：
+    // 全文件乱扫 `name: 'x'` 会把 Excel 参数名、表单字段名一起捞进来（实测 470 条噪声）。
+    for (const call of text.matchAll(/\.tools\s*\.\s*register\(\s*([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const fn = call[1];
+      const decl = new RegExp(
+        `(?:function\\s+${fn}\\s*\\(|(?:const|let|var)\\s+${fn}\\s*=\\s*(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>)`
+        + `[\\s\\S]{0,600}?\\breturn\\s*\\{[\\s\\S]{0,300}?\\bname:\\s*["']([^"']+)["']`,
+      );
+      const hit = decl.exec(text);
+      if (hit) add(hit[1], source);
+    }
   }
 }
 
@@ -75,7 +155,7 @@ function extractFromPatch(text, source, add) {
  * @returns `{ names: Map<name, Set<source>>, packages: string[] }`。
  *          `packages` 是实际扫过的包/插件名，便于诊断「一个都没扫到」。
  */
-export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
+export function collectDshToolNames({ packagesDir, pluginDirs, profileDirs } = {}) {
   const names = new Map();
   const packages = [];
   const add = (name, source) => {
@@ -92,24 +172,81 @@ export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
     // 仍然说明这个名字曾经真实存在）。
     roots.push({ dir, filter: null });
   }
+  // profile 里装着的第三方插件包：每个 dir 就是一个包的根，直接扫。
+  const profilePkgs = profileDirs ?? dshProfilePackageDirs();
+  if (profilePkgs.length) roots.push({ dir: null, packages: profilePkgs });
 
-  for (const { dir, filter } of roots) {
-    let entries = [];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      if (filter && !filter.test(e.name)) continue;
-      const pkgDir = path.join(dir, e.name);
-      packages.push(e.name);
-      for (const f of walkFiles(pkgDir)) {
+  for (const root of roots) {
+    // 形态 A：一个目录下有多个包（@deepseek-ai / 用户 plugins 目录）
+    // 形态 B：直接给出包目录列表（profile 的 node_modules）
+    const pkgList = root.packages
+      ? root.packages.map((dir) => ({ name: pkgLabel(dir), dir }))
+      : (() => {
+        let entries = [];
+        try { entries = fs.readdirSync(root.dir, { withFileTypes: true }) } catch { return [] }
+        return entries
+          .filter((e) => e.isDirectory() && (!root.filter || root.filter.test(e.name)))
+          .map((e) => ({ name: e.name, dir: path.join(root.dir, e.name) }));
+      })();
+
+    for (const { name, dir } of pkgList) {
+      packages.push(name);
+      for (const f of walkFiles(dir)) {
         let text = '';
-        try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
-        if (/\.(js|mjs|cjs)$/.test(f) || f.endsWith('.d.ts')) extractFromSource(text, e.name, add);
-        else if (/\.patch\.ya?ml$/.test(f)) extractFromPatch(text, e.name, add);
+        try { text = fs.readFileSync(f, 'utf8'); } catch { continue }
+        if (/\.(js|mjs|cjs)$/.test(f) || f.endsWith('.d.ts')) extractFromSource(text, name, add);
+        else if (/\.patch\.ya?ml$/.test(f)) extractFromPatch(text, name, add);
       }
     }
   }
   return { names, packages };
+}
+
+/**
+ * 某个包是否装在**任意** profile 里 —— 直接按包名探测目录，不走 {@link dshProfilePackageDirs}。
+ *
+ * 为什么必须独立探测（2026-10-25，这是本文件最隐蔽的一个坑）：
+ *   「第三方工具名凭什么豁免真实存在性校验」的判据是「所属插件装没装」。
+ *   如果这个判据复用 `dshProfilePackageDirs()`，那么扫描器一旦退化
+ *   （目录遍历返回空 / asar 路径失效 / 有人改回只扫官方包），
+ *   两件事会**同时**发生：名字扫不到 + 判据认为"插件没装"
+ *   ⇒ 于是每个第三方名字都被当作"没装插件所以缺席正常"而跳过 ⇒ **全绿**。
+ *   实测确认过：给 dshProfilePackageDirs() 加 `return []` 后，
+ *   test-preset-local-tools 依然 fail 0 —— 一个把真故障藏起来的判据。
+ *   现在改成按包名直接 existsSync 探测：遍历坏了它也照样返回 true，
+ *   于是"插件装着但名字扫不到"必定报红，把退化暴露出来。
+ */
+export function isProfilePackageInstalled(pkgName) {
+  const home = process.env.DSH_HOME
+    || (process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.dsh') : null);
+  if (!home || !pkgName) return false;
+  let profiles = [];
+  try { profiles = fs.readdirSync(path.join(home, 'profiles'), { withFileTypes: true }) } catch { return false }
+  for (const p of profiles) {
+    if (!p.isDirectory()) continue;
+    // 直接拼 `node_modules/<pkgName>`；带 scope 的名字自然落到 `@scope/name`。
+    if (readable(path.join(home, 'profiles', p.name, 'node_modules', ...pkgName.split('/')))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * profile 里**已安装**的包名集合（给「第三方工具名凭什么豁免」判定用）。
+ *
+ * 见 {@link isProfilePackageInstalled} 的说明：这里**不**复用目录遍历结果，
+ * 而是逐个按名字探测，保证「扫描器退化」不会同时让归属判据瞎掉。
+ */
+export function dshProfilePackageLabels() {
+  return new Set(dshProfilePackageDirs().map((dir) => pkgLabel(dir)));
+}
+
+/** 包目录 → 便于阅读的包名（`…/node_modules/@scope/pkg` → `@scope/pkg`）。 */
+export function pkgLabel(dir) {
+  const base = path.basename(dir);
+  const parent = path.basename(path.dirname(dir));
+  return parent.startsWith('@') ? `${parent}/${base}` : base;
 }
 
 /** 便利包装：只要名字集合。 */

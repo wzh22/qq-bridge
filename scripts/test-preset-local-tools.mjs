@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathToFileURL } from 'node:url';
-import { collectDshToolNames as collectDshToolNamesShared } from './dsh-tool-names.mjs';
+import { collectDshToolNames as collectDshToolNamesShared, isProfilePackageInstalled } from './dsh-tool-names.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const PRESETS_DIR = path.join(ROOT, 'dsh', 'agent-presets');
@@ -98,6 +98,96 @@ const OPTIONAL_BUNDLE_TOOLS = new Set([
   // 所以按「可选装包」处理，而不是当假名清掉。
   'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
 ]);
+
+/**
+ * 第三方插件注册的全局工具 → **所属插件包名**（2026-10-25 对账）。
+ *
+ * 这组名字来自 profile 的 `node_modules`，不是 `@deepseek-ai/*` 官方包。
+ * 它们必须留在守卫名单里（真的会进仿真会话 schema），但判定「名字是否真实存在」
+ * 的方式和官方包不同 —— 所以这里登记来源包，而不是像旧版那样给一个整体豁免集合。
+ *
+ * 为什么要登记来源包（这是本文件最重要的教训）：
+ *   旧版写的是 `THIRD_PARTY_PLUGIN_TOOLS` 豁免集合，命中就跳过真实性校验。
+ *   它看起来让套件变绿，实际把**两种失败模式都藏起来了** —— 扫描器一旦退化
+ *   回「只扫 @deepseek-ai」，这 62 个名字统统逃过校验，而 2026-10-25 的真实
+ *   故障正是扫描器看不见 4 个真实存在的名字（read_url / univer_status /
+ *   context_lens_code / context_lens_log），差点被当成假名删掉。
+ *   现在改判「所属插件**装没装**」：
+ *     · 装了   ⇒ 名字必须被扫描器扫到，扫不到 = 扫描器退化或插件损坏，**报红**；
+ *     · 没装   ⇒ 允许缺席（守卫仍保留名字，装上即生效，fail-closed）。
+ *   这样扫描器的覆盖能力本身被钉住了，而不是被豁免绕过。
+ */
+const THIRD_PARTY_TOOL_OWNER = new Map(Object.entries({
+  // dsh-plugin-tool-management：派生 agent / 改宿主配置 / 持久记忆
+  subagent_manager_save: 'dsh-plugin-tool-management',
+  subagent_manager_switch: 'dsh-plugin-tool-management',
+  mcp_manager_list: 'dsh-plugin-tool-management',
+  mcp_manager_save: 'dsh-plugin-tool-management',
+  mcp_manager_switch: 'dsh-plugin-tool-management',
+  skill_manager_list: 'dsh-plugin-tool-management',
+  skill_manager_read: 'dsh-plugin-tool-management',
+  skill_manager_save: 'dsh-plugin-tool-management',
+  skill_manager_switch: 'dsh-plugin-tool-management',
+  prompt_manager_apply: 'dsh-plugin-tool-management',
+  prompt_manager_list: 'dsh-plugin-tool-management',
+  scene_manager_list: 'dsh-plugin-tool-management',
+  scene_manager_save: 'dsh-plugin-tool-management',
+  scene_manager_switch: 'dsh-plugin-tool-management',
+  memory_manager_list: 'dsh-plugin-tool-management',
+  memory_manager_read: 'dsh-plugin-tool-management',
+  memory_manager_save: 'dsh-plugin-tool-management',
+  memory_manager_switch: 'dsh-plugin-tool-management',
+  // dsh-read-url：任意 URL ⇒ SSRF 面
+  read_url: 'dsh-read-url',
+  read_url_links: 'dsh-read-url',
+  read_url_batch: 'dsh-read-url',
+  read_url_site: 'dsh-read-url',
+  // dsh-free-search：主动对外检索
+  advanced_search: 'dsh-free-search',
+  cache_search: 'dsh-free-search',
+  domain_search: 'dsh-free-search',
+  multi_search: 'dsh-free-search',
+  platform_search: 'dsh-free-search',
+  video_search: 'dsh-free-search',
+  free_search_test: 'dsh-free-search',
+  research: 'dsh-free-search',
+  weather: 'dsh-free-search',
+  // dsh-univer-office：整套 .univer 文档读写 + 导入导出
+  univer_api: 'dsh-univer-office',
+  univer_status: 'dsh-univer-office',
+  univer_new: 'dsh-univer-office',
+  univer_unit: 'dsh-univer-office',
+  univer_worktree: 'dsh-univer-office',
+  univer_inspect: 'dsh-univer-office',
+  univer_lint: 'dsh-univer-office',
+  univer_execute: 'dsh-univer-office',
+  univer_import: 'dsh-univer-office',
+  univer_export: 'dsh-univer-office',
+  univer_print_pdf: 'dsh-univer-office',
+  univer_screenshot: 'dsh-univer-office',
+  univer_compile_svg: 'dsh-univer-office',
+  univer_resources: 'dsh-univer-office',
+  // @goodandready/dsh-time-machine：快照 + 回滚工作区（回滚 = 覆盖文件）
+  time_machine_checkpoint_create: '@goodandready/dsh-time-machine',
+  time_machine_checkpoint_list: '@goodandready/dsh-time-machine',
+  time_machine_checkpoint_delete: '@goodandready/dsh-time-machine',
+  time_machine_checkpoint_prune: '@goodandready/dsh-time-machine',
+  time_machine_checkpoint_rollback: '@goodandready/dsh-time-machine',
+  time_machine_diff: '@goodandready/dsh-time-machine',
+  time_machine_file_rollback: '@goodandready/dsh-time-machine',
+  // dsh-image-gen：花额度 / 可上传群里的图 / 画布
+  generate_image: 'dsh-image-gen',
+  generate_images: 'dsh-image-gen',
+  edit_image: 'dsh-image-gen',
+  canvas_state: 'dsh-image-gen',
+  view_canvas: 'dsh-image-gen',
+  find_inspiration: 'dsh-image-gen',
+  // @goodandready/dsh-context-lens：只读但没必要
+  context_lens_code: '@goodandready/dsh-context-lens',
+  context_lens_log: '@goodandready/dsh-context-lens',
+  // dsh-better-sidebar：宿主 UI 动作
+  sidebar_open: 'dsh-better-sidebar',
+}));
 
 /**
  * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，
@@ -219,19 +309,81 @@ test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错
   // 只打日志 ⇒ 拼错的名字 = **静默 no-op**。这正是本名单初版的真实缺陷：
   // pwsh_persistent / bash_persistent / cordis / goal_write / goal_read 五个假名
   // 让整批限制悄悄少生效，而套件当时全绿。
+  //
+  // 三类名字，三种判据（区别很重要，混用会重演 2026-10-25 的误报）：
+  //   ① 官方包（@deepseek-ai/*）    ⇒ 扫描器必须扫得到；
+  //   ② 第三方插件工具              ⇒ **所属插件装了就**必须扫得到（见 THIRD_PARTY_TOOL_OWNER）；
+  //   ③ dev_* / 可选 bundle          ⇒ 运行时才出现或本机没装，允许缺席。
   const dshNames = collectDshToolNames();
   if (dshNames === null) {
     console.log('  ⏭  跳过：未找到 DSH 工具包（设 DSH_TOOL_PACKAGES 指向 @deepseek-ai 目录即可启用）');
     return;
   }
+  // 「插件装没装」必须**独立探测**，不能复用扫描器的遍历结果。
+  // 复用会导致：扫描器退化 ⇒ 名字扫不到 + 判据认为没装 ⇒ 全部跳过 ⇒ 假绿。
+  // 这条是实测出来的：给 dshProfilePackageDirs 塞 `return []` 后套件仍 fail 0。
+  const ownerInstalled = (owner) => isProfilePackageInstalled(owner);
+
   for (const id of SIMULATION_PRESETS) {
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
-    const fabricated = mod.RESTRICTED_TOOL_NAMES
-      .filter((n) => !DEV_TOOL_PREFIX.test(n) && !OPTIONAL_BUNDLE_TOOLS.has(n) && !dshNames.has(n));
+
+    const fabricated = [];
+    const skippedBecauseUninstalled = [];
+    for (const n of mod.RESTRICTED_TOOL_NAMES) {
+      if (DEV_TOOL_PREFIX.test(n) || OPTIONAL_BUNDLE_TOOLS.has(n)) continue;
+      if (dshNames.has(n)) continue;
+      const owner = THIRD_PARTY_TOOL_OWNER.get(n);
+      if (owner && !ownerInstalled(owner)) {
+        // 插件没装 ⇒ 名字缺席是预期的（守卫保留名字 = 装上即生效）。
+        skippedBecauseUninstalled.push(`${n}(${owner})`);
+        continue;
+      }
+      fabricated.push(owner ? `${n}(来自 ${owner}，但没被扫描到)` : n);
+    }
+
     assert.deepEqual(fabricated, [],
       `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`
       + `限制静默失效：${fabricated.join(', ')}`);
+    if (skippedBecauseUninstalled.length) {
+      console.log(`  ℹ️  ${id}: ${skippedBecauseUninstalled.length} 个名字所属插件本机未装，`
+        + `按 fail-closed 保留：${skippedBecauseUninstalled.join(', ')}`);
+    }
+  }
+});
+
+test('第三方插件工具的来源包名必须登记且自洽（防豁免表变成垃圾桶）', async () => {
+  // 这条挡住的是「往里随手加名字」：豁免表一旦变成垃圾桶，
+  // 「名字必须真实存在」的约束就在这批名字上永久失效了。
+  for (const [tool, owner] of THIRD_PARTY_TOOL_OWNER) {
+    assert.match(tool, /^[a-z][a-z0-9_]{1,40}$/, `登记的第三方工具名形态合法：${tool}`);
+    assert.ok(owner && owner.length > 0, `${tool} 必须登记所属包名`);
+    // 归属必须是具体包，不能是通配或空泛描述。
+    assert.match(owner, /^(@[a-z0-9-]+\/)?[a-z0-9][a-z0-9-]*$/,
+      `${tool} 的所属包名要写成真实包名（可带 scope），实际是 ${owner}`);
+    assert.ok(!DEV_TOOL_PREFIX.test(tool), `${tool}: dev_* 不该走第三方归属表`);
+  }
+
+  // 反向断言（这条才有牙齿）：守卫里被声明为「第三方插件工具」的每一个名字，
+  // 都必须在归属表里有登记。否则它要么走官方包判据被判成假名报红，
+  // 要么有人为了让它变绿直接塞进 OPTIONAL_BUNDLE_TOOLS —— 那才是真漏洞。
+  for (const id of SIMULATION_PRESETS) {
+    const { dir } = readPreset(id);
+    const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
+    // 守卫若导出这段名单就逐一核对；未导出（老版本守卫）则显式跳过并说明。
+    const declared = mod.THIRD_PARTY_PLUGIN_TOOL_NAMES;
+    if (!Array.isArray(declared)) {
+      console.log(`  ⏭  ${id}: 守卫未导出 THIRD_PARTY_PLUGIN_TOOL_NAMES，跳过反向核对`);
+      continue;
+    }
+    const unregistered = declared.filter((n) => !THIRD_PARTY_TOOL_OWNER.has(n));
+    assert.deepEqual(unregistered, [],
+      `${id}: 守卫声明为第三方工具、但测试里没登记归属包的名字：${unregistered.join(', ')}。`
+      + `请在 THIRD_PARTY_TOOL_OWNER 补上真实包名，不要塞进豁免。`);
+    // 同时也防反向漂移：归属表里有、守卫里却没有 ⇒ 有人删了守卫条目。
+    const missingInGuard = [...THIRD_PARTY_TOOL_OWNER.keys()].filter((n) => !declared.includes(n));
+    assert.deepEqual(missingInGuard, [],
+      `${id}: 归属表登记了但守卫没挡的名字：${missingInGuard.join(', ')}`);
   }
 });
 

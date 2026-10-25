@@ -132,8 +132,11 @@ const LOCAL_EXECUTION_TOOLS = [
   'workflow', 'ralph',
   // 插件/cordis 运行期检查：能读宿主状态（0.1.7 起只有这两个名字）
   'cordis_inspect_list', 'cordis_inspect_query',
-  // 本机文件 + 进程：plugin-guard 会改写配置并 spawn pnpm
-  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
+  // 本机文件 + 进程：plugin-guard 会改写配置并 spawn pnpm。
+  // 注意：dsh_snapshot / dsh_rollback / incident_resolved 三个名字**不在这里**，
+  // 而是移到下面的 OPTIONAL_BUNDLE_TOOL_NAMES —— 该 bundle 本机当前没装，
+  // 名字扫不到，放进本数组会被「拼错假名」的判定报成不一致。
+  // 语义上它们仍属于本地执行面，仍然会被 restrict（见 KNOWN_DANGEROUS_GLOBAL_TOOLS）。
   // 会话/交付/任务面
   // 注意：`todo_write` 与 `ask_user_question` **故意不在**此名单——它们是下面
   // SAFE_EXACT 允许的无害模型侧工具，两边不能自相矛盾。
@@ -177,11 +180,90 @@ const LOCAL_EXECUTION_TOOLS = [
 export const OPTIONAL_BUNDLE_TOOL_NAMES = Object.freeze([
   'subagent_codex',
   'subagent_claude_code',
+  // dsh-plugin-guard（本机当前**没装**）：它注册 dsh_snapshot / dsh_rollback /
+  // incident_resolved。这三个必须留在守卫名单里 —— 它会改写 package.json/lockfile
+  // 并 spawn pnpm，属于本地执行面；删掉才是真危险（装上即静默放行）。
+  // 按「可选装 bundle」归类，与上面两个同理：扫不到 ≠ 拼错。
+  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
 ])
+
+/**
+ * 第三方插件注册的全局工具（2026-10-25 对账）。
+ *
+ * 为什么会有这一组：上面的名单历来只拿 `@deepseek-ai/dsh-*` 官方包对账
+ * （`scripts/scan-dsh-tool-names.mjs`），而当前 profile 装了 26 个第三方插件，
+ * 其中 8 个用 `defineTool` 往**全局层**注册了工具 —— 官方包里根本没有这些名字，
+ * 于是守卫一个都没覆盖。
+ *
+ * 实证（不是推测）：`state/tool-restrict.log` 的 `known global tools` 报错清单里
+ * 直接列着 `advanced_search, cache_search, canvas_state, context_lens_code, …`，
+ * 那是 DSH 自己打出的「全局层真实存在这些名字」。更直接的证据是
+ * `state/tool-calls.jsonl`：QQ 仿真会话**真的调用过** `save_token_expand` 6 次
+ * （全部被下面的执行期 guard 拦掉）。也就是说这些名字确实进了仿真会话 schema。
+ *
+ * 危害分三档，逐条判定：
+ *   ① 派生 agent / 改宿主配置（= 间接拿到执行面）：
+ *      `subagent_manager_save|switch`（写子智能体配置并派生子 agent）、
+ *      `mcp_manager_list|save|switch`（增删 MCP server ⇒ 挂上 filesystem 就等于开文件读写）、
+ *      `skill_manager_*` / `prompt_manager_*` / `scene_manager_*`（改写模型可见的指令层）、
+ *      `memory_manager_*`（跨会话持久记忆，群里的人能往里灌东西）。
+ *   ② 主动对外发请求 / 读写工作区文件：
+ *      `read_url`（任意 URL ⇒ SSRF 面）、`advanced_search` 等检索族、
+ *      `univer_api|univer_status`（读写 .univer 文档）、
+ *      `generate_image|generate_images|edit_image`（花额度、可把群里的图上传）、
+ *      `sidebar_open`（宿主 UI 动作）。
+ *   ③ 只读但没必要：`canvas_state` / `view_canvas` / `find_inspiration` /
+ *      `context_lens_code` / `context_lens_log`。挡掉不损失聊天能力。
+ *
+ * 唯一**放行**的是 `save_token_expand`：它只读本机 spill 缓存，把被压缩掉的
+ * 工具输出原文还给模型，没有外部副作用。而它在 QQ 会话里的缺席是**功能缺陷**：
+ * 压缩标记 `[save-token #xxx]` 会进上下文却展不开，长会话下模型等于"看不懂
+ * 自己之前的输出"。所以它是 SAFE_EXACT 成员，不在下面这组里。
+ *
+ * ⚠️ 这一组同样受「名字必须真实存在」的约束：`tools.restrict()` 对未知名字抛错。
+ * 名字来自 `node scripts/scan-dsh-tool-names.mjs`（已扩展为同时扫 profile 的
+ * node_modules），插件被卸载后名字消失 → 抛错 → 由 per-name try/catch 记日志。
+ *
+ * ⚠️ 测试侧的判据**不是**「在这个数组里就豁免」，而是「所属插件装没装」：
+ *   装在 profile 里 ⇒ 名字必须被扫描器扫到，扫不到就报红（防扫描器退化）；
+ *   没装在 profile 里 ⇒ 允许缺席（名字仍保留，装上即生效）。
+ *   归属包名登记在 `scripts/test-preset-local-tools.mjs` 的 THIRD_PARTY_TOOL_OWNER。
+ *   历史教训：旧版给过整体豁免集合，结果扫描器退化时 62 个名字全被静默跳过，
+ *   而 2026-10-25 的真实故障正是扫描器看不见 4 个真实名字、差点被当假名删掉。
+ */
+const THIRD_PARTY_PLUGIN_TOOLS = [
+  // ① 派生 agent / 改宿主配置 / 持久记忆
+  'subagent_manager_save', 'subagent_manager_switch',
+  'mcp_manager_list', 'mcp_manager_save', 'mcp_manager_switch',
+  'skill_manager_list', 'skill_manager_read', 'skill_manager_save', 'skill_manager_switch',
+  'prompt_manager_apply', 'prompt_manager_list',
+  'scene_manager_list', 'scene_manager_save', 'scene_manager_switch',
+  'memory_manager_list', 'memory_manager_read', 'memory_manager_save', 'memory_manager_switch',
+  // ② 对外发请求 / 读写文件 / 出图 / 宿主 UI
+  'read_url', 'read_url_links', 'read_url_batch', 'read_url_site',
+  'advanced_search', 'cache_search', 'domain_search', 'multi_search',
+  'platform_search', 'video_search', 'free_search_test', 'research', 'weather',
+  // univer-office：一整套 .univer 文档读写 + 导入导出（= 工作区文件面）
+  'univer_api', 'univer_status',
+  'univer_new', 'univer_unit', 'univer_worktree', 'univer_inspect', 'univer_lint',
+  'univer_execute', 'univer_import', 'univer_export', 'univer_print_pdf',
+  'univer_screenshot', 'univer_compile_svg', 'univer_resources',
+  // time-machine：快照 + **回滚工作区**（回滚 = 覆盖文件，属于写盘面）
+  'time_machine_checkpoint_create', 'time_machine_checkpoint_list',
+  'time_machine_checkpoint_delete', 'time_machine_checkpoint_prune',
+  'time_machine_checkpoint_rollback', 'time_machine_diff', 'time_machine_file_rollback',
+  'generate_image', 'generate_images', 'edit_image',
+  'sidebar_open',
+  // ③ 只读但没必要
+  'canvas_state', 'view_canvas', 'find_inspiration',
+  'context_lens_code', 'context_lens_log',
+]
 
 const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
   // 本地执行面（见上）
   ...LOCAL_EXECUTION_TOOLS,
+  // 第三方插件推进全局层的工具（见上）
+  ...THIRD_PARTY_PLUGIN_TOOLS,
   // 按需安装的可选能力包（0.2.1 起默认不存在；装上就要挡）
   ...OPTIONAL_BUNDLE_TOOL_NAMES,
   // dsh-super-injector / 开发注入器（0.1.7-rc.2 实测注册的全局工具）
@@ -207,8 +289,14 @@ const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
   'dev_uninject_plugin',
 ]
 
-// 供 test-preset-local-tools.mjs 导入并与 DSH 真实工具名对账，避免两份名单漂移。
+// 供 test-preset-local-tools.mjs / scan-dsh-tool-names.mjs 导入并与 DSH 真实工具名对账，
+// 避免两份名单漂移。
 export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TOOLS])
+
+// 单独导出第三方插件那一段：扫描器要能用「不同来源」判定名字是否该存在
+// （官方包 vs profile 的 node_modules），插件被卸载后这一段的名字会临时变成
+// "查不到但不许删"——和 OPTIONAL_BUNDLE_TOOL_NAMES 是同一类处理。
+export const THIRD_PARTY_PLUGIN_TOOL_NAMES = Object.freeze([...THIRD_PARTY_PLUGIN_TOOLS])
 
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
@@ -237,9 +325,19 @@ const SAFE_PREFIXES = [
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
+//
+// `save_token_expand`（dsh-plugin-save-token 注册）为什么放行：
+//   它唯一的参数是一个压缩标记 id，执行时只查本机内存/spill 缓存，把被压缩掉的
+//   工具输出**原文**还给模型 —— 不读工作区以外的文件、不发网络请求、不写盘。
+//   而挡掉它是**实质功能损失**：压缩标记 `[save-token #xxx]` 仍会进入上下文，
+//   模型却展不开 ⇒ 长会话下"看不懂自己之前的输出"。
+//   实证：`state/tool-calls.jsonl` 里 QQ 会话已尝试调用它 6 次，全部被拒。
+//   注意：它 miss 时的兜底文案会带上 spill 文件的绝对路径，但那个路径指向
+//   本会话自己的 tool-output 缓存目录（且 QQ 会话没有 read 工具），不构成越权。
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  'save_token_expand',
 ])
 
 // ── 诊断落盘：restrict 失败时到底为什么 ────────────────────────────────────
