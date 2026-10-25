@@ -96,7 +96,10 @@ function startFakeDiaryServer(file, { ownerQQ = '2409281798' } = {}) {
     const body = req.method === 'POST' ? JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') : {};
     const key = String(req.method === 'POST' ? (body.key ?? '') : (url.searchParams.get('key') ?? '')).trim();
     if (!key) { send({ ok: false, error: 'key 不能为空' }, 400); return; }
-    if (!isOwnerPrivate(key)) { send({ ok: false, error: '日记本只能在主人本人的私聊中读写' }, 403); return; }
+    // 新契约：私聊都能读写，群聊一律拒绝；私聊之间靠 key 过滤，互不可见。
+    if (!isOwnerPrivate(key) && !/^private:\d+$/.test(key)) { send({ ok: false, error: '日记本只能在私聊中读写' }, 403); return; }
+    const isOwner = isOwnerPrivate(key);
+    const scoped = (list) => (isOwner ? list : list.filter((e) => String(e.key ?? '') === key));
     if (req.method === 'POST') {
       const r = appendEntry(file, { ...body, key });
       if (!r.ok) { send({ ok: false, error: r.error }, 400); return; }
@@ -104,10 +107,11 @@ function startFakeDiaryServer(file, { ownerQQ = '2409281798' } = {}) {
       return;
     }
     const { entries } = loadDiary(file);
+    const mine = scoped(entries);
     const q = String(url.searchParams.get('q') ?? '').trim();
-    if (!q) { send({ ok: true, total: entries.length, entries: entries.slice(-20) }); return; }
-    const hits = recallEntries(entries, { q, limit: 20 });
-    send({ ok: true, total: entries.length, matched: hits.length, entries: hits.map((h) => h.entry) });
+    if (!q) { send({ ok: true, total: mine.length, entries: mine.slice(-20) }); return; }
+    const hits = recallEntries(mine, { q, limit: 20 });
+    send({ ok: true, total: mine.length, matched: hits.length, entries: hits.map((h) => h.entry) });
   });
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
@@ -171,12 +175,31 @@ test('E2E HTTP: 群聊被拒绝（隐私闸门）', async () => {
   }
 });
 
-test('E2E HTTP: 别人的私聊也被拒绝', async () => {
+test('E2E HTTP: 别人的私聊可以写，但只能看到自己的', async () => {
   const file = tmpFile();
   const { server, port } = await startFakeDiaryServer(file);
   try {
-    const r = await request(port, '/api/socialV2/diary?key=private:99999999');
-    assert.equal(r.status, 403, '非主人的私聊不能读');
+    const w = await request(port, '/api/socialV2/diary', {
+      method: 'POST',
+      body: { key: 'private:99999999', body: '朋友的日记：今天打球赢了', importance: 3 },
+    });
+    assert.equal(w.status, 200, '白名单朋友的私聊应当可以写自己的日记');
+    assert.equal(w.body.ok, true);
+
+    // 写进去的条目必须带上归属 key —— 否则「只能看自己的」这层过滤就无从判断。
+    const { entries } = loadDiary(file);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].key, 'private:99999999', '他人日记必须记录归属会话');
+
+    // 他自己翻得到
+    const own = await request(port, '/api/socialV2/diary?key=private:99999999');
+    assert.equal(own.status, 200);
+    assert.equal(own.body.total, 1);
+
+    // 换一个人来翻，看不到这条（同文件、按 key 隔离）
+    const other = await request(port, '/api/socialV2/diary?key=private:88888888');
+    assert.equal(other.status, 200);
+    assert.equal(other.body.total, 0, '别人的日记不能出现在另一个人的会话里');
   } finally {
     server.close();
   }

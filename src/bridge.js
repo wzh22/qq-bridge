@@ -32,7 +32,7 @@ import { normalizeImageForModel } from './media-normalize.js';
 import { generateVoice, normalizeSynthesis } from './voice-synthesis.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
-import { hardenDir, manualDirCommand } from './state-acl.mjs';
+import { hardenDir, isHardened, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
@@ -116,6 +116,17 @@ const OWNER_MEMORY_FILE = path.join(STATE_DIR, 'owner-memory.json');
 // 分开一个文件而不是塞进 owner-memory.json：日记是 append-only 的流水，
 // 事实库是会被 supersede 的集合，两种写冲突模型混在一个文件里迟早互相破坏。
 const DIARY_FILE = path.join(STATE_DIR, 'diary.jsonl');
+// 他人日记本：白名单里的**其他**人（非主人）各自的日记。
+//
+// 为什么必须与 diary.jsonl 物理分开：
+//   日记正文会被注入 prompt。主人日记里是主人的生活、备考、身体状况；
+//   一旦允许从「别人的会话」写入同一个库，两件事会同时发生：
+//     ① 别人可以往主人的记忆里塞内容（间接污染主人的人格上下文）；
+//     ② 主人的私事会随「近期日记」注入到别人的会话里，等于当众朗读。
+//   所以文件分开只是第一层；第二层是**每条按 key 过滤**（见 diaryBlockFor），
+//   保证 A 的日记不会出现在 B 的会话里 —— 一份文件、逻辑隔离、
+//   比「一人一个文件」更好维护，也不会有文件名注入的风险。
+const DIARY_OTHERS_FILE = path.join(STATE_DIR, 'diary-others.jsonl');
 // 对话归档（append-only JSONL）。只用于「回炉再提炼」，永不进 prompt。
 const OWNER_CHAT_ARCHIVE = path.join(STATE_DIR, 'owner-chat.jsonl');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
@@ -288,20 +299,42 @@ function loadOrCreateConsoleToken() {
  * 宁可明确报"没做成"，也不要假装已经安全。
  */
 function hardenStateDirAcl() {
-  const result = hardenDir(STATE_DIR);
-  if (result.ok) {
-    stateDirHardened = true;
-    return;
+  // 先做**非递归**自检，已收紧就直接跳过。
+  //
+  // 原实现每次启动都无条件跑 `hardenDir()`，而它内部是 `icacls /T` 全量递归：
+  // state/ 下有 11000+ 个条目、1.3GB（其中绝大多数是 Edge CDP profile 的缓存），
+  // 30 秒超时必然触发 `ETIMEDOUT`，于是**每次启动都报「未能收紧」——
+  // 但 ACL 其实早就是对的**。那条告警因此变成了噪音：「狼来了」叫多了，
+  // 真正的权限问题反而会被忽略。`isHardened()` 只 icacls 目录本身，毫秒级。
+  if (!isHardened(STATE_DIR)) {
+    const result = hardenDir(STATE_DIR);
+    if (!result.ok) {
+      stateDirHardened = false;
+      if (process.platform !== 'win32') {
+        log(`⚠️ 收紧 state/ 权限失败（chmod 700）：${result.detail}`);
+      } else {
+        log('⚠️ 未能收紧 state/ 目录权限：本机任何已登录用户都可能读到控制台令牌与 QQ 聊天记录。');
+        log(`   原因：${String(result.detail).slice(0, 300)}`);
+        log('   改 ACL 需要管理员权限。请用**管理员身份**打开终端后执行下面这几条命令（或在控制台「访问与安全」页点按钮）：');
+        log(`   ${manualDirCommand(STATE_DIR)}`);
+      }
+      return;
+    }
   }
-  stateDirHardened = false;
-  if (process.platform !== 'win32') {
-    log(`⚠️ 收紧 state/ 权限失败（chmod 700）：${result.detail}`);
-    return;
+  stateDirHardened = true;
+
+  // roles/ 与 state/ 同属敏感面，但此前**从未被收紧过**：人格卡（含「隐私边界」
+  // 小节、主人的作息/称呼/雷点）继承着 roles/ 目录的 ACL，实测为
+  // `Authenticated Users:(M)` + `BUILTIN\\Users:(RX)` —— 本机任何能登录的账户
+  // 都能直接读走人格卡。它不在 state/ 子树里，所以 hardenStateDirAcl 覆盖不到。
+  // 这里单独收紧；失败不阻断启动，但要留痕。
+  if (!isHardened(ROLES_DIR)) {
+    const rr = hardenDir(ROLES_DIR);
+    if (!rr.ok) {
+      log(`⚠️ 未能收紧 roles/ 目录权限（人格卡可能被本机其他用户读取）：${String(rr.detail).slice(0, 200)}`);
+      log(`   ${manualDirCommand(ROLES_DIR)}`);
+    }
   }
-  log('⚠️ 未能收紧 state/ 目录权限：本机任何已登录用户都可能读到控制台令牌与 QQ 聊天记录。');
-  log(`   原因：${String(result.detail).slice(0, 300)}`);
-  log('   改 ACL 需要管理员权限。请用**管理员身份**打开终端后执行下面这几条命令（或在控制台「访问与安全」页点按钮）：');
-  log(`   ${manualDirCommand(STATE_DIR)}`);
 }
 
 function readActivityTail(n) {
@@ -781,6 +814,12 @@ function loadConfig() {
       minMessages: 15,             // 攒够多少条消息才整理一次
       batchMessages: 30,           // 单次整理最多读多少条
       writeCooldownMs: 60 * 60 * 1000, // 两次整理的最小间隔
+      // 主人日记与事实提炼共用「QQ 主人记忆」会话；**他人的日记单独一条会话**。
+      // 不能共用：sessions.prompt 是往同一个会话排队，上下文会累积 ——
+      // 主人刚聊的私事会留在那条会话的历史里，下一个人整理日记时模型看得见，
+      // 于是可能被写进 diary-others.jsonl。文件分了两本，草稿纸却是同一张。
+      learnerPreset: 'qq-chat',
+      workspaceTitle: '他人日记整理',
       recentDays: 7,               // 「最近的日记」时间窗口
       injectRecent: 5,             // 注入最近几条
       injectRecall: 4,             // 按当前话题检索注入几条
@@ -1546,6 +1585,10 @@ async function main() {
   const feedbackTimes = new Map();      // key -> [timestamp]：AI 反馈限频（内存态）
   const slangResearchingIds = new Set(); // 正在研究中的候选 id，防止重复排队
   const learnerSessions = new Set();    // sessionId -> 学习会话（不映射 QQ，不发送）
+  // sessionId -> 账本归属标签。**必须与句柄（ownerLearnerSessionId 等）解耦**：
+  // 句柄在会话失效时会被置 null 以便重建，若账本归属也依赖句柄，
+  // 那一瞬间的历史花费就会从「主人记忆」掉进「黑话学习」，账目张冠李戴。
+  const internalSessionLabels = new Map();
   const learnerCollectors = new Map();  // sessionId -> turn collector
   const learnerWaiters = new Map();     // sessionId -> [{resolve,reject,timer}]
   let slangLearnerSessionId = null;
@@ -1595,6 +1638,10 @@ async function main() {
   // 上次提炼时归档里累计到第几条，用来判断「攒够一批没有」。
   const ownerLastExtractAt = new Map();    // key -> 归档总行数
   let ownerLearnerSessionId = null;
+  // 他人日记专用会话：与 ownerLearnerSessionId **物理隔开**。
+  // 共用一条会话时，sessions.prompt 排队会让上下文累积，主人的私聊内容
+  // 会留在下一个人整理日记时看得见的历史里（详见 ensureDiaryOthersSession 注释）。
+  let diaryOthersSessionId = null;
   let ownerTaskChain = Promise.resolve();
 
   // ── 日记本（叙事性长期记忆） ─────────────────────────────────────────────
@@ -1614,6 +1661,18 @@ async function main() {
   } catch (error) {
     diaryWritable = false;
     log(`⚠️ 日记本加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
+  }
+  // 他人日记本：与主人日记同构，但**入库时强制带上归属 key**。
+  // 读失败同样降级为只读，理由与主人日记完全一致（不能让空库回写覆盖磁盘）。
+  let diaryOthersEntries = [];
+  let diaryOthersWritable = true;
+  try {
+    const loadedOthers = loadDiary(DIARY_OTHERS_FILE, { onCorrupt: (message) => log(`⚠️ ${message}`) });
+    diaryOthersEntries = loadedOthers.entries;
+    log(`他人日记本已加载：${diaryOthersEntries.length} 条`);
+  } catch (error) {
+    diaryOthersWritable = false;
+    log(`⚠️ 他人日记本加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
   }
   // 日记水位与事实提炼各自独立：两者处理同一条消息，但成功/失败互不牵连。
   // 共用水位会导致「事实提炼成功、日记失败」时那段对话被日记永久跳过。
@@ -2364,10 +2423,52 @@ async function main() {
     const value = unwrap(await api.sessions.create(params), 'owner-memory session.create');
     ownerLearnerSessionId = value.sessionId;
     learnerSessions.add(ownerLearnerSessionId);
+    internalSessionLabels.set(ownerLearnerSessionId, 'internal:主人记忆');
     api.events.follow(ownerLearnerSessionId);
     await ensureChatModel(ownerLearnerSessionId);
     log(`主人记忆学习会话已创建：${ownerLearnerSessionId}`);
     return ownerLearnerSessionId;
+  }
+
+  /**
+   * 他人日记专用会话。
+   *
+   * 为什么必须和主人记忆**分开**（这是隐私边界，不是省不省会话的问题）：
+   * `api.sessions.prompt` 是往同一个 sessionId 排队，DSH 那条会话的上下文会累积。
+   * 原先日记与事实提炼共用 ownerLearnerSessionId，于是主人刚聊的私事留在这条会话
+   * 的历史里；下一个白名单朋友整理日记时，模型在同一条会话上仍看得见那些内容，
+   * 有可能把它写进 diary-others.jsonl —— 那一刻文件是按 key 分开的，
+   * 但内容已经串了人。数据层隔离做得再严也挡不住草稿纸是同一张。
+   *
+   * 因此：主人的事实提炼 + 主人日记 → ownerLearnerSessionId；
+   *       其他人的日记        → diaryOthersSessionId（本条）。
+   * 两条会话互不可见，各自的工作区也分开（owner-memory-agent / diary-others-agent）。
+   */
+  async function ensureDiaryOthersSession() {
+    const preset = resolvePresetName(cfg.diary?.learnerPreset || cfg.agentPreset, { strict: true });
+    if (!preset) throw new Error('他人日记整理缺少已验证的安全 preset，拒绝创建或复用会话');
+    if (diaryOthersSessionId) {
+      learnerSessions.add(diaryOthersSessionId);
+      api.events.follow(diaryOthersSessionId);
+      return diaryOthersSessionId;
+    }
+    const dir = path.join(STATE_DIR, 'diary-others-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'diary-others workspace.create');
+    const workspaceTitle = cfg.diary?.workspaceTitle || '他人日记整理';
+    if (wsValue.created && workspaceTitle) {
+      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: workspaceTitle }); } catch {}
+    }
+    const params = { workspaceId: wsValue.workspace.workspaceId };
+    params.agentPreset = preset;
+    const value = unwrap(await api.sessions.create(params), 'diary-others session.create');
+    diaryOthersSessionId = value.sessionId;
+    learnerSessions.add(diaryOthersSessionId);
+    internalSessionLabels.set(diaryOthersSessionId, 'internal:他人日记');
+    api.events.follow(diaryOthersSessionId);
+    await ensureChatModel(diaryOthersSessionId);
+    log(`他人日记会话已创建：${diaryOthersSessionId}`);
+    return diaryOthersSessionId;
   }
 
   /**
@@ -2473,52 +2574,79 @@ async function main() {
    *
    * 先落盘再进内存：反过来的话，写盘失败时内存里会有一条"看起来存在"的日记，
    * 直到下次重启才消失 —— 期间 AI 会引用它、用户却看不到，属于最难查的一类不一致。
+   *
+   * 归属（owner / others）决定落到哪个文件。**不信任调用方传进来的 scope**：
+   * 一律由会话 key 重新判定，否则模型只要在参数里写 scope:'owner'
+   * 就能把自己的日记塞进主人的本子里。
    */
-  function writeDiaryEntry(raw) {
+  function writeDiaryEntry(raw, { key = '' } = {}) {
     if (!diaryEnabled()) return { ok: false, error: '日记本已关闭' };
-    if (!diaryWritable) {
+    const sessionKey = String(key || raw?.key || '').trim();
+    const forOwner = isOwnerPrivateSession(sessionKey);
+    const file = forOwner ? DIARY_FILE : DIARY_OTHERS_FILE;
+    const writable = forOwner ? diaryWritable : diaryOthersWritable;
+    if (!writable) {
       log('⚠️ 日记本处于只读降级状态（启动时加载失败），本次写入不落盘');
       return { ok: false, error: '日记本当前只读' };
     }
-    const result = appendDiaryEntry(DIARY_FILE, raw);
+    // key 必须一并写入：他人日记靠它做「只能看自己的」过滤。
+    const result = appendDiaryEntry(file, { ...raw, key: sessionKey, scope: forOwner ? 'owner' : 'other' });
     if (!result.ok) {
       log('写入日记失败:', result.error);
       return result;
     }
-    diaryEntries.push(result.entry);
-    // 内存里也要保持上限，否则长期运行会无限增长。
-    if (diaryEntries.length > DIARY_MAX_ENTRIES) {
-      diaryEntries = capEntries(diaryEntries);
+    if (forOwner) {
+      diaryEntries.push(result.entry);
+      // 内存里也要保持上限，否则长期运行会无限增长。
+      if (diaryEntries.length > DIARY_MAX_ENTRIES) {
+        diaryEntries = capEntries(diaryEntries);
+      }
+    } else {
+      diaryOthersEntries.push(result.entry);
+      if (diaryOthersEntries.length > DIARY_MAX_ENTRIES) {
+        diaryOthersEntries = capEntries(diaryOthersEntries);
+      }
     }
-    log(`日记已写入：[${result.entry.title}] (${result.entry.body.length} 字)`);
+    log(`日记已写入[${forOwner ? '主人' : '他人'}]：[${result.entry.title}] (${result.entry.body.length} 字)`);
     return result;
   }
 
   /**
    * 用一轮对话生成日记。
    *
-   * 与事实提炼共用学习会话：两者都是「整理刚发生的对话」，
-   * 各开一个 DSH 会话会让内存与连接开销翻倍，而它们本就串行执行、互不干扰。
-   * 但**水位与冷却各自独立** —— 事实提炼失败不该让日记也停摆。
+   * **按归属选会话，不能共用**：
+   *   - 主人的日记 → ownerLearnerSessionId（与事实提炼共用，两者都是「整理主人的对话」）
+   *   - 他人的日记 → diaryOthersSessionId（独立会话，见 ensureDiaryOthersSession）
+   * 共用一条会让主人的私聊内容留在别人整理日记时可见的上下文里。
+   * 水位与冷却各自独立 —— 事实提炼失败不该让日记也停摆。
    */
   async function runDiaryWrite(key) {
     if (!diaryEnabled()) return;
     if (!dshReady) return;
     const batchSize = Math.max(5, Number(cfg.diary?.batchMessages ?? 30));
     const offset = ownerArchiveOffset(`diary:${key}`);
-    const { records, nextOffset } = readArchiveSince(OWNER_CHAT_ARCHIVE, offset, { maxLines: batchSize });
+    // 多读几倍再按 key 过滤：归档是**所有会话共用**的一条流水，
+    // 只读 batchSize 行的话，别的会话插进来几条就把自己的消息挤出窗口，
+    // 表现为「明明聊了很多却永远不写日记」。与事实提炼保持一致（batchSize * 3）。
+    const { records, nextOffset } = readArchiveSince(OWNER_CHAT_ARCHIVE, offset, { maxLines: batchSize * 3 });
     const mine = records.filter((r) => r && r.key === key);
     if (mine.length < Math.max(5, Number(cfg.diary?.minMessages ?? 15))) return;
 
+    const forOwner = isOwnerPrivateSession(key);
     let sessionId;
     try {
-      sessionId = await ensureOwnerLearnerSession();
+      sessionId = forOwner ? await ensureOwnerLearnerSession() : await ensureDiaryOthersSession();
     } catch (error) {
       log(`日记整理会话创建失败 (${key}):`, error?.message ?? error);
       return;
     }
 
-    const promptText = buildDiaryWritePrompt(mine, { existing: diaryEntries.slice(-15), key });
+    // 「最近写过的日记（避免重复）」这份上下文也必须按归属取：
+    // 主人日记的标题里就有他的生活细节，塞进别人的整理提示词等于又漏一次。
+    const existingForThisKey = forOwner
+      ? diaryEntries.slice(-15)
+      : diaryOthersEntries.filter((e) => String(e.key ?? '') === (canonicalV2Key(key) ?? key)).slice(-15);
+    const promptText = buildDiaryWritePrompt(mine, { existing: existingForThisKey, key });
     let output;
     try {
       const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
@@ -2529,7 +2657,8 @@ async function main() {
       output = await waitLearnerTurn(sessionId);
     } catch (error) {
       if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
-        ownerLearnerSessionId = null;
+        // 只作废出错的那一条，别把另一条也牵连重建。
+        if (forOwner) ownerLearnerSessionId = null; else diaryOthersSessionId = null;
       }
       log(`日记整理失败 (${key}):`, error?.message ?? error);
       return;
@@ -2537,8 +2666,9 @@ async function main() {
 
     const parsed = parseDiaryJson(output);
     let written = 0;
+    // 归属由 key 决定（writeDiaryEntry 内部再判一次），这里不写死 scope：'owner'。
     for (const item of parsed) {
-      const r = writeDiaryEntry({ ...item, key, scope: 'owner' });
+      const r = writeDiaryEntry({ ...item, key }, { key });
       if (r.ok) written += 1;
     }
     if (written) log(`日记整理：${key} 写入 ${written} 条`);
@@ -2569,23 +2699,36 @@ async function main() {
   }
 
   /**
-   * 日记注入：只给主人私聊。
+   * 日记注入：主人私聊注入主人日记，**其他白名单私聊只注入他自己的日记**。
    *
-   * 理由与主人长期记忆完全相同 —— 日记里全是主人的私事。
-   * 群聊里注入等于把主人的生活当众念出来，这是本项目最不能犯的错误。
+   * 三条边界，缺一不可：
+   *   1) 群聊一律不注入 —— 群里有别人，念日记等于当众公开私事；
+   *   2) 非主人私聊只读 diary-others.jsonl，且**再按 key 过滤一次**：
+   *      该文件是所有人共用的，不过滤就会出现「A 的日记进了 B 的会话」，
+   *      这是比文件混用更隐蔽的一类泄漏（文件是分开的，但注入时串了人）；
+   *   3) 两本日记永不互相注入 —— 主人看不到别人的，别人也看不到主人的。
    */
   function diaryBlockFor(key, query) {
     if (!diaryEnabled()) return '';
-    if (!isOwnerPrivateSession(key)) return '';
-    if (!diaryEntries.length) return '';
-    return buildDiaryContext(diaryEntries, {
+    const opts = {
       query: String(query ?? '').slice(0, 500),
       now: Date.now(),
       recentDays: Number(cfg.diary?.recentDays ?? 7),
       recentMax: Number(cfg.diary?.injectRecent ?? 5),
       recallMax: Number(cfg.diary?.injectRecall ?? 4),
       styleMax: Number(cfg.diary?.injectStyle ?? 3),
-    });
+    };
+    if (isOwnerPrivateSession(key)) {
+      if (!diaryEntries.length) return '';
+      return buildDiaryContext(diaryEntries, opts);
+    }
+    // 非主人：只给「本人私聊」注入他自己的那本。
+    // 群聊 / 主人私聊都走不到这里（主人已被上面 return）。
+    if (!/^private:\d+$/.test(String(key ?? ''))) return '';
+    const canonical = canonicalV2Key(key) ?? String(key ?? '');
+    const mine = diaryOthersEntries.filter((e) => String(e.key ?? '') === canonical);
+    if (!mine.length) return '';
+    return buildDiaryContext(mine, opts);
   }
 
 
@@ -2603,6 +2746,7 @@ async function main() {
     if (saved?.sessionId && saved.preset === preset) {
       slangLearnerSessionId = String(saved.sessionId);
       learnerSessions.add(slangLearnerSessionId);
+      internalSessionLabels.set(slangLearnerSessionId, 'internal:黑话学习');
       api.events.follow(slangLearnerSessionId);
       await ensureChatModel(slangLearnerSessionId);
       return slangLearnerSessionId;
@@ -2619,6 +2763,7 @@ async function main() {
     const value = unwrap(await api.sessions.create(params), 'slang session.create');
     slangLearnerSessionId = value.sessionId;
     learnerSessions.add(slangLearnerSessionId);
+    internalSessionLabels.set(slangLearnerSessionId, 'internal:黑话学习');
     api.events.follow(slangLearnerSessionId);
     await ensureChatModel(slangLearnerSessionId);
     fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -2832,6 +2977,10 @@ async function main() {
   // 为什么不归档所有人：本次要学的是「关于主人的事实与偏好」。
   // 把群友的闲聊也塞进归档，只会让提取器把噪音当成主人的特征，
   // 而且归档与提炼都是要花 token 的 —— 无关内容不该占这个预算。
+  //
+  // 但**日记**是另一回事：日记记的是「和这个人的共同经历」，本来就该按会话分开存。
+  // 所以非主人的私聊也进归档（同一个 JSONL，靠 key 分水位），只是不进主人事实提炼 ——
+  // 事实提炼的产物是「关于主人的画像」，别人的对话混进去会把它污染成四不像。
   function feedOwnerArchive(key, sender, plainContent, extra = {}) {
     // 注意这里用「事实或日记任一开启」而不是只看 ownerMemoryEnabled：
     // 归档是两者的共同素材，若只按事实开关判断，主人关掉事实提炼后日记也会一起停，
@@ -2841,8 +2990,17 @@ async function main() {
     const text = plainContent.trim();
     if (!text || text.startsWith('/')) return;
     if (/进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(text)) return;
-    // 只收主人：私聊全部算主人；群聊只收 ownerQQ 发的。
-    if (!isOwnerSpeaker(key, extra)) return;
+    const isOwner = isOwnerSpeaker(key, extra);
+    if (!isOwner) {
+      // 非主人：只有「他人私聊」才归档，用于他自己的日记本。
+      // 群聊不归档 —— 群聊里每句话都归档会让归档量按群规模膨胀，
+      // 而群聊本来也不该有「和某个人的共同私事」这种叙事。
+      if (!diaryEnabled()) return;
+      if (!/^private:\d+$/.test(String(key ?? ''))) return;
+      archiveOwnerMessage(key, { ...extra, text, plain: text, sender: sender || String(key ?? '') });
+      maybeQueueDiaryWrite(key);
+      return;
+    }
     archiveOwnerMessage(key, { ...extra, text, plain: text, sender: sender || '主人' });
     maybeQueueOwnerExtraction(key);
     maybeQueueDiaryWrite(key);
@@ -3001,6 +3159,13 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // sessionId -> 本轮开始时是否还有「待回应的对方消息」。
+  //
+  // 为什么需要：reserved2 模式下 AI 的正文不会自动发到 QQ，必须由它主动调用发送工具。
+  // 它偶尔会忘（实测 2026-10-25 一小时内漏了 2 次，且都发生在用户提问、它给出答案之后），
+  // 于是「用户问了、AI 答了、手机上什么都没有」——看起来就是消息发不出去。
+  // 有了这个标记就能只在「本轮本该回复」时兜底，而不是把所有自言自语都转发出去。
+  const v2TurnReplyableSessions = new Map();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -3041,11 +3206,12 @@ async function main() {
     file: TOKEN_USAGE_FILE,
     log: (...args) => log(...args),
     priceTable,
-    // 会话 → QQ 会话归属：学习会话单独记账，其余未知会话归入「未归属」。
+    // 会话 → QQ 会话归属：内部会话单独记账，其余未知会话归入「未归属」。
+    // 三条内部会话必须分开记账：它们的花费占比不低，混在一个「黑话学习」名下
+    // 就没法判断钱到底花在学词、记主人的事、还是给朋友写日记上。
+    // 用 internalSessionLabels（建会话时写入）而不是句柄，理由见该 Map 的声明处。
     resolveKey: (sessionId) => reverse.get(sessionId)
-      ?? (learnerSessions.has(sessionId) || (slangLearnerSessionId && sessionId === slangLearnerSessionId)
-        ? 'internal:黑话学习'
-        : undefined)
+      ?? internalSessionLabels.get(sessionId)
   });
 
   /** sessionId -> 最近一次已知的实际模型。切换模型会让单价差好几倍，所以按会话记。 */
@@ -3392,6 +3558,7 @@ async function main() {
     sessionModels.delete(sessionId);
     modelAppliedSessions.delete(sessionId);
     sendToolSucceededSessions.delete(sessionId);
+    v2TurnReplyableSessions.delete(sessionId);
     pendingSendToolCalls.delete(sessionId);
     v2TurnStartAt.delete(sessionId);
     turnLeaseNoted.delete(sessionId);
@@ -3782,6 +3949,20 @@ async function main() {
       }
       return false;
     };
+    /**
+     * 反查「这个会话令牌属于哪个会话」。
+     *
+     * 权限分级必须按**令牌反查出的会话**判断，绝不能用请求体里的 key：
+     * 那个 key 是模型自己填的，它完全可以在 body 里写 private:<主人QQ> 冒充管理员。
+     * 令牌是桥接自己下发的、模型改不了，才是可信的「谁在调」。
+     */
+    const agentKeyForToken = (token) => {
+      if (typeof token !== 'string' || !token) return null;
+      for (const [k, st] of socialV2.conversations.entries()) {
+        if (st?.agentToken && tokenEq(token, st.agentToken)) return k;
+      }
+      return null;
+    };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
     const server = http.createServer(async (req, res) => {
@@ -3987,6 +4168,39 @@ async function main() {
         if (req.headers['x-agent-token'] && (url.pathname === '/api/stickers' || url.pathname.startsWith('/api/stickers/'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
+        }
+        // ── 权限分级：管理员专属能力 ────────────────────────────────────────
+        //
+        // 白名单只回答「能不能和 bot 说话」，不回答「能让 bot 替你干什么」。
+        // 之前所有 v2 工具只校验「令牌有效 + 会话在白名单内」，于是**任何**被放进来的人
+        // 都能让 bot 用主人账号发说说、改头像、改签名、往别人那里发文件 ——
+        // 这些是对外不可逆、且以主人身份做出的动作，提示词里那条软约束挡不住
+        // （模型可以被一句「帮我发条说说」说动，服务端不拦就是真发出去了）。
+        //
+        // 这里按「谁在调」硬判：以下能力只允许**主人私聊**那个会话调用。
+        // 其他人（白名单里的朋友）保持：聊天、发消息、发语音、问问题、看图、查状态 —— 够用且不可逆性低。
+        const OWNER_ONLY_PATHS = new Set([
+          '/api/socialV2/send-qzone',    // 公开发布，收不回来
+          '/api/socialV2/set-avatar',    // 改 bot 身份
+          '/api/socialV2/set-nickname',  // 改 bot 身份
+          '/api/socialV2/send-document', // 把工作目录里的文件外发给任意会话
+          '/api/roles/evo/apply',        // 改写 bot 人格卡本身
+        ]);
+        if (req.headers['x-agent-token'] && OWNER_ONLY_PATHS.has(url.pathname)) {
+          const token = req.headers['x-agent-token'];
+          const callerKey = agentKeyForToken(token);
+          // 先分「令牌不认识」和「令牌认识但不是主人」：两者都拒，但错误信息必须能区分，
+          // 否则令牌写错时会被告知「仅管理员可用」，排查方向直接跑偏。
+          if (!callerKey) {
+            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            return;
+          }
+          if (!isOwnerPrivateSession(callerKey)) {
+            log(`拒绝非管理员调用管理员专属能力：${url.pathname}（来自 ${callerKey ?? '未知会话'}）`);
+            appendActivity(`${callerKey ?? '未知会话'} 尝试调用管理员专属能力被拒：${url.pathname}`);
+            sendJson({ ok: false, error: '该能力仅管理员可用；你只能和 bot 聊天、发消息、发语音' }, 403);
+            return;
+          }
         }
         // agent token 默认拒绝：MCP 的 v2 工具同时携带 x-console-token 与 x-agent-token，
         // 因此仅靠控制台令牌挡不住 AI。这里改成白名单：只有 AI 真正需要的面放行，
@@ -5479,6 +5693,7 @@ async function main() {
               toolCallNames.delete(sid);
               pendingSendToolCalls.delete(sid);
               sendToolSucceededSessions.delete(sid);
+              v2TurnReplyableSessions.delete(sid);
               // 订阅也要退掉，否则它会在每次重连时被重新 follow 并重发整份快照。
               api.events.forget?.(sid);
             }
@@ -7866,8 +8081,10 @@ async function main() {
         // 不是后台黑箱。但仍然**不开删除/覆盖**：原文只能追加，
         // 纠错走 /diary/correct（追加 correction，不改正文）。
         //
-        // 隐私闸门与 owner-memory 完全一致：只有主人私聊能读写。
-        // 这是本项目最容易出事的一处 —— 日记里全是主人的私事。
+        // 两本书，界限按会话分：
+        //   · 主人私聊  → diary.jsonl（全量，含主人在群里说过的话整理出来的条目）
+        //   · 他人私聊  → diary-others.jsonl，且**只给本人看本人那几条**
+        //   · 群聊      → 一律拒绝（群里有别人，读写日记都等于公开隐私）
         if (url.pathname === '/api/socialV2/diary' || url.pathname === '/api/socialV2/diary/correct') {
           const isWrite = req.method === 'POST';
           if (req.method !== 'GET' && !isWrite) { sendJson({ ok: false, error: '不支持的方法' }, 405); return; }
@@ -7886,17 +8103,36 @@ async function main() {
           if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (token && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (token && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_*' }, 403); return; }
-          if (!isOwnerPrivateSession(key)) {
-            sendJson({ ok: false, error: '日记本只能在主人本人的私聊中读写；当前会话不是主人私聊' }, 403);
+          const isOwnerBook = isOwnerPrivateSession(key);
+          // 非主人只允许「本人的私聊」。群聊里就算说话人是白名单成员也不行：
+          // 那个会话的可见范围是一整个群，日记写进去就等于被全群看见。
+          if (!isOwnerBook && !/^private:\d+$/.test(key)) {
+            sendJson({ ok: false, error: '日记本只能在私聊中读写；群聊不提供日记能力' }, 403);
             return;
           }
           if (!diaryEnabled()) { sendJson({ ok: false, error: '日记本已关闭' }, 403); return; }
+
+          // 归属过滤：他人只能看到/改到自己那本里 key 匹配的条目。
+          const canonicalKey = canonicalV2Key(key) ?? key;
+          const bookAll = isOwnerBook ? diaryEntries : diaryOthersEntries;
+          const bookMine = isOwnerBook
+            ? bookAll
+            : bookAll.filter((e) => String(e.key ?? '') === canonicalKey);
+          const bookFile = isOwnerBook ? DIARY_FILE : DIARY_OTHERS_FILE;
+          const bookWritable = isOwnerBook ? diaryWritable : diaryOthersWritable;
 
           if (url.pathname === '/api/socialV2/diary/correct') {
             const id = String(body.id ?? '').trim();
             const text = String(body.text ?? '').trim();
             if (!id || !text) { sendJson({ ok: false, error: 'id / text 不能为空' }, 400); return; }
-            const r = appendDiaryCorrection(DIARY_FILE, diaryEntries, id, text);
+            // 必须先在**自己的**那本里命中，防止拿别人的 id 来纠错（写入的是整个文件，
+            // 不校验归属就等于能改任意人的日记）。
+            if (!bookMine.some((e) => e.id === id)) {
+              sendJson({ ok: false, error: '没有找到这条日记（只能更正你自己的日记）' }, 404);
+              return;
+            }
+            // 传整本：appendDiaryCorrection 会 writeAll 整个数组，只传子集会把别人的条目抹掉。
+            const r = appendDiaryCorrection(bookFile, bookAll, id, text);
             if (!r.ok) { sendJson({ ok: false, error: r.error }, 400); return; }
             sendJson({ ok: true, entry: { id: r.entry.id, title: r.entry.title, corrections: r.entry.corrections } });
             return;
@@ -7912,26 +8148,26 @@ async function main() {
               quote: body.quote,
               importance: body.importance,
               key,
-              scope: 'owner',
-            });
+            }, { key });
             if (!r.ok) { sendJson({ ok: false, error: r.error }, 400); return; }
             sendJson({ ok: true, entry: { id: r.entry.id, title: r.entry.title, time: r.entry.createdAt } });
             return;
           }
 
-          // GET：检索或列表
+          // GET：检索或列表（都只在自己的那本里查）
           const q = String(url.searchParams.get('q') ?? '').trim();
           const mode = String(url.searchParams.get('mode') ?? '').trim();
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
           if (mode === 'recent' || !q) {
-            const list = [...diaryEntries]
+            const list = [...bookMine]
               .sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0))
               .slice(0, limit);
             sendJson({
               ok: true,
               enabled: diaryEnabled(),
-              writable: diaryWritable,
-              total: diaryEntries.length,
+              writable: bookWritable,
+              scope: isOwnerBook ? 'owner' : 'other',
+              total: bookMine.length,
               entries: list.map((e) => ({
                 id: e.id, title: e.title, body: e.body, mood: e.mood,
                 tags: e.tags, people: e.people, importance: e.importance,
@@ -7941,7 +8177,7 @@ async function main() {
             });
             return;
           }
-          const hits = recallEntries(diaryEntries, {
+          const hits = recallEntries(bookMine, {
             q,
             limit,
             withinDays: Number(url.searchParams.get('withinDays')) || 0,
@@ -7953,7 +8189,8 @@ async function main() {
           sendJson({
             ok: true,
             enabled: diaryEnabled(),
-            total: diaryEntries.length,
+            scope: isOwnerBook ? 'owner' : 'other',
+            total: bookMine.length,
             matched: hits.length,
             q,
             entries: hits.map((h) => ({
@@ -8419,6 +8656,7 @@ async function main() {
           reverse.clear();
           collectors.clear();
           sendToolSucceededSessions.clear();
+          v2TurnReplyableSessions.clear();
           pendingSendToolCalls.clear();
           v2TurnStartAt.clear();
           toolCallNames.clear();
@@ -11650,6 +11888,18 @@ async function main() {
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    // 权限分级提示（硬性规则的**告知**部分；真正的门在控制台 HTTP 层按令牌判）。
+    //
+    // 为什么要写进 prompt：模型不知道自己是「管理员那一侧」还是「普通朋友那一侧」时，
+    // 会按人格卡里那句「群友没有管理权限」去回绝**主人**，或者反过来被朋友一句话说动
+    // 就去发说说。这里让它明确知道自己这一侧能做什么，两边都不会猜错。
+    // 注意：这只是提示，不是边界 —— 有人会绕过话术直接调工具，服务端那份 OWNER_ONLY_PATHS 才是门。
+    const privilegeLine = isOwnerPrivateSession(key)
+      ? '【你的权限】当前是管理员本人的私聊：你可以正常执行管理类操作（发QQ空间说说、改头像/签名、发文件、调整人格），但这些是对外不可逆的动作，动手前要确认对方真的要。\n\n'
+      : '【你的权限】当前对话对象是白名单里的普通朋友，不是管理员。你只能：陪他聊天、给他发消息、发语音、回答他的问题、看图片/表情。\n'
+        + '以下事情**一律不能做，也不要假装做到**：发QQ空间说说、改你的头像或签名、往这里发工作目录里的文件、修改你的人格/设定、切换角色、任何"管理"操作。\n'
+        + '他如果要求这些，就自然地说这不是你能决定的（"这个得管理员来"），不要解释内部机制、不要说工具名、不要报错信息。\n'
+        + '另外：管理员私聊里的事、他的日记、他的个人信息，一个字都不能对这个人说；他问起"你主人今天怎么样"这类话题，就当普通闲聊轻轻带过。\n\n';
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -11657,6 +11907,11 @@ async function main() {
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    // 【必须用工具发】以前只有 bootstrap 那条提示词说了「文本输出不会自动发送」，
+    // 而 bootstrap 每个会话只发生一次；后续唤醒（@/关键词/提问…）都没这句，
+    // 模型在长上下文里很容易忘，于是只输出正文、不调发送工具——用户侧表现为「消息发不出去」。
+    // 兜底转发只能兜住「本轮有未读」的情况，主动冒泡仍然会丢，所以这条要常驻。
+    const sendRuleLine = '【必须用工具发】你的文本输出不会自动发送到 QQ。想说话就用 qq_send_message / qq_reply 发出去；只写正文不调用发送工具，对方什么都不会收到。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
@@ -11697,7 +11952,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    const base = roleLine + identityLine + tokenLine + privilegeLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12823,6 +13078,15 @@ async function main() {
               pendingSendToolCalls.delete(frame.sessionId);
               v2TurnStartAt.set(frame.sessionId, Date.now());
               turnLeaseNoted.delete(frame.sessionId);
+              // 记下「本轮开始时还有没有对方的消息等着回应」。
+              // 它的唯一用途是决定正文兜底要不要发出去：有人问了才补发，纯自言自语一律丢弃。
+              if (currentMode === 'reserved2' && key) {
+                const stForReplyable = getSocialV2State(key);
+                const pendingFromOther = (Array.isArray(stForReplyable.unread) ? stForReplyable.unread : [])
+                  .some((m) => m && !m.isSelf);
+                if (pendingFromOther) v2TurnReplyableSessions.set(frame.sessionId, true);
+                else v2TurnReplyableSessions.delete(frame.sessionId);
+              }
             }
             if (frame.event.type === 'tool/call') {
               const toolName = String(frame.event.data?.name ?? '');
@@ -12910,6 +13174,9 @@ async function main() {
               turnLeaseNoted.delete(frame.sessionId);
               const sendToolSucceeded = sendToolSucceededSessions.has(frame.sessionId);
               sendToolSucceededSessions.delete(frame.sessionId);
+              // 兜底判断要用，先取出来再清（同 sendToolSucceeded）。
+              const replyExpected = v2TurnReplyableSessions.get(frame.sessionId) === true;
+              v2TurnReplyableSessions.delete(frame.sessionId);
               pendingSendToolCalls.delete(frame.sessionId);
               toolCallNames.delete(frame.sessionId);
               // 标记本次 turn 是否为“活跃超时退场”发言（用于准确回到观望，避免把旧回复误判为退场）
@@ -13078,8 +13345,32 @@ async function main() {
                     }
                   }
                 } else if (currentMode === 'reserved2') {
-                  log(`[reserved2] AI 内部输出（不自动转发）(${key}): ${plain.slice(0, 80)}`);
-                  appendActivity(`${key} [reserved2] AI 内部输出：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  // reserved2 下正文默认不自动转发：正常路径是 AI 自己调 qq_send_message。
+                  // 兜底只针对一种情况——本轮**开始时还有对方的消息没被回应**，而 AI 只输出了
+                  // 正文、没调任何发送工具。这类回合的正文几乎一定就是想说的话（用户问了、它答了），
+                  // 丢弃会让用户看到「消息发不出去」。纯自言自语（定时唤醒、主动检查）没有未读，
+                  // replyExpected 为 false，仍然只记日志、不发送。
+                  if (replyExpected && !shouldBlockSilentReply(key)) {
+                    const hasKnownTokenFb = [...KNOWN_AGENT_TOKENS].some((t) => t && plain.includes(t));
+                    if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownTokenFb)) {
+                      log(`[reserved2] ⚠️ 兜底转发被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownTokenFb ? '（含会话令牌）' : ''}`);
+                      appendActivity(`${key} [reserved2] 兜底转发被拦截（疑似敏感信息）`);
+                    } else {
+                      log(`[reserved2] 有未回应消息但本轮未调用发送工具，兜底转发 (${key}) ${plain.length} 字: ${plain.slice(0, 80)}`);
+                      appendActivity(`${key} [reserved2] 兜底转发：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                      await sendToQQ(key, plain);
+                      if (lastSendSucceeded(key)) {
+                        const stFb = getSocialV2State(key);
+                        stFb.lastAiReplyAt = Date.now();
+                        saveSocialV2State();
+                      } else {
+                        log(`[reserved2] ${key} 兜底转发未送达（QQ 发送失败）`);
+                      }
+                    }
+                  } else {
+                    log(`[reserved2] AI 内部输出（不自动转发）(${key}): ${plain.slice(0, 80)}`);
+                    appendActivity(`${key} [reserved2] AI 内部输出：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  }
                 } else {
                   if (shouldBlockSilentReply(key)) {
                     log(`静默模式，拦截在途回复 (${key})`);
@@ -13205,6 +13496,7 @@ async function main() {
         collectors.clear(); // 清除旧 turn collector，避免重连后残留导致重复累加
         social.silentTurns.clear(); // 清除未消费的摘要静默名额，避免重连后吞掉正常回复
         sendToolSucceededSessions.clear();
+        v2TurnReplyableSessions.clear();
         pendingSendToolCalls.clear();
         v2TurnStartAt.clear();
         toolCallNames.clear();

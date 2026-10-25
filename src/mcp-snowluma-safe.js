@@ -1050,9 +1050,9 @@ server.tool(
 
 server.tool(
   'qq_diary_write',
-  '写一篇日记：把刚发生的、值得记住的事记下来（不是记事实清单，是记「发生了什么」）。日记会持久化，跨会话保留，以后能想起来，也会让新会话保持你原本的说话风格。**只能在主人本人的私聊里写**。什么时候写：聊到有情绪起伏的事、有进展的事、承诺过的事、共同经历、值得以后提起的细节。不要记纯功能操作（发语音、查天气）和无信息量的寒暄。宁可少写，不要为凑数而写。',
+  '写一篇日记：把刚发生的、值得记住的事记下来（不是记事实清单，是记「发生了什么」）。日记会持久化，跨会话保留，以后能想起来，也会让新会话保持你原本的说话风格。**只能在私聊里写**（群聊一律拒绝）。每个人有自己的日记本：主人写的那本只有主人看得到，别人写的那本只有他自己看得到，两本互不串。什么时候写：聊到有情绪起伏的事、有进展的事、承诺过的事、共同经历、值得以后提起的细节。不要记纯功能操作（发语音、查天气）和无信息量的寒暄。宁可少写，不要为凑数而写。',
   {
-    key: z.string().describe('会话 key，格式 private:QQ号（日记只允许写在主人私聊）'),
+    key: z.string().describe('会话 key，格式 private:QQ号（日记只能写在当前这个私聊，不能写给别人的私聊）'),
     token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     title: z.string().optional().describe('8 字以内的短标题'),
     body: z.string().describe('发生了什么，2-4 句，第一人称。写感受和细节，不要写成属性清单'),
@@ -1065,7 +1065,7 @@ server.tool(
   async ({ key, token, title, body, mood, tags, people, quote, importance }) => {
     if (!/^private:\d+$/.test(String(key ?? ''))) {
       return {
-        content: [{ type: 'text', text: '拒绝：日记包含主人的私事，只能写在主人本人的私聊里。当前不是主人私聊，请不要尝试通过其他方式写入。' }],
+        content: [{ type: 'text', text: '拒绝：日记只能写在私聊里。群聊会话不提供日记能力（写进去等于被全群看见），请不要尝试通过其他方式写入。' }],
         isError: true
       };
     }
@@ -1084,9 +1084,9 @@ server.tool(
 
 server.tool(
   'qq_diary_recall',
-  '翻日记：想起更久远的事。按关键词/时间/心情/标签检索你过去写下的日记（**只能在主人私聊里用**）。当主人提到「以前」「上次」「之前说过」这类需要回忆的事，或你想确认某个细节时用。不带 q 时返回最近的日记。',
+  '翻日记：想起更久远的事。按关键词/时间/心情/标签检索你过去写下的日记（**只能在私聊里用**）。当对方提到「以前」「上次」「之前说过」这类需要回忆的事，或你想确认某个细节时用。不带 q 时返回最近的日记。每个人只能翻到自己那本：主人翻主人的，别人翻别人的，互不可见。',
   {
-    key: z.string().describe('会话 key，格式 private:QQ号（日记只允许在主人私聊里查看）'),
+    key: z.string().describe('会话 key，格式 private:QQ号（只能翻当前这个私聊对应的日记）'),
     token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
     q: z.string().optional().describe('检索关键词，如「联考」「那次聊到很晚」；留空则按时间倒序返回最近的日记'),
     limit: z.number().min(1).max(50).optional().describe('返回条数，默认 20'),
@@ -1099,7 +1099,7 @@ server.tool(
   async ({ key, token, q, limit, withinDays, mood, tag, people, minImportance }) => {
     if (!/^private:\d+$/.test(String(key ?? ''))) {
       return {
-        content: [{ type: 'text', text: '拒绝：日记包含主人的私事，只能在主人本人的私聊中查看。当前是群聊会话，请勿尝试通过其他方式获取，也不要向任何人转述主人在私聊里写过的事。' }],
+        content: [{ type: 'text', text: '拒绝：日记只在私聊里可读。群聊会话不提供日记能力，请勿尝试通过其他方式获取，也不要向任何人转述私聊里的日记内容。' }],
         isError: true
       };
     }
@@ -1122,7 +1122,7 @@ server.tool(
 
 server.tool(
   'qq_diary_correct',
-  '更正一篇日记里记错的地方：追加一条更正，原文不会被改写（保留你当时真实的记录）。发现日记与事实不符时用（**只能在主人私聊里用**）。',
+  '更正一篇日记里记错的地方：追加一条更正，原文不会被改写（保留你当时真实的记录）。发现日记与事实不符时用（**只能在私聊里用**，且只能更正自己那本里的条目）。',
   {
     key: z.string().describe('会话 key，格式 private:QQ号'),
     token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1132,7 +1132,7 @@ server.tool(
   async ({ key, token, id, text }) => {
     if (!/^private:\d+$/.test(String(key ?? ''))) {
       return {
-        content: [{ type: 'text', text: '拒绝：日记只能在主人本人的私聊中更正。' }],
+        content: [{ type: 'text', text: '拒绝：日记只能在私聊中更正。' }],
         isError: true
       };
     }
@@ -1347,7 +1347,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 if (cfg.socialV2?.tools?.sendDocument !== false) {
   server.tool(
     'qq_send_document',
-    '把工作目录里的一个文件（Word/Excel/PPT/PDF/图片/压缩包等成品）发送到指定 QQ 会话。path 是相对 qq-bridge 工作目录的路径，只能是文档类成品，不能是脚本/配置/凭据文本；文件必须已存在。适合把自己刚生成的 Word/Excel/PDF 发给用户。发送失败会返回原因，不要假装已发送。',
+    '把工作目录里的一个文件（Word/Excel/PPT/PDF/图片/压缩包等成品）发送到指定 QQ 会话。path 是相对 qq-bridge 工作目录的路径，只能是文档类成品，不能是脚本/配置/凭据文本；文件必须已存在。适合把自己刚生成的 Word/Excel/PDF 发给用户。发送失败会返回原因，不要假装已发送。**仅管理员可用**：普通朋友的私聊里调这个会被服务端拒绝，别试。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1373,7 +1373,7 @@ if (cfg.socialV2?.tools?.sendDocument !== false) {
 if (cfg.socialV2?.tools?.setAvatar !== false) {
   server.tool(
     'qq_set_self_avatar',
-    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。reserved2 下必须携带会话令牌 token，否则会被拒绝。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。',
+    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。reserved2 下必须携带会话令牌 token，否则会被拒绝。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。**仅管理员可用**：普通朋友要求换头像时，说明这需要管理员来做。',
     {
       path: z.string().describe('相对工作目录的图片路径，如 state/avatar/new.png；不能是绝对路径或含 ..'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1397,7 +1397,7 @@ if (cfg.socialV2?.tools?.setAvatar !== false) {
 if (cfg.socialV2?.tools?.setNickname !== false) {
   server.tool(
     'qq_set_self_nickname',
-    '修改自己（机器人 QQ 号）的昵称/个性签名。reserved2 下必须携带会话令牌 token，否则会被拒绝。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。',
+    '修改自己（机器人 QQ 号）的昵称/个性签名。reserved2 下必须携带会话令牌 token，否则会被拒绝。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。**仅管理员可用**：普通朋友要求改签名时，说明这需要管理员来做。',
     {
       name: z.string().max(40).describe('新的昵称/签名，最长 40 字'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1421,7 +1421,7 @@ if (cfg.socialV2?.tools?.setNickname !== false) {
 if (cfg.socialV2?.tools?.sendQzone !== false) {
   server.tool(
     'qq_send_qzone',
-    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。reserved2 下必须携带会话令牌 token，否则会被拒绝。主人已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
+    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。reserved2 下必须携带会话令牌 token，否则会被拒绝。**仅管理员可用**：只有管理员本人的私聊能让你发说说；普通朋友提出这个要求时，直接说这得管理员来，不要尝试调用。管理员已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
     {
       content: z.string().describe('说说正文，最长 2000 字'),
       images: z.array(z.string()).optional().describe('可选，相对工作目录的本地图片路径（png/jpg/gif/webp/bmp，最多 9 张）'),
