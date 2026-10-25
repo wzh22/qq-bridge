@@ -212,39 +212,90 @@ function patchCordis({ patchFile, original, text, removed }) {
 }
 
 /**
+ * 判断一个路径当前是链接、真实目录，还是不存在。
+ *
+ * 为什么不直接用 `lstatSync(p).isSymbolicLink()`：
+ *   Node 在 Windows 上把 junction 报告成 S_IFDIR（mode 0o40666），与真实目录
+ *   **完全一致**，isSymbolicLink() 恒为 false。于是「上一轮装好的 junction」
+ *   会被误判成「用户手工放的真目录」，安装直接 fatal。
+ *   唯一可靠的信号是**父目录 readdir 的 Dirent**：同一条路径，
+ *   `lstat().isSymbolicLink` 是 false，而 `Dirent.isSymbolicLink()` 是 true。
+ *
+ * 还有一个坑：**悬空 junction 的 lstatSync 会抛 ENOENT**。旧代码把它当成
+ * 「路径不存在」继续往下走，接着 symlinkSync 撞 EEXIST，整个安装崩掉。
+ * 父目录 readdir 能看到它（Dirent.isSymbolicLink = true），所以从 readdir 判断。
+ *
+ * 返回：'link' | 'dir' | 'absent'
+ */
+function inspectPathKind(linkPath) {
+  const parent = path.dirname(linkPath);
+  const base = path.basename(linkPath);
+  const eq = (a, b) => (process.platform === 'win32'
+    ? String(a).toLowerCase() === String(b).toLowerCase()
+    : String(a) === String(b));
+
+  try {
+    const entries = fs.readdirSync(parent, { withFileTypes: true });
+    const hit = entries.find((entry) => eq(entry.name, base));
+    if (hit) return hit.isSymbolicLink() ? 'link' : 'dir';
+  } catch (error) {
+    // 父目录不存在 ⇒ 路径必然不存在；其它错误不该吞掉。
+    if (error?.code !== 'ENOENT') fatal(`failed to inspect ${linkPath}: ${error?.message ?? error}`);
+    return 'absent';
+  }
+
+  // 父目录读成功但没这个条目 ⇒ 确实不存在（含已被删掉的悬空链接）。
+  return 'absent';
+}
+
+/**
+ * 取链接的最终指向，穿透 Windows junction。
+ *
+ * `fs.realpathSync()` 在 junction 上返回**链接自身路径**而不穿透，
+ * 于是「已存在且指向本仓库」永远判成 false，每次安装都白重建一遍。
+ * `.native` 版本走系统 realpath，才会真正解析到目标。
+ */
+function resolveLinkTarget(p) {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return null; // 悬空链接 / 目标不可达
+  }
+}
+
+function samePath(a, b) {
+  if (!a || !b) return false;
+  return process.platform === 'win32'
+    ? String(a).toLowerCase() === String(b).toLowerCase()
+    : String(a) === String(b);
+}
+
+/**
  * 建一个指向本仓库的目录链接（Windows 用 junction，免管理员权限）。
  *
  * 链接已存在时校验指向：指向本仓库 ⇒ 跳过（幂等）；指向别处/悬空 ⇒ 重建。
  * 指向别处说明用户手工挪过文件，这里按"重装"处理并明确打印。
+ * 真实目录绝不删除 —— 那可能是用户自己放的东西，交给人处理。
  */
 function ensureDirLink(linkPath, targetDir, label) {
   if (!fs.existsSync(targetDir)) fatal(`${label} 源目录不存在: ${targetDir}`);
   ensureDir(path.dirname(linkPath));
 
-  let existing = null;
-  try {
-    existing = fs.lstatSync(linkPath);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') fatal(`failed to inspect ${label}: ${error?.message ?? error}`);
+  const kind = inspectPathKind(linkPath);
+
+  if (kind === 'dir') {
+    fatal(`${label} 已存在且不是符号链接/junction: ${linkPath}。请先手工移走或删除，然后重跑。`);
   }
 
-  if (existing) {
-    if (!existing.isSymbolicLink()) {
-      fatal(`${label} 已存在且不是符号链接/junction: ${linkPath}。请先手工移走或删除，然后重跑。`);
-    }
-    let sameTarget = false;
-    try {
-      const target = fs.realpathSync(linkPath);
-      const expected = fs.realpathSync(targetDir);
-      sameTarget = process.platform === 'win32'
-        ? String(target).toLowerCase() === String(expected).toLowerCase()
-        : String(target) === String(expected);
-    } catch {}
-    if (sameTarget) {
+  if (kind === 'link') {
+    const actual = resolveLinkTarget(linkPath);
+    const expected = resolveLinkTarget(targetDir);
+    if (samePath(actual, expected)) {
       log(`${label} 已存在且指向本仓库: ${linkPath}`);
       return linkPath;
     }
     log(`${label} 存在但指向别处/失效，重建: ${linkPath}`);
+    // 只删链接本身：实测 rmSync(junction, recursive) 不会动目标目录里的内容。
     fs.rmSync(linkPath, { recursive: true, force: true });
   }
 

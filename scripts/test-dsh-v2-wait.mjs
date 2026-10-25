@@ -97,13 +97,27 @@ async function main() {
   console.log('TOOLS_TEXT_END');
   const hasWait = text.includes('qq_wait_for_messages');
   console.log('HAS_qq_wait_for_messages=' + hasWait);
+
+  // 空文本 ≠ 工具没注册。这两件事过去被混成同一句「未看到 qq_wait_for_messages」，
+  // 害人去查工具装配，实际是模型侧没吐字（上游中转站分组关闭时就是 403 + 空文本）。
+  // 现在分开报，把排查方向指对。
+  if (!text.trim()) {
+    console.log('RESULT=INCONCLUSIVE_EMPTY_MODEL_REPLY');
+    console.error(
+      '⚠️ 模型返回空文本，无法据此判断工具面（不是工具没注册）。\n' +
+      '   常见原因：上游 provider 报错/分组关闭、鉴权失效、模型选择失败。\n' +
+      '   请先看 bridge.log 里同一时段的模型错误，再来跑本测试。\n' +
+      '   本用例的真实断言是「工具面含 qq_wait_for_messages」，空文本时它没有被验证 —— ' +
+      '按仓库规矩（跳过不等于通过）判红，但红因是模型侧重试，不是代码缺陷。'
+    );
+    process.exit(1);
+  }
+
   console.log('RESULT=' + (hasWait ? 'WAIT_TOOL_VISIBLE' : 'CHECK_FAILED'));
   // 这个测试原来只打印 CHECK_FAILED 却仍然 exit 0，于是任何用退出码判断的
   // 回归入口（run-all-tests / CI）都会把它记成「通过」——假绿灯。
-  // 实测它确实会失败：模型返回的文本为空（TOOLS_TEXT 之间什么都没有），
-  // 断言根本没拿到可判定的内容。宁可红，也不能让空结果冒充通过。
   if (!hasWait) {
-    console.error('❌ 未在返回文本里看到 qq_wait_for_messages（文本长度 ' + text.length + '）');
+    console.error('❌ 模型确实回了 ' + text.length + ' 字，但其中没有 qq_wait_for_messages。');
     process.exit(1);
   }
 }
