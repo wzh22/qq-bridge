@@ -25,11 +25,19 @@ const FILTER = filterIdx >= 0 ? argv[filterIdx + 1] : null;
 // 这些测试要么依赖外部服务（语音合成、RVC、GIF 编解码），要么要起浏览器，
 // 单跑几分钟且容易因环境缺件失败。--fast 时跳过，但**不算通过**，
 // 单独列为 skipped 并在末尾明确报出来，避免「跳过」被读成「通过」。
+//
+// `test-console` 为什么在这一组里（2026-10-25 加）：
+//   它是唯一会打**真实生产控制台**的测试 —— 建删真实人格、改生产 config.json
+//   的群白名单、再调 /api/test-send 真的发一条群消息。以前 `--fast` 全量跑
+//   会把它带到生产上：18:38、19:14、19:17 三次日志里都是同样的四行
+//   「白名单已更新（群: 123456789）… 白名单已更新（群: 无）」。
+//   脚本本身现在也有端口守卫（检测到活桥接就 exit 0 跳过），两道一起挡：
+//   即便有人把它加回 --fast，也不会在没显式 --allow-live 时动生产。
 const SLOW = new Set([
   'test-voice', 'test-voice-gui', 'test-voice-system', 'test-voice-synthesis',
   'test-voice-preview', 'test-voice-volume', 'test-gpt-sovits', 'test-rvc',
   'test-gif-e2e', 'test-media-search', 'test-vision-media', 'test-console-ui',
-  'test-dsh-session-retire', 'test-mux-reconnect', 'test-onebot-connection',
+  'test-console', 'test-dsh-session-retire', 'test-mux-reconnect', 'test-onebot-connection',
   'test-snowluma-upstream-health', 'test-diary-e2e', 'test-owner-memory-e2e',
 ]);
 
