@@ -90,6 +90,13 @@ import {
   DIARY_MAX_ENTRIES,
   MOODS,
 } from './diary.js';
+import {
+  buildInboxSummaryPrompt,
+  parseInboxSummary,
+  renderInboxSummary,
+  maskQQ,
+  MAX_SESSIONS_PER_SUMMARY,
+} from './owner-inbox.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -928,7 +935,11 @@ function loadConfig() {
         // 默认**开启**是有意的：它只影响 bot 自己的说话风格，不动别人的东西；
         // 而且改动都走「提案 → 落盘 → apply」且留快照可回滚，风险是可控的。
         // 想完全禁止 bot 改自己，把它设成 false 即可（工具会在注册期就消失）。
-        roleEvolve: true
+        roleEvolve: true,
+        // 主人跨会话动态：只给主人私聊用，且只返回「谁找过 / 聊了哪类话题 / 回没回」，
+        // 不返回任何原文（parseInboxSummary 还会再查一遍有没有引用原话）。
+        // 默认开启：它只影响主人自己的知情范围，不外发、不改任何远端状态。
+        ownerInbox: true
       },
       wake: {
         defaultMode: 'diving',
@@ -1642,6 +1653,16 @@ async function main() {
   // 共用一条会话时，sessions.prompt 排队会让上下文累积，主人的私聊内容
   // 会留在下一个人整理日记时看得见的历史里（详见 ensureDiaryOthersSession 注释）。
   let diaryOthersSessionId = null;
+  // 「主人跨会话动态」的转述会话：与上面两条**再隔开一层**。
+  //
+  // 这条会话的任务是把「别人和 bot 的私聊」转述给主人听（只给概括，不给原文）。
+  // 绝不能在 ownerLearnerSessionId 上跑：那条会话里留着主人自己的私聊内容，
+  // 让它在同一上下文里读到别人的私聊，就会把两边混着转述 —— 这正是 4acf5be
+  // 修掉的那类「草稿纸是同一张」的泄漏。
+  let ownerInboxSessionId = null;
+  // 转述结果缓存：主人反复问「刚谁找我」时不必每次跑一轮模型。
+  // 值形如 { at: number, data: {...} }；TTL 见 ownerInboxCacheTtlMs()。
+  const ownerInboxCache = new Map(); // ownerKey -> { at, data }
   let ownerTaskChain = Promise.resolve();
 
   // ── 日记本（叙事性长期记忆） ─────────────────────────────────────────────
@@ -2472,6 +2493,50 @@ async function main() {
   }
 
   /**
+   * 主人跨会话动态的**转述会话**（B 方案：只给概括，不给原文）。
+   *
+   * 主人问「刚才谁找过我 / 别人跟我说了啥」时，bot 在主人窗口里看不到别的会话
+   * —— 那是刻意的隔离（每个 QQ 会话一条独立 DSH 会话、独立 agentToken）。
+   * 但「完全不知道有没有人找我」并不合理：主人应当知道**有事发生**，
+   * 只是不该看到别人私聊的原文（那是对方的隐私）。
+   *
+   * 因此这条链路的设计是：
+   *   1. 桥接在**本地**把目标会话的消息拼成结构化素材（原文只送到这条内部会话）；
+   *   2. 内部会话的模型把它转述成概括，明确不许引用原话、不许带细节；
+   *   3. 主人只拿到概括。
+   * 原文因此不进主人的上下文 —— 边界在「谁的上下文看得见什么」，而不是只靠提示词约束。
+   *
+   * 与会话归属的关系：这条会话不映射任何 QQ 会话，只做一次性转述，
+   * 且与 ownerLearnerSessionId / diaryOthersSessionId 都不共用（理由见上面声明处）。
+   */
+  async function ensureOwnerInboxSession() {
+    const preset = resolvePresetName(cfg.ownerInbox?.learnerPreset || cfg.agentPreset, { strict: true });
+    if (!preset) throw new Error('跨会话转述缺少已验证的安全 preset，拒绝创建或复用会话');
+    if (ownerInboxSessionId) {
+      learnerSessions.add(ownerInboxSessionId);
+      api.events.follow(ownerInboxSessionId);
+      return ownerInboxSessionId;
+    }
+    const dir = path.join(STATE_DIR, 'owner-inbox-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'owner-inbox workspace.create');
+    const workspaceTitle = cfg.ownerInbox?.workspaceTitle || '主人跨会话转述';
+    if (wsValue.created && workspaceTitle) {
+      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: workspaceTitle }); } catch {}
+    }
+    const params = { workspaceId: wsValue.workspace.workspaceId };
+    params.agentPreset = preset;
+    const value = unwrap(await api.sessions.create(params), 'owner-inbox session.create');
+    ownerInboxSessionId = value.sessionId;
+    learnerSessions.add(ownerInboxSessionId);
+    internalSessionLabels.set(ownerInboxSessionId, 'internal:跨会话转述');
+    api.events.follow(ownerInboxSessionId);
+    await ensureChatModel(ownerInboxSessionId);
+    log(`跨会话转述会话已创建：${ownerInboxSessionId}`);
+    return ownerInboxSessionId;
+  }
+
+  /**
    * 从归档里取一批新消息，提炼成事实写进记忆库。
    *
    * 水位推进的时机很关键：**必须等提炼成功之后**才推进。
@@ -2696,6 +2761,101 @@ async function main() {
     if (pending < min) return;
     diaryWriteCooldowns.set(key, Date.now());
     queueDiaryTask(() => runDiaryWrite(key));
+  }
+
+  /**
+   * 主人跨会话动态：收集「别人找 bot」的会话素材，交给转述会话概括。
+   *
+   * 只允许主人私聊调用（调用方已按令牌反查校验，这里再守一次）。
+   * 返回 { ok, items, dropped, note }，**不含任何原文**。
+   */
+  async function runOwnerInboxSummary(ownerKey, { refresh = false } = {}) {
+    if (!isOwnerPrivateSession(ownerKey)) {
+      return { ok: false, error: '只有主人本人能查看跨会话动态' };
+    }
+    const ttl = Math.max(0, Number(cfg.ownerInbox?.cacheTtlMs ?? 60000));
+    const cached = ownerInboxCache.get(ownerKey);
+    if (!refresh && cached && Date.now() - cached.at < ttl) {
+      return { ...cached.data, cached: true };
+    }
+    if (!dshReady) return { ok: false, error: 'DSH 未就绪，暂时无法整理' };
+
+    // 收素材：跳过主人自己这条会话（问「别人找我」时不该把自己的话混进去）。
+    const sessions = [];
+    for (const [key, st] of socialV2.conversations.entries()) {
+      if (key === ownerKey) continue;
+      const msgs = (st.recentMessages || []).filter((m) => m && (m.text || m.plain));
+      if (msgs.length === 0) continue;
+      sessions.push({
+        key,
+        kind: key.startsWith('group:') ? 'group' : 'private',
+        label: maskQQ(key),
+        lastAt: Number(st.lastIncomingAt) || Number(msgs[msgs.length - 1]?.time) || 0,
+        lastAtText: fmtClock(Number(st.lastIncomingAt) || Number(msgs[msgs.length - 1]?.time) || 0),
+        messages: msgs,
+        replied: !!st.lastAiReplyAt,
+        pending: (st.unread || []).length > 0,
+        unread: (st.unread || []).length,
+      });
+    }
+    // 最近的优先，且只取有限条：主人的问题是「最近谁找我」，不是全量盘点。
+    sessions.sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0));
+    const picked = sessions.slice(0, MAX_SESSIONS_PER_SUMMARY);
+    if (picked.length === 0) {
+      const empty = { ok: true, items: [], dropped: [], note: '这会儿没有别人找我。', totalUnread: 0 };
+      ownerInboxCache.set(ownerKey, { at: Date.now(), data: empty });
+      return empty;
+    }
+
+    let sessionId;
+    try {
+      sessionId = await ensureOwnerInboxSession();
+    } catch (error) {
+      log(`跨会话转述会话创建失败:`, error?.message ?? error);
+      return { ok: false, error: '整理会话创建失败' };
+    }
+
+    const promptText = buildInboxSummaryPrompt(picked, { ownerKey });
+    let output;
+    try {
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (!accepted.result.ok) {
+        log(`跨会话转述被拒: ${accepted.result.error.code}: ${accepted.result.error.message}`);
+        return { ok: false, error: '转述请求被拒' };
+      }
+      output = await waitLearnerTurn(sessionId);
+    } catch (error) {
+      if (/会话|session|not found|404/i.test(String(error?.message ?? error))) ownerInboxSessionId = null;
+      log(`跨会话转述失败:`, error?.message ?? error);
+      return { ok: false, error: '整理超时或失败' };
+    }
+
+    const { items, dropped } = parseInboxSummary(output, { sessions: picked });
+    if (dropped.length) log(`跨会话转述：丢弃 ${dropped.length} 条（${dropped.map((d) => d.reason).join('；')}）`);
+    const totalUnread = sessions.reduce((n, s) => n + (s.unread || 0), 0);
+    const data = {
+      ok: true,
+      items,
+      dropped,
+      totalUnread,
+      note: renderInboxSummary(items, { totalUnread }),
+    };
+    ownerInboxCache.set(ownerKey, { at: Date.now(), data });
+    return data;
+  }
+
+  /** 秒级时钟，给「最后一次消息是几点」用。只到分钟，够判断新旧。 */
+  function fmtClock(ms) {
+    const t = Number(ms) || 0;
+    if (!t) return '未知';
+    const d = new Date(t);
+    const pad = (n) => String(n).padStart(2, '0');
+    const today = new Date();
+    const sameDay = d.getFullYear() === today.getFullYear()
+      && d.getMonth() === today.getMonth()
+      && d.getDate() === today.getDate();
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return sameDay ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
   }
 
   /**
@@ -8205,6 +8365,52 @@ async function main() {
               createdAt: h.entry.createdAt,
               line: renderEntryLine(h.entry),
             })),
+          });
+          return;
+        }
+
+        // 主人跨会话动态（B 方案：只给概括，不给原文）。
+        //
+        // 为什么需要这个端点：二代模式每个 QQ 会话一条独立 DSH 会话 + 独立 agentToken，
+        // 主人在自己窗口里用 qq_get_recent_messages 只能读到主人这条会话。
+        // 别人找 bot 聊了什么，它的上下文里没有，工具也读不到（服务端按令牌 403）。
+        // 这是**有意的隐私隔离**，不该拆掉；但「完全不知道有没有人找我」也不合理。
+        // 于是划中间线：主人只知道「谁找过、聊了哪类话题、回没回」。
+        //
+        // 权限：令牌反查出的会话必须是主人私聊。绝不能用 body/query 里的 key 判定
+        // —— 模型可以伪造 key，改不了桥接自己下发的令牌。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/owner-inbox') {
+          const queriedKey = String(url.searchParams.get('key') ?? '').trim();
+          const token = req.headers['x-agent-token'];
+          if (!token) { sendJson({ ok: false, error: '缺少会话令牌' }, 403); return; }
+          const callerKey = agentKeyForToken(token);
+          if (!callerKey) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          // 令牌真实所属的会话才是「谁在问」；queriedKey 只用来发现「你以为你在别处」。
+          if (!isOwnerPrivateSession(callerKey)) {
+            log(`拒绝非管理员查看跨会话动态（来自 ${callerKey}）`);
+            sendJson({ ok: false, error: '只有主人本人的私聊能查看跨会话动态；别人的私聊内容不会给到你' }, 403);
+            return;
+          }
+          if (queriedKey && queriedKey !== callerKey) {
+            sendJson({ ok: false, error: '只能以自己的会话身份查询；请不要在别人窗口里尝试读取他人动态' }, 403);
+            return;
+          }
+          if (!v2SessionAllowed(callerKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('ownerInbox')) { sendJson({ ok: false, error: '工具未启用：qq_owner_inbox' }, 403); return; }
+          const refresh = url.searchParams.get('refresh') === '1';
+          const data = await runOwnerInboxSummary(callerKey, { refresh });
+          if (!data.ok) { sendJson({ ok: false, error: data.error || '整理失败' }, 503); return; }
+          // 注意：返回体里**没有**任何原文。items 里只有 who/topic/gist 这类话题层信息，
+          // 且已由 parseInboxSummary 做过「是否引用原话」的检测。
+          sendJson({
+            ok: true,
+            scope: 'owner',
+            cached: data.cached === true,
+            totalUnread: data.totalUnread ?? 0,
+            count: data.items?.length ?? 0,
+            items: data.items ?? [],
+            droppedCount: data.dropped?.length ?? 0,
+            note: data.note ?? '',
           });
           return;
         }

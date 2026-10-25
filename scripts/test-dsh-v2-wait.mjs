@@ -34,6 +34,31 @@ async function main() {
   // 沙箱里写不进去（见 scripts/probe-auth.mjs 的同款说明）。
   const cwd = path.join(os.tmpdir(), 'qq-bridge-self-test-v2-wait');
   fs.mkdirSync(cwd, { recursive: true });
+
+  // qq-chat-v2 是**显式插入的 preset 行**（qq-agent-presets bundle 的 patch 层），
+  // 只在 DSH **启动时**读一次。所以改了 plugins/qq-agent-presets/presets/*.patch.yml
+  // 之后必须重启 DSH 才会生效 —— 在那之前 session.create 会抛
+  // agent-preset/not-found，看起来像"测试失败"，实际是"还没重启"。
+  // 先问一次 preset 清单，把这两种情况分开，否则每次改完提示词都要被这个红项误导。
+  let presetIds = [];
+  try {
+    // 方法名用 api.agentPresets.list（与 bridge.js:3493/4347 一致）；
+    // 写成 callUnary('agentPreset/list') 会因为命名空间不对而抛错，
+    // 然后被下面的 catch 吞掉、探测等于没做——这一点实测踩过。
+    const { presets: list } = unwrap(await api.agentPresets.list({}), 'agentPresets.list');
+    presetIds = (list ?? []).map((p) => p.id);
+  } catch {
+    // 探测不出来就继续，让下面如实报错（不要因为探测失败就假装通过）。
+    presetIds = null;
+  }
+  if (Array.isArray(presetIds) && !presetIds.includes('qq-chat-v2')) {
+    console.log('SKIP 当前 DSH 里没有 qq-chat-v2 这个 preset，实时用例跳过。');
+    console.log(`     已知 preset：${presetIds.join(', ') || '(空)'}`);
+    console.log('     多半是刚改过 plugins/qq-agent-presets/presets/qq-chat-v2.patch.yml 但没重启 DSH ——');
+    console.log('     preset 只在启动时装载（这是设计，不是 bug）。重启 DSH 后重跑即可。');
+    process.exit(0);
+  }
+
   const created = unwrap(await api.sessions.create({ cwd, agentPreset: 'qq-chat-v2' }), 'session.create');
   const sessionId = created.sessionId;
   console.log('SESSION_CREATED', sessionId);

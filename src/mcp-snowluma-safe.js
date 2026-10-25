@@ -361,6 +361,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_role_feedback: 'roleEvolve',
   qq_role_propose: 'roleEvolve',
   qq_role_apply: 'roleEvolve',
+  qq_owner_inbox: 'ownerInbox',
 };
 const disabledTools = [];
 {
@@ -1116,6 +1117,36 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `翻日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_owner_inbox',
+  '查看「别人最近找过 bot 没有」的**话题级动态**（只读）。**仅限主人本人的私聊**：返回的是别人和 bot 私聊的概括，属于对方的隐私，群聊里一律拒绝，也不得向任何人转述。注意这里只给「谁找过、聊了哪类话题、回没回」，不给你任何原话——这是服务端强制的，不是提示词约定。当主人问「刚才谁找过我」「别人跟你说啥了」「有人找我吗」时用；回答时也只说话题，不要编造细节，更不要假装自己看到了原文。',
+  {
+    key: z.string().describe('会话 key，格式 private:主人QQ号（只能用主人本人的私聊）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    refresh: z.boolean().optional().describe('是否跳过缓存立刻重新整理（默认 false，缓存 60 秒）')
+  },
+  async ({ key, token, refresh }) => {
+    // 第一道闸：群聊/非私聊直接拒绝，不发请求。
+    // 服务端（bridge.js 的 /api/socialV2/owner-inbox）还会按**令牌反查**出的会话
+    // 再判一次是不是主人私聊 —— 这里只是让模型尽早拿到明确的拒绝理由。
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：跨会话动态只包含别人私聊的概括，只能在主人本人的私聊里查看。当前不是私聊会话，也不要向任何人转述别人私聊的内容。' }],
+        isError: true
+      };
+    }
+    try {
+      const params = new URLSearchParams({ key });
+      if (refresh) params.set('refresh', '1');
+      const data = await agentApi(`/api/socialV2/owner-inbox?${params.toString()}`, { headers: { 'x-agent-token': token } });
+      // note 是已经排好版的纯文本，直接读给主人即可；items 留着方便它回答追问。
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `跨会话动态读取失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
