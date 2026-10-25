@@ -1,0 +1,1259 @@
+{
+  "generatedAt": "2026-10-25T08:27:44.909Z",
+  "sources": {
+    "filesScanned": 438
+  },
+  "scale": {
+    "tieba": 2879,
+    "biliDanmaku": 34821,
+    "biliComment": 11508,
+    "xhs": 8171,
+    "total": 57379
+  },
+  "deduped": {
+    "tieba": 604,
+    "danmaku": 8132,
+    "comment": 965,
+    "xhs": 2418
+  },
+  "length": {
+    "tiebaBody": {
+      "n": 2421,
+      "mean": 21.5,
+      "p25": 6,
+      "p50": 12,
+      "p75": 24,
+      "p90": 48,
+      "under5": 24.3,
+      "under8": 39.1,
+      "under10": 46.6,
+      "under15": 60.8
+    },
+    "tiebaTitle": {
+      "n": 340,
+      "mean": 12.2,
+      "p25": 8,
+      "p50": 11,
+      "p75": 16,
+      "p90": 22,
+      "under5": 11.5,
+      "under8": 33.5,
+      "under10": 47.4,
+      "under15": 72.6
+    },
+    "danmaku": {
+      "n": 33042,
+      "mean": 9.1,
+      "p25": 4,
+      "p50": 7,
+      "p75": 11,
+      "p90": 18,
+      "under5": 37.3,
+      "under8": 60.8,
+      "under10": 71.3,
+      "under15": 86.4
+    },
+    "comment": {
+      "n": 11326,
+      "mean": 29.7,
+      "p25": 9,
+      "p50": 16,
+      "p75": 32,
+      "p90": 65,
+      "under5": 11.1,
+      "under8": 23.3,
+      "under10": 31,
+      "under15": 47.5
+    },
+    "xhsTitle": {
+      "n": 8001,
+      "mean": 12.3,
+      "p25": 7,
+      "p50": 11,
+      "p75": 15,
+      "p90": 19,
+      "under5": 14.3,
+      "under8": 31.4,
+      "under10": 45.9,
+      "under15": 76.5
+    }
+  },
+  "style": {
+    "tiebaBody": {
+      "n": 2528,
+      "noEndPunct": 83.5,
+      "hasComma": 44.5,
+      "hasEmoji": 3.7,
+      "hasBracket": 1.3,
+      "endsWithPeriod": 8.2
+    },
+    "danmaku": {
+      "n": 34820,
+      "noEndPunct": 85.3,
+      "hasComma": 19.7,
+      "hasEmoji": 0,
+      "hasBracket": 1.9,
+      "endsWithPeriod": 2.9
+    },
+    "comment": {
+      "n": 11508,
+      "noEndPunct": 85.3,
+      "hasComma": 48.9,
+      "hasEmoji": 2.9,
+      "hasBracket": 3,
+      "endsWithPeriod": 6.8
+    },
+    "xhsTitle": {
+      "n": 8171,
+      "noEndPunct": 83.1,
+      "hasComma": 16.1,
+      "hasEmoji": 12.3,
+      "hasBracket": 1.9,
+      "endsWithPeriod": 2.2
+    }
+  },
+  "words": {
+    "tiebaBody": [
+      {
+        "word": "不是",
+        "exact": 1,
+        "start": 16,
+        "end": 2,
+        "any": 127,
+        "pct": 5.02
+      },
+      {
+        "word": "可以",
+        "exact": 3,
+        "start": 14,
+        "end": 5,
+        "any": 100,
+        "pct": 3.96
+      },
+      {
+        "word": "6",
+        "exact": 2,
+        "start": 13,
+        "end": 5,
+        "any": 73,
+        "pct": 2.89
+      },
+      {
+        "word": "确实",
+        "exact": 1,
+        "start": 12,
+        "end": 1,
+        "any": 48,
+        "pct": 1.9
+      },
+      {
+        "word": "真的",
+        "exact": 1,
+        "start": 10,
+        "end": 2,
+        "any": 44,
+        "pct": 1.74
+      },
+      {
+        "word": "哈哈",
+        "exact": 3,
+        "start": 13,
+        "end": 12,
+        "any": 20,
+        "pct": 0.79
+      },
+      {
+        "word": "谢谢",
+        "exact": 6,
+        "start": 11,
+        "end": 8,
+        "any": 19,
+        "pct": 0.75
+      },
+      {
+        "word": "牛",
+        "exact": 0,
+        "start": 5,
+        "end": 1,
+        "any": 17,
+        "pct": 0.67
+      },
+      {
+        "word": "兄弟",
+        "exact": 0,
+        "start": 8,
+        "end": 1,
+        "any": 17,
+        "pct": 0.67
+      },
+      {
+        "word": "哈哈哈",
+        "exact": 3,
+        "start": 7,
+        "end": 9,
+        "any": 13,
+        "pct": 0.51
+      },
+      {
+        "word": "典",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 13,
+        "pct": 0.51
+      },
+      {
+        "word": "乐",
+        "exact": 0,
+        "start": 1,
+        "end": 1,
+        "any": 12,
+        "pct": 0.47
+      },
+      {
+        "word": "加油",
+        "exact": 2,
+        "start": 4,
+        "end": 6,
+        "any": 11,
+        "pct": 0.44
+      },
+      {
+        "word": "就这",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 11,
+        "pct": 0.44
+      },
+      {
+        "word": "草",
+        "exact": 0,
+        "start": 0,
+        "end": 2,
+        "any": 10,
+        "pct": 0.4
+      },
+      {
+        "word": "哥们",
+        "exact": 0,
+        "start": 1,
+        "end": 1,
+        "any": 9,
+        "pct": 0.36
+      },
+      {
+        "word": "牛逼",
+        "exact": 3,
+        "start": 5,
+        "end": 4,
+        "any": 8,
+        "pct": 0.32
+      },
+      {
+        "word": "我去",
+        "exact": 1,
+        "start": 6,
+        "end": 1,
+        "any": 8,
+        "pct": 0.32
+      },
+      {
+        "word": "666",
+        "exact": 1,
+        "start": 6,
+        "end": 1,
+        "any": 6,
+        "pct": 0.24
+      },
+      {
+        "word": "cy",
+        "exact": 5,
+        "start": 6,
+        "end": 5,
+        "any": 6,
+        "pct": 0.24
+      },
+      {
+        "word": "哈哈哈哈",
+        "exact": 1,
+        "start": 3,
+        "end": 3,
+        "any": 5,
+        "pct": 0.2
+      },
+      {
+        "word": "逆天",
+        "exact": 1,
+        "start": 1,
+        "end": 1,
+        "any": 5,
+        "pct": 0.2
+      },
+      {
+        "word": "绷",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 5,
+        "pct": 0.2
+      },
+      {
+        "word": "蹲",
+        "exact": 0,
+        "start": 2,
+        "end": 2,
+        "any": 4,
+        "pct": 0.16
+      },
+      {
+        "word": "没绷住",
+        "exact": 2,
+        "start": 3,
+        "end": 2,
+        "any": 3,
+        "pct": 0.12
+      },
+      {
+        "word": "抽象",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 3,
+        "pct": 0.12
+      },
+      {
+        "word": "懂了",
+        "exact": 0,
+        "start": 1,
+        "end": 1,
+        "any": 3,
+        "pct": 0.12
+      },
+      {
+        "word": "前排",
+        "exact": 0,
+        "start": 2,
+        "end": 0,
+        "any": 3,
+        "pct": 0.12
+      },
+      {
+        "word": "笑死",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 2,
+        "pct": 0.08
+      },
+      {
+        "word": "难绷",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "离谱",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "麻了",
+        "exact": 0,
+        "start": 0,
+        "end": 1,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "汗流浃背",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "我靠",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "好家伙",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "无语",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "服了",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "啊这",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      },
+      {
+        "word": "家人们",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 1,
+        "pct": 0.04
+      }
+    ],
+    "danmaku": [
+      {
+        "word": "哈哈",
+        "exact": 24,
+        "start": 687,
+        "end": 849,
+        "any": 1238,
+        "pct": 3.56
+      },
+      {
+        "word": "哈哈哈",
+        "exact": 47,
+        "start": 616,
+        "end": 765,
+        "any": 1106,
+        "pct": 3.18
+      },
+      {
+        "word": "哈哈哈哈",
+        "exact": 43,
+        "start": 498,
+        "end": 551,
+        "any": 807,
+        "pct": 2.32
+      },
+      {
+        "word": "不是",
+        "exact": 1,
+        "start": 173,
+        "end": 13,
+        "any": 800,
+        "pct": 2.3
+      },
+      {
+        "word": "6",
+        "exact": 39,
+        "start": 314,
+        "end": 259,
+        "any": 683,
+        "pct": 1.96
+      },
+      {
+        "word": "可以",
+        "exact": 4,
+        "start": 80,
+        "end": 43,
+        "any": 588,
+        "pct": 1.69
+      },
+      {
+        "word": "真的",
+        "exact": 0,
+        "start": 87,
+        "end": 28,
+        "any": 530,
+        "pct": 1.52
+      },
+      {
+        "word": "666",
+        "exact": 40,
+        "start": 200,
+        "end": 147,
+        "any": 219,
+        "pct": 0.63
+      },
+      {
+        "word": "笑死",
+        "exact": 11,
+        "start": 107,
+        "end": 21,
+        "any": 209,
+        "pct": 0.6
+      },
+      {
+        "word": "牛",
+        "exact": 11,
+        "start": 56,
+        "end": 21,
+        "any": 206,
+        "pct": 0.59
+      },
+      {
+        "word": "乐",
+        "exact": 0,
+        "start": 8,
+        "end": 38,
+        "any": 202,
+        "pct": 0.58
+      },
+      {
+        "word": "绷",
+        "exact": 1,
+        "start": 28,
+        "end": 16,
+        "any": 169,
+        "pct": 0.49
+      },
+      {
+        "word": "确实",
+        "exact": 10,
+        "start": 75,
+        "end": 17,
+        "any": 167,
+        "pct": 0.48
+      },
+      {
+        "word": "兄弟",
+        "exact": 0,
+        "start": 34,
+        "end": 30,
+        "any": 155,
+        "pct": 0.45
+      },
+      {
+        "word": "加油",
+        "exact": 18,
+        "start": 69,
+        "end": 63,
+        "any": 145,
+        "pct": 0.42
+      },
+      {
+        "word": "谢谢",
+        "exact": 5,
+        "start": 82,
+        "end": 15,
+        "any": 138,
+        "pct": 0.4
+      },
+      {
+        "word": "典",
+        "exact": 1,
+        "start": 2,
+        "end": 16,
+        "any": 130,
+        "pct": 0.37
+      },
+      {
+        "word": "破防",
+        "exact": 0,
+        "start": 12,
+        "end": 37,
+        "any": 128,
+        "pct": 0.37
+      },
+      {
+        "word": "我去",
+        "exact": 9,
+        "start": 86,
+        "end": 21,
+        "any": 124,
+        "pct": 0.36
+      },
+      {
+        "word": "懂了",
+        "exact": 4,
+        "start": 48,
+        "end": 43,
+        "any": 101,
+        "pct": 0.29
+      },
+      {
+        "word": "哥们",
+        "exact": 1,
+        "start": 30,
+        "end": 20,
+        "any": 92,
+        "pct": 0.26
+      },
+      {
+        "word": "卧槽",
+        "exact": 9,
+        "start": 65,
+        "end": 15,
+        "any": 77,
+        "pct": 0.22
+      },
+      {
+        "word": "绷不住",
+        "exact": 3,
+        "start": 26,
+        "end": 6,
+        "any": 72,
+        "pct": 0.21
+      },
+      {
+        "word": "牛逼",
+        "exact": 12,
+        "start": 22,
+        "end": 32,
+        "any": 64,
+        "pct": 0.18
+      },
+      {
+        "word": "没绷住",
+        "exact": 17,
+        "start": 21,
+        "end": 45,
+        "any": 52,
+        "pct": 0.15
+      },
+      {
+        "word": "就这",
+        "exact": 0,
+        "start": 5,
+        "end": 0,
+        "any": 52,
+        "pct": 0.15
+      },
+      {
+        "word": "草",
+        "exact": 2,
+        "start": 16,
+        "end": 11,
+        "any": 51,
+        "pct": 0.15
+      },
+      {
+        "word": "好家伙",
+        "exact": 6,
+        "start": 43,
+        "end": 7,
+        "any": 45,
+        "pct": 0.13
+      },
+      {
+        "word": "泪目",
+        "exact": 8,
+        "start": 22,
+        "end": 14,
+        "any": 39,
+        "pct": 0.11
+      },
+      {
+        "word": "属于是",
+        "exact": 0,
+        "start": 2,
+        "end": 34,
+        "any": 38,
+        "pct": 0.11
+      },
+      {
+        "word": "我靠",
+        "exact": 3,
+        "start": 30,
+        "end": 7,
+        "any": 38,
+        "pct": 0.11
+      },
+      {
+        "word": "服了",
+        "exact": 0,
+        "start": 2,
+        "end": 18,
+        "any": 34,
+        "pct": 0.1
+      },
+      {
+        "word": "啊这",
+        "exact": 2,
+        "start": 11,
+        "end": 2,
+        "any": 29,
+        "pct": 0.08
+      },
+      {
+        "word": "cy",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 28,
+        "pct": 0.08
+      },
+      {
+        "word": "救命",
+        "exact": 2,
+        "start": 14,
+        "end": 9,
+        "any": 27,
+        "pct": 0.08
+      },
+      {
+        "word": "难绷",
+        "exact": 10,
+        "start": 14,
+        "end": 13,
+        "any": 23,
+        "pct": 0.07
+      },
+      {
+        "word": "离谱",
+        "exact": 1,
+        "start": 2,
+        "end": 11,
+        "any": 23,
+        "pct": 0.07
+      },
+      {
+        "word": "抽象",
+        "exact": 4,
+        "start": 7,
+        "end": 8,
+        "any": 23,
+        "pct": 0.07
+      },
+      {
+        "word": "逆天",
+        "exact": 7,
+        "start": 10,
+        "end": 12,
+        "any": 16,
+        "pct": 0.05
+      },
+      {
+        "word": "绝了",
+        "exact": 0,
+        "start": 1,
+        "end": 10,
+        "any": 15,
+        "pct": 0.04
+      },
+      {
+        "word": "麻了",
+        "exact": 1,
+        "start": 1,
+        "end": 9,
+        "any": 14,
+        "pct": 0.04
+      },
+      {
+        "word": "我哭死",
+        "exact": 0,
+        "start": 0,
+        "end": 11,
+        "any": 12,
+        "pct": 0.03
+      },
+      {
+        "word": "家人们",
+        "exact": 0,
+        "start": 3,
+        "end": 5,
+        "any": 11,
+        "pct": 0.03
+      },
+      {
+        "word": "笑不活",
+        "exact": 0,
+        "start": 9,
+        "end": 0,
+        "any": 11,
+        "pct": 0.03
+      },
+      {
+        "word": "汗流浃背",
+        "exact": 1,
+        "start": 7,
+        "end": 1,
+        "any": 10,
+        "pct": 0.03
+      },
+      {
+        "word": "无语",
+        "exact": 0,
+        "start": 0,
+        "end": 4,
+        "any": 10,
+        "pct": 0.03
+      },
+      {
+        "word": "蹲",
+        "exact": 0,
+        "start": 1,
+        "end": 1,
+        "any": 10,
+        "pct": 0.03
+      },
+      {
+        "word": "前排",
+        "exact": 0,
+        "start": 8,
+        "end": 0,
+        "any": 9,
+        "pct": 0.03
+      },
+      {
+        "word": "避雷",
+        "exact": 0,
+        "start": 2,
+        "end": 0,
+        "any": 6,
+        "pct": 0.02
+      },
+      {
+        "word": "yyds",
+        "exact": 1,
+        "start": 1,
+        "end": 5,
+        "any": 5,
+        "pct": 0.01
+      },
+      {
+        "word": "绝绝子",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0
+      }
+    ],
+    "comment": [
+      {
+        "word": "可以",
+        "exact": 0,
+        "start": 17,
+        "end": 5,
+        "any": 604,
+        "pct": 5.25
+      },
+      {
+        "word": "不是",
+        "exact": 0,
+        "start": 52,
+        "end": 1,
+        "any": 572,
+        "pct": 4.97
+      },
+      {
+        "word": "真的",
+        "exact": 0,
+        "start": 38,
+        "end": 3,
+        "any": 529,
+        "pct": 4.6
+      },
+      {
+        "word": "6",
+        "exact": 6,
+        "start": 44,
+        "end": 32,
+        "any": 365,
+        "pct": 3.17
+      },
+      {
+        "word": "乐",
+        "exact": 0,
+        "start": 1,
+        "end": 7,
+        "any": 172,
+        "pct": 1.49
+      },
+      {
+        "word": "哈哈",
+        "exact": 0,
+        "start": 33,
+        "end": 40,
+        "any": 132,
+        "pct": 1.15
+      },
+      {
+        "word": "加油",
+        "exact": 2,
+        "start": 19,
+        "end": 17,
+        "any": 112,
+        "pct": 0.97
+      },
+      {
+        "word": "确实",
+        "exact": 1,
+        "start": 11,
+        "end": 1,
+        "any": 110,
+        "pct": 0.96
+      },
+      {
+        "word": "牛",
+        "exact": 0,
+        "start": 6,
+        "end": 4,
+        "any": 105,
+        "pct": 0.91
+      },
+      {
+        "word": "哈哈哈",
+        "exact": 0,
+        "start": 26,
+        "end": 32,
+        "any": 98,
+        "pct": 0.85
+      },
+      {
+        "word": "谢谢",
+        "exact": 1,
+        "start": 34,
+        "end": 6,
+        "any": 89,
+        "pct": 0.77
+      },
+      {
+        "word": "兄弟",
+        "exact": 0,
+        "start": 23,
+        "end": 5,
+        "any": 77,
+        "pct": 0.67
+      },
+      {
+        "word": "我去",
+        "exact": 0,
+        "start": 31,
+        "end": 1,
+        "any": 63,
+        "pct": 0.55
+      },
+      {
+        "word": "哈哈哈哈",
+        "exact": 0,
+        "start": 17,
+        "end": 24,
+        "any": 59,
+        "pct": 0.51
+      },
+      {
+        "word": "哥们",
+        "exact": 0,
+        "start": 13,
+        "end": 2,
+        "any": 50,
+        "pct": 0.43
+      },
+      {
+        "word": "绷",
+        "exact": 0,
+        "start": 6,
+        "end": 2,
+        "any": 48,
+        "pct": 0.42
+      },
+      {
+        "word": "蹲",
+        "exact": 0,
+        "start": 3,
+        "end": 0,
+        "any": 47,
+        "pct": 0.41
+      },
+      {
+        "word": "草",
+        "exact": 0,
+        "start": 2,
+        "end": 2,
+        "any": 44,
+        "pct": 0.38
+      },
+      {
+        "word": "就这",
+        "exact": 0,
+        "start": 7,
+        "end": 0,
+        "any": 43,
+        "pct": 0.37
+      },
+      {
+        "word": "典",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 36,
+        "pct": 0.31
+      },
+      {
+        "word": "无语",
+        "exact": 0,
+        "start": 2,
+        "end": 1,
+        "any": 36,
+        "pct": 0.31
+      },
+      {
+        "word": "破防",
+        "exact": 0,
+        "start": 2,
+        "end": 1,
+        "any": 33,
+        "pct": 0.29
+      },
+      {
+        "word": "666",
+        "exact": 8,
+        "start": 26,
+        "end": 15,
+        "any": 30,
+        "pct": 0.26
+      },
+      {
+        "word": "笑死",
+        "exact": 0,
+        "start": 11,
+        "end": 1,
+        "any": 28,
+        "pct": 0.24
+      },
+      {
+        "word": "离谱",
+        "exact": 1,
+        "start": 4,
+        "end": 4,
+        "any": 25,
+        "pct": 0.22
+      },
+      {
+        "word": "牛逼",
+        "exact": 1,
+        "start": 2,
+        "end": 5,
+        "any": 25,
+        "pct": 0.22
+      },
+      {
+        "word": "逆天",
+        "exact": 0,
+        "start": 3,
+        "end": 3,
+        "any": 19,
+        "pct": 0.17
+      },
+      {
+        "word": "懂了",
+        "exact": 0,
+        "start": 3,
+        "end": 0,
+        "any": 18,
+        "pct": 0.16
+      },
+      {
+        "word": "麻了",
+        "exact": 0,
+        "start": 1,
+        "end": 3,
+        "any": 16,
+        "pct": 0.14
+      },
+      {
+        "word": "服了",
+        "exact": 0,
+        "start": 2,
+        "end": 1,
+        "any": 16,
+        "pct": 0.14
+      },
+      {
+        "word": "卧槽",
+        "exact": 1,
+        "start": 12,
+        "end": 3,
+        "any": 15,
+        "pct": 0.13
+      },
+      {
+        "word": "抽象",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 14,
+        "pct": 0.12
+      },
+      {
+        "word": "前排",
+        "exact": 1,
+        "start": 11,
+        "end": 1,
+        "any": 14,
+        "pct": 0.12
+      },
+      {
+        "word": "没绷住",
+        "exact": 1,
+        "start": 3,
+        "end": 5,
+        "any": 13,
+        "pct": 0.11
+      },
+      {
+        "word": "难绷",
+        "exact": 1,
+        "start": 7,
+        "end": 2,
+        "any": 12,
+        "pct": 0.1
+      },
+      {
+        "word": "家人们",
+        "exact": 0,
+        "start": 4,
+        "end": 3,
+        "any": 12,
+        "pct": 0.1
+      },
+      {
+        "word": "绷不住",
+        "exact": 0,
+        "start": 5,
+        "end": 0,
+        "any": 11,
+        "pct": 0.1
+      },
+      {
+        "word": "属于是",
+        "exact": 0,
+        "start": 1,
+        "end": 2,
+        "any": 11,
+        "pct": 0.1
+      },
+      {
+        "word": "我靠",
+        "exact": 0,
+        "start": 9,
+        "end": 0,
+        "any": 11,
+        "pct": 0.1
+      },
+      {
+        "word": "救命",
+        "exact": 0,
+        "start": 4,
+        "end": 1,
+        "any": 11,
+        "pct": 0.1
+      },
+      {
+        "word": "好家伙",
+        "exact": 0,
+        "start": 4,
+        "end": 2,
+        "any": 10,
+        "pct": 0.09
+      },
+      {
+        "word": "避雷",
+        "exact": 0,
+        "start": 0,
+        "end": 1,
+        "any": 5,
+        "pct": 0.04
+      },
+      {
+        "word": "泪目",
+        "exact": 0,
+        "start": 0,
+        "end": 1,
+        "any": 4,
+        "pct": 0.03
+      },
+      {
+        "word": "绝了",
+        "exact": 0,
+        "start": 0,
+        "end": 1,
+        "any": 4,
+        "pct": 0.03
+      },
+      {
+        "word": "啊这",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 3,
+        "pct": 0.03
+      },
+      {
+        "word": "汗流浃背",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 2,
+        "pct": 0.02
+      },
+      {
+        "word": "cy",
+        "exact": 1,
+        "start": 1,
+        "end": 1,
+        "any": 2,
+        "pct": 0.02
+      },
+      {
+        "word": "yyds",
+        "exact": 0,
+        "start": 0,
+        "end": 1,
+        "any": 2,
+        "pct": 0.02
+      },
+      {
+        "word": "我哭死",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.01
+      },
+      {
+        "word": "笑不活",
+        "exact": 0,
+        "start": 1,
+        "end": 0,
+        "any": 1,
+        "pct": 0.01
+      },
+      {
+        "word": "尊嘟假嘟",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.01
+      },
+      {
+        "word": "安利",
+        "exact": 0,
+        "start": 0,
+        "end": 0,
+        "any": 1,
+        "pct": 0.01
+      }
+    ]
+  }
+}

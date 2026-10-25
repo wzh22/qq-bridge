@@ -9,6 +9,21 @@ config.json
 *.bak
 *.bak-*
 
+# 语料工程（corpus/）
+#
+# 为什么需要这一段：`state/` 整目录被忽略，而语料工具原先放在 state/corpus/ 里，
+# 于是「卡片数字与语料是否一致」这条护栏**连同它的校验脚本一起从未进版本库**。
+# 换机重装后工具消失，且没有任何提示——护栏静默失效比没有护栏更糟。
+#
+# 现在拆成三块，按「能否由别人重新生成」区分：
+#   corpus/scripts/  工具，必须入库（可审阅、可回归、可复用）
+#   corpus/out/      生成物（baseline.json），入库便于 diff 出「数字哪天变了」
+#   corpus/data/     原始语料快照：默认不入库（体积大、且是别人站点的内容，
+#                    仅作本地分析用；需要时可自行采集或用 QQB_STATE 指向别处）
+#   corpus/out/backup/ 是本机卡片快照，含私人语境，不入库
+corpus/data/
+corpus/out/backup/
+
 # Local development / planning / research docs (not part of public project)
 /PROJECT_GUIDE.md
 /ARCH_REVIEW.md
