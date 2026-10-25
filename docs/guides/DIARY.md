@@ -78,8 +78,17 @@ score = (重要度 - 3) × 0.6
    但 A 的日记会出现在 B 的会话里，是比文件混用更隐蔽的泄漏
 4. 注入层：`diaryBlockFor` 主人只拿 owner 库、其他人只拿自己那几条
 
+还有一道在**上游**，比上面四道都更容易漏（因为文件是对的，只是生成日记的那张"草稿纸"是同一张）：
+
+5. **整理会话隔离**：主人日记走 `ownerLearnerSessionId`（与事实提炼共用），
+   他人的日记走**独立的** `diaryOthersSessionId`（工作区 `state/diary-others-agent`，标题「他人日记整理」）。
+   `api.sessions.prompt` 是往同一个 sessionId 排队、**上下文会累积**——
+   共用一个会话时，主人刚聊的私事仍在历史里，下一个人整理日记时模型看得见，
+   可能被写进 `diary-others.jsonl`。那一刻文件按 key 分开了，内容却已经串了人。
+
 **为什么必须分层**：工具层能绕过，服务端才是真正的那道门；
-注入层则防住「以后有人改了前两道但忘了这里」。
+注入层则防住「以后有人改了前两道但忘了这里」；
+整理会话隔离则防住「前四道全对，但内容在生成阶段就混了」。
 
 **为什么主人和其他人要物理分开**：主人的日记里有主人的生活、备考、身体状况。
 写在同一本就意味着两件事同时发生 —— 别人可以往主人的记忆里塞内容（间接污染人格上下文），
@@ -109,6 +118,8 @@ score = (重要度 - 3) × 0.6
     "minMessages": 15,
     "batchMessages": 30,
     "writeCooldownMs": 3600000,
+    "learnerPreset": "qq-chat",
+    "workspaceTitle": "他人日记整理",
     "recentDays": 7,
     "injectRecent": 5,
     "injectRecall": 4,
@@ -117,6 +128,8 @@ score = (重要度 - 3) × 0.6
 }
 ```
 
+`learnerPreset` / `workspaceTitle` 只影响**他人日记**那条独立会话
+（主人日记与事实提炼共用 `ownerMemory.learnerPreset`）。
 `injectStyle: 0` 可单独关掉风格注入（保留记忆但不注入原话）。
 
 工具开关在 `socialV2.tools.diary`，与 `memory` **分开**：

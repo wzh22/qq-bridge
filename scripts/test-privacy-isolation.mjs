@@ -70,5 +70,36 @@ const LEAK = ['2409281798', '西安未央', '陕西警察学院', '交通管理�
 const leaked = LEAK.filter(w => injected.includes(w));
 ok('无真实隐私进注入', leaked.length === 0, leaked.join(','));
 
+console.log('\n=== 6. 整理会话：他人日记必须与主人记忆物理分开 ===');
+// 这是"草稿纸同一张"那类泄漏：文件分开了，但生成内容时上下文串了人。
+// sessions.prompt 是往同一个 sessionId 排队，上下文累积 —— 共用会话等于共用上下文。
+const diaryFn = src.match(/async function runDiaryWrite\(key\) \{[\s\S]*?\n  \}/);
+ok('runDiaryWrite 存在', Boolean(diaryFn), diaryFn ? '' : '没找到');
+if (diaryFn) {
+  ok('按归属选会话（含三元分支）',
+    /forOwner\s*\?\s*await ensureOwnerLearnerSession\(\)\s*:\s*await ensureDiaryOthersSession\(\)/.test(diaryFn[0]),
+    '必须先算 forOwner 再分派');
+  ok('不再无条件共用主人学习会话',
+    !/sessionId\s*=\s*await ensureOwnerLearnerSession\(\);/.test(diaryFn[0]),
+    '又退回共用了');
+  ok('出错时只作废对应那条',
+    /if \(forOwner\) ownerLearnerSessionId = null; else diaryOthersSessionId = null;/.test(diaryFn[0]),
+    '连带作废会把另一条无辜会话也拆掉');
+}
+
+const othersFn = src.match(/async function ensureDiaryOthersSession\(\) \{[\s\S]*?\n  \}/);
+ok('ensureDiaryOthersSession 存在', Boolean(othersFn), othersFn ? '' : '没找到');
+if (othersFn) {
+  ok('独立句柄 diaryOthersSessionId', /diaryOthersSessionId\s*=\s*value\.sessionId/.test(othersFn[0]));
+  ok('独立工作区 diary-others-agent', /'diary-others-agent'/.test(othersFn[0]));
+  ok('preset 走 strict 校验（fail-closed）',
+    /resolvePresetName\([\s\S]*?strict:\s*true\s*\}/.test(othersFn[0]),
+    '群聊/陌生人会话不能回退到含本地工具的默认 preset');
+  ok('创建后设置模型', /ensureChatModel\(diaryOthersSessionId\)/.test(othersFn[0]));
+}
+ok('主人记忆会话不再被日记复用为唯一入口',
+  !/diaryOthersSessionId\s*=\s*ownerLearnerSessionId/.test(src),
+  '两者不能是同一个 id');
+
 console.log(`\n总计: ${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);
