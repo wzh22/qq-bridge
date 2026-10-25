@@ -5,8 +5,8 @@
 //   1. 安装两套 agent preset：qq-chat、qq-chat-v2
 //      （DSH 0.1.7 机制：作为 qq-agent-presets bundle 的 patch 层插入
 //        @deepseek-ai/dsh-agent-preset 行；~/.dsh/.agent-presets/ 目录已不再被读取）
-//   2. 在 DSH profile 的 cordis.patch.yml 中挂载三个 MCP server：
-//      mcp-snowluma / mcp-snowluma-host / mcp-web-search-safe
+//   2. 在 DSH profile 的 cordis.patch.yml 中挂载四个 MCP server：
+//      mcp-snowluma / mcp-snowluma-host / mcp-web-search-safe / mcp-bilibili-safe
 //   3. 在 profile package.json 中注册两个 bundle：qq-mode-console、qq-agent-presets
 //
 // 用法：
@@ -122,8 +122,8 @@ function yamlSingleQuote(s) {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
 
-// 由桥接托管的 MCP 条目 id：脚本对这三个 id 拥有所有权，可安全地按 id 增删。
-const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
+// 由桥接托管的 MCP 条目 id：脚本对这些 id 拥有所有权，可安全地按 id 增删。
+const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe', 'mcp-bilibili-safe', 'mcp-tieba-safe'];
 
 function mcpEntries() {
   const node = process.execPath;
@@ -131,6 +131,14 @@ function mcpEntries() {
     'mcp-snowluma': { serverName: 'snowluma', script: path.join(REPO_ROOT, 'src', 'mcp-snowluma-safe.js'), toolCallTimeoutMs: 725000 },
     'mcp-snowluma-host': { serverName: 'snowluma-host', script: path.join(REPO_ROOT, 'src', 'mcp-host-server.js') },
     'mcp-web-search-safe': { serverName: 'web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js') },
+    // B 站只读能力：搜视频 / 抓学习材料 / 热门榜。**不含任何写操作**，
+    // 详见 src/mcp-bilibili-safe.js 开头的设计说明。
+    'mcp-bilibili-safe': { serverName: 'bilibili-safe', script: path.join(REPO_ROOT, 'src', 'mcp-bilibili-safe.js'), toolCallTimeoutMs: 120000 },
+    // 贴吧只读能力：读吧列表 / 读帖子 / 采样语料。**不含任何写操作**。
+    // 走 CDP 复用主人自己的浏览器会话（贴吧对普通 HTTP 一律 403 + 人机验证），
+    // 所以需要浏览器开着调试端口。语料采集是慢操作（限速 1.4s/次导航），
+    // 给足超时，否则采集中途会被 DSH 掐断。详见 src/mcp-tieba-safe.js。
+    'mcp-tieba-safe': { serverName: 'tieba-safe', script: path.join(REPO_ROOT, 'src', 'mcp-tieba-safe.js'), toolCallTimeoutMs: 300000 },
   };
   let out = '# === qq-bridge MCP BEGIN ===\n';
   out += '# 由 scripts/setup-dsh.mjs 维护；这段区块会被整体替换，请勿手工编辑内部条目。\n';

@@ -21,10 +21,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { NodeApiClient, unwrap, discoverDshLaunchToken } from '../src/dsh-client.js';
+import { resolveDshBaseUrl } from './_test-dsh-base.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
-const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
+// 原来写死 'http://127.0.0.1:3080' —— 旧版固定端口。DSH 现在每次启动挑高位随机端口，
+// guardian 会同步进 config.json；写死等于让这个测试永远 ECONNREFUSED。
+const BASE = resolveDshBaseUrl();
 
 let pass = 0, fail = 0;
 const results = [];

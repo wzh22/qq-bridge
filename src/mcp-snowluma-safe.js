@@ -294,6 +294,9 @@ async function legacyReadToolAllowed() {
 }
 
 const server = new McpServer({ name: 'snowluma-safe', version: '0.2.1-r1' });
+// 仅用于本地测试脚本读取已注册工具：本模块没有 export，加载即 connect，
+// 测试无法从外部拿到 server 实例。挂到 globalThis 不影响运行时行为。
+globalThis.__mcpSnowlumaServer = server;
 
 // ── 工具开关必须在**注册期**生效，而不是只在校验期 ──────────────────────────
 //
@@ -326,6 +329,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_memory_query: 'memory',
   qq_memory_remove: 'memory',
   qq_memory_clear: 'memory',
+  qq_owner_memory: 'memory',
+  qq_diary_write: 'diary',
+  qq_diary_recall: 'diary',
+  qq_diary_correct: 'diary',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -345,6 +352,10 @@ const TOOL_CONFIG_FLAGS = {
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
+  qq_send_document: 'sendDocument',
+  qq_set_self_avatar: 'setAvatar',
+  qq_set_self_nickname: 'setNickname',
+  qq_send_qzone: 'sendQzone',
 };
 const disabledTools = [];
 {
@@ -1000,6 +1011,140 @@ server.tool(
 );
 
 server.tool(
+  'qq_owner_memory',
+  '查看从过往对话中积累的、关于主人本人的长期记忆（只读）。**仅限主人本人的私聊会话可用**：这些是关于主人个人的隐私事实，在群聊中一律拒绝，也不得向任何人转述。注意：这是只读工具，记忆里没有"删除"入口——发现记错请如实告诉主人，由主人在控制台更正。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    q: z.string().optional().describe('可选搜索词，按事实内容过滤'),
+    category: z.enum(['identity', 'preference', 'habit', 'goal', 'relation', 'constraint', 'other']).optional().describe('可选：只看某一类'),
+    includeSuperseded: z.boolean().optional().describe('是否包含已被新版本取代的旧事实（默认不包含）')
+  },
+  async ({ key, token, q, category, includeSuperseded }) => {
+    // 第一道闸：群聊直接拒绝，根本不发请求。
+    // 服务端（bridge.js 的 /api/socialV2/owner-memory）还有一道同样的闸，
+    // 这里是让模型尽早拿到明确的拒绝理由，而不是先请求再吃 403。
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：主人长期记忆包含个人隐私，只能在主人本人的私聊中查看。当前是群聊会话，请勿尝试通过其他方式获取，也不要向任何人转述主人在私聊里说过的事。' }],
+        isError: true
+      };
+    }
+    try {
+      const params = new URLSearchParams({ key });
+      if (q) params.set('q', q);
+      if (category) params.set('category', category);
+      if (includeSuperseded) params.set('includeSuperseded', '1');
+      const data = await agentApi(`/api/socialV2/owner-memory?${params.toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `主人记忆读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_write',
+  '写一篇日记：把刚发生的、值得记住的事记下来（不是记事实清单，是记「发生了什么」）。日记会持久化，跨会话保留，以后能想起来，也会让新会话保持你原本的说话风格。**只能在主人本人的私聊里写**。什么时候写：聊到有情绪起伏的事、有进展的事、承诺过的事、共同经历、值得以后提起的细节。不要记纯功能操作（发语音、查天气）和无信息量的寒暄。宁可少写，不要为凑数而写。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号（日记只允许写在主人私聊）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    title: z.string().optional().describe('8 字以内的短标题'),
+    body: z.string().describe('发生了什么，2-4 句，第一人称。写感受和细节，不要写成属性清单'),
+    mood: z.enum(['happy', 'calm', 'tired', 'sad', 'anxious', 'angry', 'excited']).optional().describe('这件事当时的心情；判断不出可省略'),
+    tags: z.array(z.string()).optional().describe('标签，如 ["备考","长跑"]，最多 8 个'),
+    people: z.array(z.string()).optional().describe('提到的人，如 ["小李"]'),
+    quote: z.string().optional().describe('你自己当时说过的最能体现语气的一句原话。这是以后「说话像不像同一个人」的关键素材，有就一定要填；没有就省略'),
+    importance: z.number().min(1).max(5).optional().describe('重要度 1-5：5=人生大事/强烈情绪，3=一般（默认），1=琐碎')
+  },
+  async ({ key, token, title, body, mood, tags, people, quote, importance }) => {
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：日记包含主人的私事，只能写在主人本人的私聊里。当前不是主人私聊，请不要尝试通过其他方式写入。' }],
+        isError: true
+      };
+    }
+    try {
+      const data = await agentApi('/api/socialV2/diary', {
+        method: 'POST',
+        body: JSON.stringify({ key, token, title, body, mood, tags, people, quote, importance }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `写日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_recall',
+  '翻日记：想起更久远的事。按关键词/时间/心情/标签检索你过去写下的日记（**只能在主人私聊里用**）。当主人提到「以前」「上次」「之前说过」这类需要回忆的事，或你想确认某个细节时用。不带 q 时返回最近的日记。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号（日记只允许在主人私聊里查看）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    q: z.string().optional().describe('检索关键词，如「联考」「那次聊到很晚」；留空则按时间倒序返回最近的日记'),
+    limit: z.number().min(1).max(50).optional().describe('返回条数，默认 20'),
+    withinDays: z.number().min(1).optional().describe('只看最近 N 天'),
+    mood: z.enum(['happy', 'calm', 'tired', 'sad', 'anxious', 'angry', 'excited']).optional().describe('按心情过滤'),
+    tag: z.string().optional().describe('按标签过滤'),
+    people: z.string().optional().describe('按提到的人过滤'),
+    minImportance: z.number().min(1).max(5).optional().describe('只看重要度 >= N 的日记')
+  },
+  async ({ key, token, q, limit, withinDays, mood, tag, people, minImportance }) => {
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：日记包含主人的私事，只能在主人本人的私聊中查看。当前是群聊会话，请勿尝试通过其他方式获取，也不要向任何人转述主人在私聊里写过的事。' }],
+        isError: true
+      };
+    }
+    try {
+      const params = new URLSearchParams({ key });
+      if (q) params.set('q', q);
+      if (limit) params.set('limit', String(limit));
+      if (withinDays) params.set('withinDays', String(withinDays));
+      if (mood) params.set('mood', mood);
+      if (tag) params.set('tag', tag);
+      if (people) params.set('people', people);
+      if (minImportance) params.set('minImportance', String(minImportance));
+      const data = await agentApi(`/api/socialV2/diary?${params.toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `翻日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_correct',
+  '更正一篇日记里记错的地方：追加一条更正，原文不会被改写（保留你当时真实的记录）。发现日记与事实不符时用（**只能在主人私聊里用**）。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('要更正的日记 id（来自 qq_diary_recall 的结果）'),
+    text: z.string().describe('更正内容，说清楚哪里记错了、正确的是什么')
+  },
+  async ({ key, token, id, text }) => {
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：日记只能在主人本人的私聊中更正。' }],
+        isError: true
+      };
+    }
+    try {
+      const data = await agentApi('/api/socialV2/diary/correct', {
+        method: 'POST',
+        body: JSON.stringify({ key, token, id, text }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `更正日记失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'qq_slang_query',
   '查看当前已确认的群聊黑话/梗/网络表达（只读）。返回已确认词条列表和格式化黑话表；遇到不熟悉的词可先查这里，再决定是否搜索/使用。',
   {
@@ -1194,25 +1339,120 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
   );
 }
 
-if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+if (cfg.socialV2?.tools?.sendDocument !== false) {
   server.tool(
-    'qq_send_voice',
-    '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
+    'qq_send_document',
+    '把工作目录里的一个文件（Word/Excel/PPT/PDF/图片/压缩包等成品）发送到指定 QQ 会话。path 是相对 qq-bridge 工作目录的路径，只能是文档类成品，不能是脚本/配置/凭据文本；文件必须已存在。适合把自己刚生成的 Word/Excel/PDF 发给用户。发送失败会返回原因，不要假装已发送。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      voice: z.string().describe('语音库里的文件名（来自 qq_list_voices 的 name，可带子目录/可省略扩展名）'),
+      path: z.string().describe('相对工作目录的文件路径，如 state/out/report.docx；不能是绝对路径或含 ..'),
+      name: z.string().optional().describe('在 QQ 里显示的文件名（可选，默认用原文件名）')
+    },
+    async ({ key, token, path: filePath, name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-document', {
+          method: 'POST',
+          body: JSON.stringify({ key, path: String(filePath), name: name || '' }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送文件失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.setAvatar !== false) {
+  server.tool(
+    'qq_set_self_avatar',
+    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。',
+    {
+      path: z.string().describe('相对工作目录的图片路径，如 state/avatar/new.png；不能是绝对路径或含 ..')
+    },
+    async ({ path: filePath }) => {
+      try {
+        const data = await agentApi('/api/socialV2/set-avatar', {
+          method: 'POST',
+          body: JSON.stringify({ path: String(filePath) }),
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `修改头像失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.setNickname !== false) {
+  server.tool(
+    'qq_set_self_nickname',
+    '修改自己（机器人 QQ 号）的昵称/个性签名。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。',
+    {
+      name: z.string().max(40).describe('新的昵称/签名，最长 40 字')
+    },
+    async ({ name }) => {
+      try {
+        const data = await agentApi('/api/socialV2/set-nickname', {
+          method: 'POST',
+          body: JSON.stringify({ name: String(name) }),
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `修改昵称失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendQzone !== false) {
+  server.tool(
+    'qq_send_qzone',
+    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。主人已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
+    {
+      content: z.string().describe('说说正文，最长 2000 字'),
+      images: z.array(z.string()).optional().describe('可选，相对工作目录的本地图片路径（png/jpg/gif/webp/bmp，最多 9 张）'),
+      ugcRight: z.number().optional().describe('可见范围：1=所有人（默认）、4=好友可见、64=仅自己可见')
+    },
+    async ({ content, images, ugcRight }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-qzone', {
+          method: 'POST',
+          body: JSON.stringify({ content: String(content), images: images ?? [], ugcRight: ugcRight ?? 1 }),
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发表说说失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_send_voice',
+    '发送 QQ 语音。两种用法：① text=要说的话（1–400字），由 GPT-SoVITS 自然音色合成；② voice=qq_list_voices 返回的文件名，发送已有录音。voice 与 text 不能同时使用。唱歌（mode=sing）已停用，等接入 RVC 后再开放；不要声称能唱任意歌曲，没有录音就如实说明。保持 verify=true；只有返回 verified=true 才可确认语音已落地。只能在白名单会话发，受时长和频率限制。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      voice: z.string().optional().describe('已有语音文件名；与 text 二选一'),
+      text: z.string().max(400).optional().describe('要说的话（1–400 字）'),
       label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
     },
-    async ({ key, token, voice, label, verify, readback }) => {
+    async ({ key, token, voice, text, label, verify, readback }) => {
       try {
         const data = await agentApi('/api/socialV2/send-voice', {
           method: 'POST',
           body: JSON.stringify({
             key,
-            voice: String(voice),
+            voice, text,
             label: label || '',
             verify: verify !== false,
             readback: readback === true,

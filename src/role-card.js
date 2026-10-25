@@ -43,7 +43,11 @@ function stripModeTags(heading) {
 export function parseRoleSections(text) {
   const sections = [];
   let current = null;
-  for (const line of String(text ?? '').split('\n')) {
+  // 必须先统一换行：Windows 下的 .md 是 CRLF，split('\n') 后每行结尾残留 \r，
+  // 会让 /^(#{1,6})\s+(.*)$/ 全部失配 —— 结果是整张卡被当成一个「无标题小节」，
+  // 模式标记（〔一代〕/〔二代〕）失效，且没有任何报错。
+  const normalized = String(text ?? '').replace(/\r\n?/g, '\n');
+  for (const line of normalized.split('\n')) {
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (!heading) {
       if (!current) {

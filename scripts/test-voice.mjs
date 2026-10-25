@@ -213,7 +213,17 @@ console.log('## 控制台契约');
   const html = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   ok(html.includes('data-v2-tool="sendVoice"'), '控制台有 sendVoice 工具开关');
-  ok(bridgeSrc.includes("'sendVoice']"), 'config API 的 toolFlags 含 sendVoice');
+  // 断言「toolFlags 数组里包含 sendVoice」，而不是「数组以 'sendVoice'] 结尾」。
+  // 后者把数组的**排列顺序**当成了契约：只要在 sendVoice 之后再加一个开关
+  // （比如后来的 sendQzone），这条就红，而实际上 sendVoice 一点没坏。
+  // 真契约只有一条：这个开关必须登记在 toolFlags 里，否则控制台保存配置时
+  // 它会被当成未知字段丢掉（`typeof !== 'boolean'` 兜底成 false，语音静默失效）。
+  const toolFlagsBlock = (() => {
+    const m = /const toolFlags = \[([\s\S]*?)\];/.exec(bridgeSrc);
+    return m ? m[1] : '';
+  })();
+  const toolFlags = [...toolFlagsBlock.matchAll(/'([A-Za-z0-9_]+)'/g)].map((m) => m[1]);
+  ok(toolFlags.includes('sendVoice'), `config API 的 toolFlags 含 sendVoice（共 ${toolFlags.length} 个开关）`);
   const uniq = (a) => [...new Set(a)].sort();
   const views = uniq([...html.matchAll(/data-view="([a-z0-9-]+)"/g)].map((m) => m[1]));
   const pages = uniq([...html.matchAll(/data-page="([a-z0-9-]+)"/g)].map((m) => m[1]));

@@ -928,14 +928,34 @@ export function unwrap(response, label) {
   throw new Error(`${label} failed: ${code}: ${message}`);
 }
 
-/** 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组）。 */
+/**
+ * 在会话事件流里收集一次 turn 的 assistant 文本（按 turn 分组）。
+ *
+ * ⚠️ 实测（DSH 0.1.7）：**`turn/start` 事件根本不会下发**。真实的事件序列是
+ *     step/start → system/message → user/message… → request/header → request/context
+ *     → session/title → assistant/message → step/end → turn/end
+ * 而这里原先只靠 `turn/start` 来建立 turns 条目，于是：
+ *   - assistant/message 找不到 turn 条目 → 直接丢弃，一个字都不收；
+ *   - turn/end 找不到条目 → 返回 null，调用方永远等不到「回合结束」。
+ * 两个叠加的结果是「回复一直不返回」，而日志里事件明明都到了。
+ *
+ * 所以改成**按需建条目**：任何带 turn 的事件第一次出现时就地登记。
+ * 这样既不依赖某个「开头事件」是否存在，也不会因为它的缺席而全盘失效。
+ */
 export function createTurnCollector() {
   const turns = new Map(); // turn -> { text }
+  /** 取（必要时新建）某个 turn 的收集槽。 */
+  function slot(turn) {
+    if (turn === undefined || turn === null) return null;
+    let t = turns.get(turn);
+    if (!t) { t = { text: '' }; turns.set(turn, t); }
+    return t;
+  }
   return {
     /** 处理一条 session/event，返回该事件是否终结了一个 turn（此时可取最终文本）。 */
     push(event) {
       if (event.type === 'turn/start') {
-        turns.set(event.data.turn, { text: '' });
+        slot(event.data.turn);
         return null;
       }
       if (event.type === 'assistant/chunk') {
@@ -944,7 +964,7 @@ export function createTurnCollector() {
         return null;
       }
       if (event.type === 'assistant/message') {
-        const t = turns.get(event.data.turn);
+        const t = slot(event.data.turn);
         if (!t) return null;
         for (const block of event.data.message?.content ?? []) {
           if (block?.type === 'text' && typeof block.text === 'string') t.text += block.text;
@@ -952,7 +972,7 @@ export function createTurnCollector() {
         return null;
       }
       if (event.type === 'turn/end') {
-        const t = turns.get(event.data.turn);
+        const t = slot(event.data.turn);
         turns.delete(event.data.turn);
         if (!t) return null;
         return { turn: event.data.turn, reason: event.data.reason, text: t.text };

@@ -19,8 +19,12 @@ import * as sticker from '../src/sticker-lib.js';
 import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
+import * as voiceSynthesis from '../src/voice-synthesis.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as roleCard from '../src/role-card.js';
+import * as ownerMemory from '../src/owner-memory.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as quietHours from '../src/quiet-hours.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -149,11 +153,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
-    collectors, setupSleepTimerV2,
+    collectors, setupSleepTimerV2, scheduleProactiveCheckV2, cancelProactiveCheckV2,
     getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
     initialPrompts, initialPromptMaxChars,
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
-    emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
+    emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES,
+    GIF_MAX_FETCH_BYTES, bot,
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
     getMode() { return currentMode; },
@@ -187,8 +192,30 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...voiceSynthesis, ...stateAcl, ...presetPrompt,
+    // 人格卡解析：bridge.js 的 bootstrap 唤醒会把人格卡正文内联进提示词，
+    // 该路径在 VM 里会真正调用 selectRoleText —— 不注入就是
+    // `ReferenceError: selectRoleText is not defined`（只影响测试，不影响线上）。
+    ...roleCard,
+    // 主人记忆：bridge.js 顶层 import 了 owner-memory 的这批函数，但 harness 一直没注入，
+    // 于是任何真正走到「消息归档」的用例都会 `ReferenceError: appendArchiveLine is not defined`。
+    // 显式逐个绑定（不用展开）：避免与 context 里已有的通用名（nowIso/createId 等）撞车。
+    loadOwnerMemory: ownerMemory.loadOwnerMemory,
+    saveOwnerMemory: ownerMemory.saveOwnerMemory,
+    mergeFacts: ownerMemory.mergeFacts,
+    buildOwnerMemoryContext: ownerMemory.buildOwnerMemoryContext,
+    buildFactExtractionPrompt: ownerMemory.buildFactExtractionPrompt,
+    parseFactJson: ownerMemory.parseFactJson,
+    appendArchiveLine: ownerMemory.appendArchiveLine,
+    readArchiveSince: ownerMemory.readArchiveSince,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
+    // 免打扰时段：bridge.js 顶层 import 了这几个纯函数（主动冒泡排期要用），
+    // VM 里没有 import 机制，必须显式注入，否则走到 scheduleProactiveCheckV2 就 ReferenceError。
+    matchQuietRange: quietHours.matchQuietRange,
+    quietMillisLeft: quietHours.quietMillisLeft,
+    normalizeQuietRanges: quietHours.normalizeQuietRanges,
+    parseClockMinutes: quietHours.parseClockMinutes,
+    formatClockMinutes: quietHours.formatClockMinutes,
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,
     planNormalization: mediaNormalize.planNormalization,

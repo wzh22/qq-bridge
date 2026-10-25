@@ -105,7 +105,7 @@ await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝
   mod.apply(ctx);
   assert.equal(typeof calls.guard, 'function', '必须注册执行期 guard');
   const guard = calls.guard;
-  for (const name of ['mcp__snowluma__qq_send_message', 'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_search', 'ask_user_question', 'todo_write']) {
+  for (const name of ['mcp__snowluma__qq_send_message', 'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_search', 'mcp__bilibili-safe__bilibili_video_learn', 'ask_user_question', 'todo_write']) {
     assert.equal(guard({ name }), undefined, `${name} 应放行`);
   }
   for (const name of ['dev_inject_plugin', 'dev_plugin_status', 'pwsh', 'read', 'write', 'dsh_snapshot', 'skill']) {

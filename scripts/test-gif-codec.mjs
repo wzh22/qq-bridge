@@ -12,7 +12,7 @@
 // 全部夹具由本文件的 makeGif() 现场合成（自带最小 LZW 编码器），不读图片素材、不跑 ffmpeg，
 // 因此这个测试在任何环境下都应当 PASS 而不是 SKIP。
 import assert from 'node:assert/strict';
-import { decodeGif, encodePng, gifToGrid, lzwDecode, pickFrameIndices } from '../src/gif-codec.js';
+import { decodeGif, encodePng, gifToGrid, lzwDecode, pickFrameIndices, scanGif } from '../src/gif-codec.js';
 
 let failures = 0;
 async function test(name, run) {
@@ -174,6 +174,69 @@ await test('pickFrameIndices 均匀取样、首尾都取到、不重复', async 
     assert.equal(new Set(picked).size, picked.length, `${n} 帧取样不应重复`);
     assert.ok(picked.every((i) => i >= 0 && i < n));
   }
+});
+
+// ── 大动图：内存必须与总帧数脱钩（2026-10-24 回归） ────────────────────────
+//
+// 事故现场：decodeGif 早期实现把**每一帧**都合成成完整 RGBA 画布存进数组。
+// 600×600、1200 帧的动图因此要 1200 × 600 × 600 × 4 ≈ 1.6 GB —— 桥接进程被 V8 堆顶死，
+// 用户看到的是「大一点的动图发过去没反应 / 图看不了」，日志里连一句像样的错误都没有。
+// 而实际上我们只抽 6 帧。修法是 scanGif() 先数帧、只保留抽中的帧（keepFrames）。
+/** 造 n 帧的夹具（颜色循环取几种，够区分即可）。 */
+function makeNFrames({ width, height, n }) {
+  const palette = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255]];
+  return makeGif({
+    width,
+    height,
+    frames: Array.from({ length: n }, (_, i) => ({ color: palette[i % palette.length], delayMs: 50 }))
+  });
+}
+
+await test('scanGif 只数帧不解码（与 decodeGif 结果一致、但不占内存）', async () => {
+  const many = makeNFrames({ width: 40, height: 30, n: 60 });
+  const scanned = scanGif(many);
+  assert.equal(scanned.frameCount, 60);
+  assert.equal(scanned.width, 40);
+  assert.equal(scanned.height, 30);
+  assert.ok(scanned.durationMs > 0, '应能算出总时长');
+});
+
+await test('decodeGif 的 keepFrames 只留指定帧，且下标是原始帧序', async () => {
+  const many = makeNFrames({ width: 40, height: 30, n: 60 });
+  const got = decodeGif(many, { keepFrames: [0, 29, 59] });
+  assert.equal(got.totalFrames, 60, '总帧数仍要是真实值');
+  assert.equal(got.frames.length, 3, '只保留 3 帧');
+  assert.deepEqual(got.frames.map((f) => f.index), [0, 29, 59]);
+  // 不传 keepFrames 时保持旧行为（全解），兼容已有调用方
+  const all = decodeGif(many);
+  assert.equal(all.frames.length, 60);
+});
+
+await test('大动图拼图：只把抽中的帧留在内存里（行为断言，不测字节数）', async () => {
+  // 200 帧 × 200×200。若仍「全帧留存」，堆上要留 200×200×200×4 ≈ 30.5MB。
+  //
+  // 这里**不做内存测量**：heapUsed 在同一进程里被夹具、GC 时机、堆扩容一起污染，
+  // 实测同一份代码在独立进程里是 2.19MB、在测试进程里能读到 16MB 以上；
+  // RSS 更糟（能差出 40MB）。拿它做阈值断言只会得到跟实现无关的假失败。
+  // 改成断言**可观察的行为契约**：keepFrames 生效后只回 6 帧，totalFrames 仍如实。
+  const big = makeNFrames({ width: 200, height: 200, n: 200 });
+  const grid = gifToGrid(big, { cols: 3, rows: 2, sampleFrames: 6, tileWidth: 240, maxBytes: 1024 * 1024 });
+  assert.equal(grid.totalFrames, 200, '总帧数必须如实反映原始文件');
+  assert.equal(grid.sampleFrames, 6, '只抽 6 帧');
+
+  // 直接验证根因：keepFrames 生效后底层只保留 6 帧（而不是 200 帧）。
+  const kept = decodeGif(big, { keepFrames: pickFrameIndices(200, 6) });
+  assert.equal(kept.frames.length, 6, 'keepFrames 必须真的只留 6 帧');
+  assert.equal(kept.totalFrames, 200);
+  assert.ok(grid.buffer.length > 0);
+});
+
+await test('gifToGrid 的总时长来自整段动画，而不是抽中的那几帧', async () => {
+  const many = makeNFrames({ width: 40, height: 30, n: 60 });
+  const scanned = scanGif(many);
+  const grid = gifToGrid(many, { cols: 3, rows: 2, sampleFrames: 6, tileWidth: 120 });
+  // 旧实现在只保留抽中帧之后会退化成「6 帧的时长」，说明里的秒数就不对了。
+  assert.equal(grid.durationMs, scanned.durationMs, '总时长必须是整段动画的');
 });
 
 // ── 拼图 ──────────────────────────────────────────────────────────────────

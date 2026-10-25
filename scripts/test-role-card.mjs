@@ -106,3 +106,23 @@ test('真实人格卡可用，且筛选不丢公共内容', () => {
   // 二代注入的文本里不应再出现一代的分条机制
   assert.doesNotMatch(v2, /空格分隔（例如|\[SILENT\]/);
 });
+
+// 回归：buildWakePromptV2 在 bootstrap 时**必须把人格卡正文拼进提示词**，
+// 不能只留一句「完整角色卡请调用 qq_get_prompt 查看」的指针。
+// 背景（2026-10-25）：线上实际跑的就是纯指针版 —— 模型只在第一轮调过一次
+// qq_get_prompt，之后每次唤醒只拿到角色名；而那一次调用返回的 22KB 角色卡
+// 又被上下文压缩插件截到 5KB。结果「人格卡已启用」但人设从未真正进入模型。
+// 这里做源码级断言，防止有人把 bootstrap 的正文注入又改回指针。
+test('bootstrap 唤醒提示词必须内联人格卡正文（防退回指针模式）', () => {
+  const src = fs.readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8');
+  const fnStart = src.indexOf('function buildWakePromptV2(');
+  assert.ok(fnStart > 0, '应能定位到 buildWakePromptV2');
+  // 截到下一个函数定义，避免把后面的 buildWakeReminderPromptV2 也算进来
+  const nextFn = src.indexOf('\n  function ', fnStart + 10);
+  const body = src.slice(fnStart, nextFn > 0 ? nextFn : src.length);
+
+  assert.match(body, /currentRoleHintV2\(\)/, 'bootstrap 分支必须调用 currentRoleHintV2() 取正文');
+  assert.match(body, /reason === 'bootstrap'/, '正文注入必须限定在 bootstrap，避免每条唤醒重复累积');
+  // 指针文案仍要在（非 bootstrap 唤醒继续用它），但不能再是唯一手段
+  assert.match(body, /完整角色卡请调用 qq_get_prompt 查看/, '非首次唤醒仍应保留指针写法');
+});

@@ -63,7 +63,14 @@
     "postinstall": "node scripts/patch-snowluma-sdk.mjs",
     "privacy-scan": "node scripts/privacy-scan.mjs",
     "diagnose:acl": "node scripts/diagnose-acl.mjs",
-    "harden-acl": "node scripts/harden-state-acl.mjs"
+    "harden-acl": "node scripts/harden-state-acl.mjs",
+    "test:voice-synthesis": "node --test scripts/test-voice-synthesis.mjs",
+    "test:rvc": "node --test scripts/test-rvc.mjs",
+    "bili-login": "node scripts/bili-login.mjs",
+    "test:bilibili": "node scripts/test-bilibili.mjs",
+    "test:bili-subtitle-guard": "node scripts/test-bili-subtitle-guard.mjs",
+    "test:bili-cookie-cwd": "node scripts/test-bili-cookie-cwd.mjs",
+    "test:diary": "node scripts/test-diary.mjs && node scripts/test-diary-e2e.mjs && node scripts/test-diary-mcp.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-host-apiproxy": "0.1.1-rc.2",

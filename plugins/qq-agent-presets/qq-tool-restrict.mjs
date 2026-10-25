@@ -212,10 +212,27 @@ export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TO
 
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
+//
+// `mcp__bilibili-safe__` 为什么可以放进来（2026-10-25 评估）：
+//   该 server 只暴露**只读**工具（bilibili_search / bilibili_video_learn /
+//   bilibili_hot / bilibili_status），源码里没有任何写操作 —— 不发弹幕、不评论、
+//   不关注、不下载、不登录。对应的 npm 包 bilibili-mcp-server 有 31 个工具含
+//   发弹幕/发评论/关注/扫码登录，是**真账号上的不可逆动作**，因此没有直接引入它，
+//   而是自建了只读子集（src/mcp-bilibili-safe.js）。放行前缀 = 放行只读浏览。
+//
+// `mcp__tieba-safe__` 同理（2026-10-25）：
+//   tieba_status / tieba_read_forum / tieba_read_thread / tieba_learn_style，
+//   四个全是只读。src/tieba.js 里**不存在**发帖/回帖/点赞/关注/收藏的实现。
+//   它走 CDP 复用主人自己的浏览器会话（贴吧对普通 HTTP 一律 403 + 人机验证），
+//   因此不会伪造身份、不破解验证码 —— 验证由主人的浏览器正常完成。
+// ⚠️ 需要主人事先开着带 --remote-debugging-port=9222 的浏览器，否则工具会
+//   明确报错并提示怎么开（不会静默失败、也不会绕路去爬）。
 const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  'mcp__bilibili-safe__',
+  'mcp__tieba-safe__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

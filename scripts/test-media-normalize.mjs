@@ -281,6 +281,30 @@ await test('fetchOneBotImage 仍返回**原始字节**（收藏表情不能被�
   } finally { await h.close(); }
 });
 
+// ── 大动图抓取上限（2026-10-24 回归） ────────────────────────────────────
+//
+// 事故：桥接把 socialV2.media.maxBytes（8MB，本意是「单条消息图片总字节预算」）
+// 同时当成 safeFetchBuffer 的**下载**上限。于是 >8MB 的动图在下载阶段就被
+// 「图片超过大小限制」拒掉，字节根本没机会进归一化 —— 而大动图恰恰是最该抽帧的：
+// 实测 34MB/600 帧 → 66KB，收益约 500 倍。用户的体感就是「大的动图还是看不了」。
+// 修法：动图单独给一个更高的抓取上限（GIF_MAX_FETCH_BYTES），静态图沿用原值。
+await test('大动图抓取上限必须高于静态图（否则大 GIF 在下载阶段就被拒）', async () => {
+  const h = await bridgeHarness();
+  try {
+    assert.ok(h.MAX_MEDIA_BYTES > 0, '静态图上限应当存在');
+    assert.ok(
+      h.GIF_MAX_FETCH_BYTES > h.MAX_MEDIA_BYTES,
+      `动图抓取上限 ${(h.GIF_MAX_FETCH_BYTES / 1024 / 1024).toFixed(0)}MB 必须大于静态图的 ` +
+      `${(h.MAX_MEDIA_BYTES / 1024 / 1024).toFixed(0)}MB，否则大 GIF 进不了归一化`
+    );
+    // 24MB 是一个务实下界：能覆盖常见的 1–2 分钟聊天动图，又不至于无界占用内存。
+    assert.ok(
+      h.GIF_MAX_FETCH_BYTES >= 24 * 1024 * 1024,
+      `动图抓取上限至少 24MB（当前 ${(h.GIF_MAX_FETCH_BYTES / 1024 / 1024).toFixed(0)}MB）`
+    );
+  } finally { await h.close(); }
+});
+
 fs.rmSync(tmp, { recursive: true, force: true });
 
 console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  failures=${failures} skipped=${skipped}`);

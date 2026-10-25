@@ -17,8 +17,12 @@ import {
   NodeApiClient, discoverDshLaunchToken, discoverDshSessionCookie,
   readBrowserSessionSecret, resolveDshHome, mintBrowserSessionCookie, isLoopbackBase
 } from '../src/dsh-client.js';
+import { resolveDshBaseUrl, dshReachable } from './_test-dsh-base.mjs';
 
-const BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
+// 原来写死 'http://127.0.0.1:3080'：那是旧版 DSH 的固定端口，现在 DSH 每次启动
+// 挑高位随机端口，guardian 会把它同步进 config.json。写死 3080 的结果是这个测试
+// 在 DSH 正常运行时会 ECONNREFUSED 直接崩掉，看起来像代码坏了。
+const BASE = resolveDshBaseUrl();
 
 let pass = 0;
 let fail = 0;
@@ -51,6 +55,16 @@ if (secret) {
 }
 
 // ── 端到端（需要 DSH 在线）────────────────────────────────────────────────
+// 这里原来没有「在线检查」：DSH 没起时 fetch 直接抛 ECONNREFUSED，整个脚本以
+// 未捕获异常退出，连纯函数层的测试结果都打不出来 —— 分不清是断言失败还是服务没起。
+const online = await dshReachable(BASE);
+if (!online) {
+  console.log(results.join('\n'));
+  console.log(`\n总计: ${pass} 通过, ${fail} 失败, 端到端 ${'已跳过'}（${BASE} 不可达）`);
+  console.log('提示：DSH 没在运行，或地址不对。设 DSH_BASE_URL 可指定其他地址。');
+  process.exit(fail > 0 ? 1 : 0);
+}
+
 const rpc = async (cookie, method, args) => {
   const res = await fetch(`${BASE}/api/${method}`, {
     method: 'POST',

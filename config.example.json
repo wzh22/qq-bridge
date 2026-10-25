@@ -68,6 +68,36 @@
     "workspaceTitle": "QQ 黑话学习",
     "autoResearch": true
   },
+  "tiebaStyle": {
+    "enabled": true,
+    "injectMax": 10,
+    "cdpPort": 9222,
+    "forums": [
+      "孙笑川"
+    ],
+    "threadsPerForum": 3,
+    "floorsPerThread": 15,
+    "maxThreads": 6
+  },
+  "ownerMemory": {
+    "enabled": true,
+    "minMessages": 20,
+    "batchMessages": 40,
+    "extractCooldownMs": 1800000,
+    "injectMax": 30,
+    "learnerPreset": "qq-chat",
+    "workspaceTitle": "QQ 主人记忆"
+  },
+  "diary": {
+    "enabled": true,
+    "minMessages": 15,
+    "batchMessages": 30,
+    "writeCooldownMs": 3600000,
+    "recentDays": 7,
+    "injectRecent": 5,
+    "injectRecall": 4,
+    "injectStyle": 3
+  },
   "social": {
     "enabled": true,
     "maxReplyChars": 500,
@@ -230,7 +260,10 @@
       "defaultVolume": 1,
       "loudness": "normal",
       "ffmpegPath": "",
-      "autoReadback": true
+      "autoReadback": true,
+      "synthesis": {
+        "enabled": false
+      }
     },
     "proactive": {
       "enabled": true,
@@ -263,6 +296,10 @@
       "gifFrames": 6,
       "gifTile": 240,
       "normalizeTimeoutMs": 25000
+    },
+    "bilibili": {
+      "sessdata": "",
+      "note": "可选。填 B 站 SESSDATA 后机器人才能取「逐字字幕」；不填就只能看标题/简介/分P大纲/评论/弹幕。获取：bilibili.com 登录后 F12 → Application → Cookies → SESSDATA。只读用途，不会用这个账号发任何东西。"
     }
   },
   "webSearch": {

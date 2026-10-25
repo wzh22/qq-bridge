@@ -150,6 +150,30 @@ export function safeJoinLibrary(voiceDir, relPath) {
  * 结果写临时文件回传，stdout/stderr 一律 ignore（受限沙箱下 pipe 会 EPERM）。
  */
 export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10000, tmpDir = null } = {}) {
+  // Generated PCM WAV needs no external ffprobe; enforce duration even on a bare Windows install.
+  if (path.extname(file).toLowerCase() === '.wav') {
+    let fd;
+    try {
+      fd = fs.openSync(file, 'r');
+      const size = fs.fstatSync(fd).size;
+      const head = Buffer.alloc(12); fs.readSync(fd, head, 0, 12, 0);
+      if (head.toString('ascii',0,4)==='RIFF' && head.toString('ascii',8,12)==='WAVE') {
+        let format=null, dataBytes=null, pos=12;
+        for(let chunks=0;pos+8<=size && chunks<10000;chunks++) {
+          const h=Buffer.alloc(8); fs.readSync(fd,h,0,8,pos);
+          const len=h.readUInt32LE(4), id=h.toString('ascii',0,4);
+          if(pos+8+len>size)break;
+          if(id==='fmt ' && len>=16){const b=Buffer.alloc(16);fs.readSync(fd,b,0,16,pos+8);format={type:b.readUInt16LE(0),channels:b.readUInt16LE(2),sampleRate:b.readUInt32LE(4),byteRate:b.readUInt32LE(8),bits:b.readUInt16LE(14)};}
+          if(id==='data')dataBytes=len;
+          pos+=8+len+(len%2);
+          if(format && dataBytes!==null)break;
+        }
+        if(format?.type===1 && format.channels>0 && format.sampleRate>0 && format.byteRate===format.sampleRate*format.channels*format.bits/8 && dataBytes>0) {
+          return {ok:true,duration:dataBytes/format.byteRate,formatName:'wav',codec:'pcm_s'+format.bits+'le',sampleRate:format.sampleRate,channels:format.channels};
+        }
+      }
+    } catch {} finally {if(fd!==undefined)fs.closeSync(fd);}
+  }
   const dirs = [tmpDir, path.join(os.tmpdir(), 'voice-probe')].filter(Boolean);
   let dir = null;
   for (const d of dirs) {

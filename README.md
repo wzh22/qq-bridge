@@ -93,6 +93,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
   - 群聊引用/回复会解析成「被引用人 + 原文」注入 DSH（如 `[引用 Derp：El Psy Kongroo是啥]机关的走狗`），让 AI 判断这句话是对谁说的，不会把群友之间引用第三方的对话误当成指向自己；引用机器人自己时会被视为必回
   - **图片/表情（含动图 GIF）**：表情包优先走 QQ 的 CDN 直链，`get_image` 失败时用 `emoji_id` 推出 CDN 地址兜底；媒体元数据保留 `emoji_id`/`summary`/`sub_type` 等字段。下载走同一套 SSRF 防护传输，并修掉了「DNS 先返回 IPv6、本机没有 IPv6 出口 → 每次白等 20 秒」的根因（改为 **IPv4 优先 + 逐地址故障切换**），动图表情不再时好时坏。单条消息上限默认 8MB / 64MP / 5 张（`socialV2.media`）
   - **动图给模型「看动画」而不是只看第一帧**：动图会被抽成 N 帧、拼成一张 3×2 网格图再交给模型，并在工具结果里注明「动图 N 帧 / 已抽 M 帧 / 行优先」。有两条实现路径 —— 主路径用 ffmpeg（输出 JPEG，体积小）；ffmpeg 不可用时自动改用**纯 JS 的 GIF 解码兜底**（`src/gif-codec.js`，零外部依赖，输出 PNG）。仓库自带便携版 ffmpeg（`tools/ffmpeg/ffmpeg.exe`），克隆即可用；想用系统 ffmpeg 就设 `FFMPEG_PATH` 或 `socialV2.voice.ffmpegPath`（显式配置优先）。可用 `socialV2.media.jsGifFallback: false` 关掉兜底。
+    - **大动图也能看了**（2026-10-24 修）：此前 `maxBytes`（8MB）被同时当成下载上限，超过它的动图在**抓取阶段**就被拒，字节根本没进抽帧 —— 而大动图恰恰收益最大（实测 34MB/600 帧 → 66KB，约 500 倍）。现在动图走独立的 `gifMaxFetchBytes`（默认 48MB）。同时修掉纯 JS 解码的内存炸弹：早期实现把每一帧都合成成整帧 RGBA 留存，600×600 / 1200 帧的动图要吃 1.6GB；现在先 `scanGif()` 数帧、只保留抽中的那几帧（`keepFrames`），内存与总帧数脱钩（实测 1200 帧峰值不再增长）。
   - MCP 发送工具支持可选 `replyToMessageId`，并新增专用 `qq_reply` 工具：AI 可以先用 `qq_get_group_history` 拿到真实消息 id，再引用/回复某条消息（是否允许 AI 主动使用由人格/策略决定；桥接会检测发送类工具调用并自动跳过该回合的重复自动转发）
   - 一代仿真模式（`reserved`）下，AI 可以只输出 `[SILENT]` 表示“潜水/不接话”，桥接会静默不发送
   - 一代仿真模式（`reserved`）按空格分句：AI 用空格表示拆成多条消息；中英文/数字之间的空格也会被当成分条信号，不想分条就不要加空格（`reserved2` 不适用，分条请用 `qq_send_message` 数组）
@@ -130,7 +131,7 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat`（改性格见下文） |
 | `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-v2` |
 | `socialV2.initialPromptMaxChars` | 会话「初始提示词」（控制台为某个群/私聊预写的环境说明）的字数上限，默认 2000，允许 100~8000。越界值会在启动时收敛并保持原文件不动 |
-| `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛。动图另有三项：`gifFrames`（抽几帧，默认 6）、`gifTile`（每格目标宽度 px，默认 240）、`normalizeTimeoutMs`（ffmpeg 硬超时，默认 25000）；`jsGifFallback`（默认 `true`）控制 ffmpeg 不可用时是否改用纯 JS 解码 |
+| `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛。动图另有五项：`gifFrames`（抽几帧，默认 6）、`gifTile`（每格目标宽度 px，默认 240）、`normalizeTimeoutMs`（ffmpeg 硬超时，默认 25000）、`jsGifFallback`（默认 `true`，ffmpeg 不可用时是否改用纯 JS 解码）、`gifMaxFetchBytes`（动图的**下载**上限，默认 48MB）。注意 `maxBytes` 只当静态图上限与单条消息预算，动图走 `gifMaxFetchBytes`——大动图抽帧后能降两个数量级（实测 34MB/600 帧 → 66KB），所以值得先把字节抓下来 |
 | `socialV2.voice.ffmpegPath` | ffmpeg 可执行文件路径。留空时按 `FFMPEG_PATH` → 仓库内 `tools/ffmpeg/ffmpeg.exe` → PATH 的顺序查找。动图抽帧拼图与语音音量处理共用这一个配置 |
 | `webSearch.provider` | 联网搜索后端：`auto`（默认，优先 DeepSeek、失败回退 Bing）/ `deepseek`（仅 DeepSeek，无凭据时报错）/ `bing` |
 | `webSearch.apiKeyEnv` / `apiKey` | 搜索凭据的环境变量名（默认 `DEEPSEEK_API_KEY`）/ 直接写死 key（不推荐）。都不设置时读 DSH 的 `$DSH_HOME/.credentials.yaml` 里同名 ref |

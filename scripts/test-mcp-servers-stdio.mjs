@@ -1,5 +1,5 @@
 // 模拟 DSH 的 dsh-mcp-client：以 stdio 拉起桥接的 MCP server，握手并列出工具，
-// 验证三个 MCP server 在新版 DSH 环境下仍能被正常接入（不需要 SnowLuma 在线）。
+// 验证四个 MCP server 在新版 DSH 环境下仍能被正常接入（不需要 SnowLuma 在线）。
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -12,6 +12,10 @@ const SERVERS = [
   { serverName: 'snowluma', script: 'src/mcp-snowluma-safe.js' },
   { serverName: 'snowluma-host', script: 'src/mcp-host-server.js' },
   { serverName: 'web-search-safe', script: 'src/mcp-web-search-safe.js' },
+  // B 站只读能力。这里只是握手/列工具，不联网。
+  { serverName: 'bilibili-safe', script: 'src/mcp-bilibili-safe.js' },
+  // 贴吧只读能力。握手/列工具不碰浏览器（CDP 只在真正调工具时才连）。
+  { serverName: 'tieba-safe', script: 'src/mcp-tieba-safe.js' },
 ];
 
 let failures = 0;

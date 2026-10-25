@@ -161,16 +161,88 @@ function deinterlace(src, w, h) {
 }
 
 /**
- * 解码整个 GIF。
+ * 轻量扫一遍 GIF 头，只数帧数、算总时长，不解 LZW。
  *
+ * 为什么需要它（2026-10-24 实测）：
+ *   decodeGif 会把**每一帧**都合成成一张完整 RGBA 画布存下来。600×600、1200 帧的
+ *   动图因此要 1200 × 600×600×4 ≈ **1.6 GB** 内存 —— 桥接进程直接被 V8 堆顶死，
+ *   表现就是「大一点的动图发过去没反应 / 图看不了」。而我们其实只抽 6 帧。
+ *   所以先花几毫秒数出总帧数，算出「要哪几帧」，再只保留那几帧的像素。
+ *
+ * 与 parseGif（media-normalize 里那份）的区别：这边顺带把每帧的 delay 也收集起来，
+ * 因为拼图需要知道总时长来写说明。仍然不解 LZW，纯内存跳块，几毫秒。
+ *
+ * @returns {{width:number, height:number, frameCount:number, durationMs:number}}
+ */
+export function scanGif(buf) {
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  if (buf.length < 13) throw new Error('GIF 太短（不足 13 字节头）');
+  const sig = buf.toString('ascii', 0, 6);
+  if (sig !== 'GIF87a' && sig !== 'GIF89a') throw new Error(`不是 GIF（签名 ${JSON.stringify(sig)}）`);
+
+  const width = buf.readUInt16LE(6);
+  const height = buf.readUInt16LE(8);
+  if (!width || !height) throw new Error('GIF 逻辑屏幕尺寸为 0');
+
+  const packed = buf[10];
+  let pos = 13;
+  if (packed & 0x80) pos += 3 * (2 << (packed & 0x07));
+
+  let frameCount = 0;
+  let durationMs = 0;
+  let delayCs = 0;
+  let guard = 0;
+
+  while (pos > 0 && pos < buf.length) {
+    if (++guard > 1_000_000) break;
+    const block = buf[pos];
+    if (block === 0x3b) break;
+    if (block === 0x21) {
+      if (pos + 1 >= buf.length) break;
+      const label = buf[pos + 1];
+      const afterLabel = pos + 2;
+      if (label === 0xf9 && afterLabel + 5 <= buf.length) {
+        const size = buf[afterLabel];
+        if (size >= 4) delayCs = buf.readUInt16LE(afterLabel + 2);
+      }
+      pos = skipSubBlocks(buf, afterLabel);
+      continue;
+    }
+    if (block === 0x2c) {
+      if (pos + 10 > buf.length) break;
+      const dp = buf[pos + 9];
+      let p = pos + 10;
+      if (dp & 0x80) p += 3 * (2 << (dp & 0x07));
+      if (p >= buf.length) break;
+      const next = skipSubBlocks(buf, p + 1); // +1 跳过 LZW 最小码长
+      if (next < 0) break;
+      frameCount += 1;
+      durationMs += delayCs || 0; // GIF 的 delay 单位是 1/100 秒，下面统一乘 10
+      delayCs = 0;
+      pos = next;
+      continue;
+    }
+    break;
+  }
+
+  return { width, height, frameCount, durationMs: durationMs * 10 };
+}
+
+/**
+ * 解码 GIF。
+ *
+ * @param opts.keepFrames  只保留这些帧下标（按原始帧序）。给 null/省略 = 保留全部。
+ *                         传入时**未选中的帧只合成、不留存**，内存只跟保留帧数有关，
+ *                         不再跟总帧数有关 —— 这是大动图不炸内存的关键。
  * @returns {{
  *   width:number, height:number, loopCount:number,
- *   frames: Array<{ rgba: Buffer, delayMs:number }>
+ *   frames: Array<{ rgba: Buffer, delayMs:number, index:number }>,
+ *   totalFrames:number
  * }}
  *   rgba 是**已经按 disposal 合成过的整幅画面**（width×height×4，非预乘）。
  *   直接逐帧拿去拼图即可，不需要调用方再理解 disposal。
  */
-export function decodeGif(buf) {
+export function decodeGif(buf, opts = {}) {
   if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
   if (buf.length < 13) throw new Error('GIF 太短（不足 13 字节头）');
   const sig = buf.toString('ascii', 0, 6);
@@ -180,6 +252,9 @@ export function decodeGif(buf) {
   const height = buf.readUInt16LE(8);
   if (!width || !height) throw new Error('GIF 逻辑屏幕尺寸为 0');
   if (width * height > 64_000_000) throw new Error(`GIF 尺寸过大（${width}×${height}）`);
+
+  // keepFrames：null = 全留；否则只留这些下标（Set 查表 O(1)）。
+  const keep = Array.isArray(opts.keepFrames) ? new Set(opts.keepFrames) : null;
 
   const packed = buf[10];
   const bgIndex = buf[11];
@@ -195,6 +270,7 @@ export function decodeGif(buf) {
 
   let canvas = Buffer.alloc(width * height * 4);
   const frames = [];
+  let totalFrames = 0;
   let loopCount = 0;
   let gce = { delayMs: 0, transparentIndex: -1, disposal: 0 };
   let guard = 0;
@@ -290,7 +366,12 @@ export function decodeGif(buf) {
         }
       }
 
-      frames.push({ rgba: Buffer.from(canvas), delayMs: gce.delayMs });
+      // 只有「要保留的帧」才复制画布。totalFrames 是这帧在原始文件里的下标，
+      // 必须在自增之前记下来，因为 keep 里存的就是原始下标。
+      if (!keep || keep.has(totalFrames)) {
+        frames.push({ rgba: Buffer.from(canvas), delayMs: gce.delayMs, index: totalFrames });
+      }
+      totalFrames += 1;
 
       // 这一帧显示完之后按 disposal 收拾画布
       if (gce.disposal === 2) {
@@ -316,7 +397,7 @@ export function decodeGif(buf) {
     break; // 认不出的块：停下，别硬猜
   }
 
-  return { width, height, loopCount, frames };
+  return { width, height, loopCount, frames, totalFrames };
 }
 
 // ── 缩放 / 拼图 ───────────────────────────────────────────────────────────
@@ -464,10 +545,6 @@ export function encodePng(rgba, width, height) {
  *   抛异常表示「这个 GIF 我解不了」，调用方据此退回别的路径。
  */
 export function gifToGrid(buf, opts = {}) {
-  const decoded = decodeGif(buf);
-  const { width, height, frames } = decoded;
-  if (!frames.length) throw new Error('GIF 里没有可解码的帧');
-
   const cols = Math.max(1, Math.round(Number(opts.cols) || 3));
   const rows = Math.max(1, Math.round(Number(opts.rows) || 2));
   const cells = cols * rows;
@@ -476,7 +553,19 @@ export function gifToGrid(buf, opts = {}) {
   const margin = Math.max(0, Math.round(Number(opts.margin ?? 4)));
   const bg = Array.isArray(opts.background) ? opts.background : [255, 255, 255];
 
-  const indices = pickFrameIndices(frames.length, Math.min(cells, opts.sampleFrames || cells));
+  // 先数帧（不解 LZW，几毫秒），据此算出「要哪几帧」，
+  // 再让 decodeGif 只保留这几帧 —— 否则 1000 帧的动图会吃掉 GB 级内存。
+  const scanned = scanGif(buf);
+  const totalFrames = Math.max(scanned.frameCount, 0);
+  if (!totalFrames) throw new Error('GIF 里没有可解码的帧');
+  const indices = pickFrameIndices(totalFrames, Math.min(cells, opts.sampleFrames || cells));
+
+  const decoded = decodeGif(buf, { keepFrames: indices });
+  const { width, height } = decoded;
+  if (!decoded.frames.length) throw new Error('GIF 里没有可解码的帧');
+
+  // decodeGif 返回的帧已按 keepFrames 过滤，但仍是原始下标 → 建一份下标到缓冲的映射。
+  const byIndex = new Map(decoded.frames.map((f) => [f.index, f.rgba]));
 
   // 格子高度按源图长宽比算；拼图整体尺寸由此固定
   const ratio = height / width;
@@ -498,7 +587,9 @@ export function gifToGrid(buf, opts = {}) {
       const cx = cell % cols;
       const cy = Math.floor(cell / cols);
       if (cy >= rows) return;
-      const scaled = resizeRGBA(frames[frameIndex].rgba, width, height, tw, th);
+      const rgba = byIndex.get(frameIndex);
+      if (!rgba) return; // 极端情况下该帧没解出来（数据损坏），留白总比崩掉好
+      const scaled = resizeRGBA(rgba, width, height, tw, th);
       blit(out, w, h, scaled, tw, th, margin + cx * (tw + gap), margin + cy * (th + gap), bg);
     });
     return { rgba: out, width: w, height: h };
@@ -519,7 +610,9 @@ export function gifToGrid(buf, opts = {}) {
     attempts += 1;
   }
 
-  const durationMs = frames.reduce((sum, f) => sum + (f.delayMs || 0), 0);
+  // 总时长用 scanGif 的结果：decodeGif 现在只保留抽中的帧，
+  // 那些帧的 delay 之和 ≠ 整段动画的时长。
+  const durationMs = scanned.durationMs;
   return {
     buffer: png,
     mimeType: 'image/png',
@@ -528,7 +621,7 @@ export function gifToGrid(buf, opts = {}) {
     cols,
     rows,
     sampleFrames: indices.length,
-    totalFrames: frames.length,
+    totalFrames,
     durationMs,
     scale: Number(scale.toFixed(3)),
     gridWidth: gridW,

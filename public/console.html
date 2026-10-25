@@ -2183,6 +2183,13 @@ button:active:not(:disabled) {
         <label style="flex:1">安静阈值（分）</label><input type="number" id="v2ProactiveIdleThreshold" min="1" style="width:80px">
         <label style="flex:1">触发概率</label><input type="number" id="v2ProactiveProbability" step="0.05" min="0" max="1" style="width:80px">
       </div>
+      <div class="row" style="align-items:flex-start">
+        <label style="flex:1;margin-top:6px">免打扰时段</label>
+        <textarea id="v2ProactiveQuietRanges" rows="3" style="flex:2;min-width:200px" placeholder="22:00-06:30&#10;12:50-13:50"></textarea>
+      </div>
+      <div class="row">
+        <span class="meta" style="flex:1">每行一段，格式 HH:MM-HH:MM；跨午夜照写（22:00-06:30 表示到次日 6:30）。这几段里 AI 不会主动冒泡，但被 @ / 关键词 / 拍一拍仍会回。留空即全天允许。</span>
+      </div>
 
       </div></details>
 <details class="settings-group"><summary>表情包参数（sticker：QQ 收藏表情体系）</summary><div class="settings-content">
@@ -3322,6 +3329,10 @@ async function loadV2Config() {
     document.getElementById('v2ProactiveIntervalMax').value = Math.round((pa.checkIntervalMaxMs || 5400000) / 60000);
     document.getElementById('v2ProactiveIdleThreshold').value = Math.round((pa.idleThresholdMs || 900000) / 60000);
     document.getElementById('v2ProactiveProbability').value = pa.probability ?? 0.3;
+    document.getElementById('v2ProactiveQuietRanges').value = (Array.isArray(pa.quietRanges) ? pa.quietRanges : [])
+      .map((r) => `${r?.start ?? ''}-${r?.end ?? ''}`)
+      .filter((s) => s !== '-')
+      .join('\n');
     const stk = c.sticker || {};
     document.getElementById('v2StickerEnabled').checked = stk.enabled !== false;
     document.getElementById('v2StickerSyncTtlSec').value = Math.round((stk.syncTtlMs || 60000) / 1000);
@@ -3402,7 +3413,18 @@ async function saveV2Config() {
       checkIntervalMinMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMin').value) || 30) * 60000,
       checkIntervalMaxMs: Math.round(Number(document.getElementById('v2ProactiveIntervalMax').value) || 90) * 60000,
       idleThresholdMs: Math.round(Number(document.getElementById('v2ProactiveIdleThreshold').value) || 15) * 60000,
-      probability: Number(document.getElementById('v2ProactiveProbability').value) || 0
+      probability: Number(document.getElementById('v2ProactiveProbability').value) || 0,
+      // 免打扰时段按「每行一段」提交成数组；服务端还会再规范化一次（丢弃坏条目），
+      // 这里只做拆分，避免前端成为唯一的校验点。
+      quietRanges: document.getElementById('v2ProactiveQuietRanges').value
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => {
+          const m = /^(.+?)\s*(?:-|~|～|至|到)\s*(.+)$/.exec(s);
+          return m ? { start: m[1].trim(), end: m[2].trim() } : null;
+        })
+        .filter(Boolean)
     },
     sticker: {
       enabled: document.getElementById('v2StickerEnabled').checked,
