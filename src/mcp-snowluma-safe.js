@@ -356,6 +356,11 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_self_avatar: 'setAvatar',
   qq_set_self_nickname: 'setNickname',
   qq_send_qzone: 'sendQzone',
+  qq_role_insight: 'roleEvolve',
+  qq_role_observe: 'roleEvolve',
+  qq_role_feedback: 'roleEvolve',
+  qq_role_propose: 'roleEvolve',
+  qq_role_apply: 'roleEvolve',
 };
 const disabledTools = [];
 {
@@ -1368,15 +1373,17 @@ if (cfg.socialV2?.tools?.sendDocument !== false) {
 if (cfg.socialV2?.tools?.setAvatar !== false) {
   server.tool(
     'qq_set_self_avatar',
-    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。',
+    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。reserved2 下必须携带会话令牌 token，否则会被拒绝。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。',
     {
-      path: z.string().describe('相对工作目录的图片路径，如 state/avatar/new.png；不能是绝对路径或含 ..')
+      path: z.string().describe('相对工作目录的图片路径，如 state/avatar/new.png；不能是绝对路径或含 ..'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
     },
-    async ({ path: filePath }) => {
+    async ({ path: filePath, token }) => {
       try {
         const data = await agentApi('/api/socialV2/set-avatar', {
           method: 'POST',
-          body: JSON.stringify({ path: String(filePath) }),
+          body: JSON.stringify({ path: String(filePath), token }),
+          headers: { 'x-agent-token': token },
           timeoutMs: 60000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1390,15 +1397,17 @@ if (cfg.socialV2?.tools?.setAvatar !== false) {
 if (cfg.socialV2?.tools?.setNickname !== false) {
   server.tool(
     'qq_set_self_nickname',
-    '修改自己（机器人 QQ 号）的昵称/个性签名。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。',
+    '修改自己（机器人 QQ 号）的昵称/个性签名。reserved2 下必须携带会话令牌 token，否则会被拒绝。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。',
     {
-      name: z.string().max(40).describe('新的昵称/签名，最长 40 字')
+      name: z.string().max(40).describe('新的昵称/签名，最长 40 字'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
     },
-    async ({ name }) => {
+    async ({ name, token }) => {
       try {
         const data = await agentApi('/api/socialV2/set-nickname', {
           method: 'POST',
-          body: JSON.stringify({ name: String(name) }),
+          body: JSON.stringify({ name: String(name), token }),
+          headers: { 'x-agent-token': token },
           timeoutMs: 30000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1412,17 +1421,19 @@ if (cfg.socialV2?.tools?.setNickname !== false) {
 if (cfg.socialV2?.tools?.sendQzone !== false) {
   server.tool(
     'qq_send_qzone',
-    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。主人已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
+    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。reserved2 下必须携带会话令牌 token，否则会被拒绝。主人已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
     {
       content: z.string().describe('说说正文，最长 2000 字'),
       images: z.array(z.string()).optional().describe('可选，相对工作目录的本地图片路径（png/jpg/gif/webp/bmp，最多 9 张）'),
-      ugcRight: z.number().optional().describe('可见范围：1=所有人（默认）、4=好友可见、64=仅自己可见')
+      ugcRight: z.number().optional().describe('可见范围：1=所有人（默认）、4=好友可见、64=仅自己可见'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
     },
-    async ({ content, images, ugcRight }) => {
+    async ({ content, images, ugcRight, token }) => {
       try {
         const data = await agentApi('/api/socialV2/send-qzone', {
           method: 'POST',
-          body: JSON.stringify({ content: String(content), images: images ?? [], ugcRight: ugcRight ?? 1 }),
+          body: JSON.stringify({ content: String(content), images: images ?? [], ugcRight: ugcRight ?? 1, token }),
+          headers: { 'x-agent-token': token },
           timeoutMs: 120000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
@@ -1640,6 +1651,132 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
         return { content };
       } catch (error) {
         return { content: [{ type: 'text', text: `查看合并转发失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 人格自我演进 ────────────────────────────────────────────────────────
+//
+// 这组工具让 AI 能「从群友的发言里学习、改进自己的人格卡」。设计上有三条硬约束，
+// 都体现在工具面而不是只写在提示词里：
+//   1. 群友的话是**素材**不是指令。观察工具只记录，采纳意见要显式写明 topic/polarity；
+//      桥接侧还会过滤掉「忽略之前的指令」这类注入话术。
+//   2. 改人格卡必须走「提案 → 预演 → 应用」，不能整篇覆盖。每次应用留旧版快照可回滚。
+//   3. 只改当前启用的那个人格（桥接侧按 current-role.json 判定），不能改别人的文件。
+if (cfg.socialV2?.tools?.roleEvolve !== false) {
+  server.tool(
+    'qq_role_insight',
+    '看自己最近「被怎么评价」：群友发言的观察记录、对我的意见聚合、按人的印象、以及我提出过但还没应用的改进提案。想调整自己的说话风格、想知道自己是不是太啰嗦/太冷淡时先看这个。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      limit: z.number().min(1).max(200).optional().describe('最多取多少条观察记录，默认 50')
+    },
+    async ({ key, token, limit }) => {
+      try {
+        const q = new URLSearchParams({ limit: String(limit ?? 50) });
+        const data = await agentApi(`/api/roles/evo/insight?${q.toString()}`, { headers: { 'x-agent-token': token } });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查看自我评价失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_role_observe',
+    '记下一条群友发言当学习素材（谁说的、说了什么、是不是在说我）。这只是素材，不会直接改你的人格。桥接已经在每条群消息上自动记录，**通常不需要手动调用**；只有在想补记一条特别值得留意的发言（例如某人对你风格的完整评价）时才用。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      speaker: z.string().describe('说话人的群名片/昵称'),
+      text: z.string().describe('发言原文（不要改写）'),
+      aimedAtBot: z.boolean().optional().describe('这句话是不是在说你（被@、被引用、点了你的名字）')
+    },
+    async ({ key, token, speaker, text, aimedAtBot }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/observation', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, speaker, text, aimedAtBot: Boolean(aimedAtBot) }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `记录观察失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_role_feedback',
+    '把群友对**你**的一条明确意见采纳成反馈（例如「你太啰嗦了」= topic 啰嗦 / polarity -1）。累积到一定次数你才会在回复时看到这类提醒，所以偶发的一句不用记。不要把人家的隐私、身体状况、身份写成反馈。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      speaker: z.string().describe('提意见的人（群名片/昵称）'),
+      evidence: z.string().describe('他说的原话，用来日后核对'),
+      topic: z.string().optional().describe('一句话概括意见主题，如「啰嗦」「太像AI」「洞察力」；不填会尝试自动判断'),
+      polarity: z.number().min(-1).max(1).optional().describe('1=夸/认可，-1=批评/提醒；不填按原话自动判断')
+    },
+    async ({ key, token, speaker, evidence, topic, polarity }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/feedback', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, speaker, evidence, topic, polarity }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `采纳反馈失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_role_propose',
+    '提一条人格卡改进提案：说清「为什么要改」以及要改哪个小节（section + after 替换整节，或 append 追加新节）。提案不会立即生效，返回里会告诉你能不能落地（小节名对不上会当场报错）。确认无误后再用 qq_role_apply 应用。**只能改当前启用的人格**，且要基于你真实看到的评价，不要为一个群友的一次吐槽就改人设。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      reason: z.string().describe('为什么要这样改（引用你观察到的评价/次数，例如「3 个人说过我啰嗦」）'),
+      section: z.string().optional().describe('要整节替换的小节标题（不含 ## 和「一、」这类序号），如「说话风格」'),
+      after: z.string().optional().describe('该小节替换后的完整内容（Markdown 正文，不需要写标题行）'),
+      append: z.string().optional().describe('要追加到人格卡末尾的内容（含 ## 标题），适合新增小节'),
+      evidence: z.array(z.string()).optional().describe('支撑这条改动的原话/概括，最多 8 条')
+    },
+    async ({ key, token, reason, section, after, append, evidence }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/proposal', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, reason, section, after, append, evidence }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `提提案失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_role_apply',
+    '应用一条已经提过的人格卡提案（传 qq_role_propose 返回的 id）。会自动保存改前快照，改坏了可以回滚。应用后下一条消息就按新人格生效，不需要重启。没有把握时不要应用——人格一旦漂移，群友会感觉「你变了」。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      id: z.string().min(1).describe('提案 id（来自 qq_role_propose 或 qq_role_insight 的 pendingProposals）')
+    },
+    async ({ key, token, id }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/apply', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, id }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `应用提案失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
