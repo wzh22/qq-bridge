@@ -73,6 +73,21 @@ try {
   const stText = textOf(st);
   console.log(stText.split('\n').map((l) => '  | ' + l).join('\n'));
   check('状态可读', stText.length > 0);
+
+  // CDP 不可达 ⇒ 后面所有断言都必然失败，而且失败原因与代码无关（只是没开浏览器）。
+  // 把它记成 fail 会让回归长期挂一个红项，久了就没人看红项了 —— 与 test-console /
+  // test-console-ui 的口径一致：**环境缺件 = skip(exit 0)**，并在末尾显式声明"未验证"。
+  const cdpDown = /连不上浏览器调试端口|fetch failed/.test(stText);
+  if (cdpDown) {
+    console.log('\n⏭  跳过贴吧读取相关断言：CDP 调试端口 9222 没有监听。');
+    console.log('   贴吧只能用真实浏览器读（HTTP 一律 403 + 人机验证），这是环境前置条件，不是回归失败。');
+    console.log('   要跑全量：先启动 pwsh -File scripts\\start-tieba-browser.ps1，再重跑本测试。');
+    console.log(`\n总计: ${pass} 通过, ${fail} 失败（工具注册已验；读取类断言未验证）`);
+    if (stderr.trim()) console.log('\nstderr:', stderr.slice(0, 600));
+    // 顶层 try 块里不能 `return`（ESM 语义是 SyntaxError），这里手动收尾后直接退出。
+    child.kill();
+    process.exit(fail ? 1 : 0);
+  }
   check('报告端口可用', /可用/.test(stText));
 
   console.log('\n=== tieba_read_forum（孙笑川吧，3 条）===');
