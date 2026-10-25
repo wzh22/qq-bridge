@@ -12,12 +12,19 @@
 // 用法：node corpus/scripts/test-bili-dedup.mjs
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { runtimeDir, corpusFiles } from './corpus-paths.mjs';
+import { runtimeDir, COLLECT_DIR } from './corpus-paths.mjs';
 
-// 采集器（longrun.mjs）和历史 BV 集合都在运行时目录里，不在仓库：
-// 它们是「这台机器采到哪了」的状态，不是可移植的代码。
-// 所以这里的路径仍然指向 runtimeDir()，只是不再写死盘符与用户名。
+// 两类文件，位置不同，必须分清（这里踩过）：
+//   · longrun.mjs（采集器源码）——**已在版本库** corpus/collect/ 下。
+//     读它才反映"仓库里的代码长什么样"，也才能在干净 clone 里跑通。
+//   · bili-seen.json / bili-auto-*.json（运行时状态与抓回的语料）——
+//     在 state/corpus/，天然不入库，没有数据时相关断言应跳过而非失败。
 const D = runtimeDir();
+
+// 优先读仓库里的采集器；旧布局（state/corpus/longrun.mjs）作为兜底。
+const LONG_RUN = existsSync(path.join(COLLECT_DIR, 'longrun.mjs'))
+  ? path.join(COLLECT_DIR, 'longrun.mjs')
+  : path.join(D, 'longrun.mjs');
 let pass = 0;
 let fail = 0;
 function check(name, cond, detail = '') {
@@ -25,7 +32,7 @@ function check(name, cond, detail = '') {
   else { fail += 1; console.log(`  ❌ ${name}${detail ? ' — ' + detail : ''}`); }
 }
 
-const src = readFileSync(path.join(D, 'longrun.mjs'), 'utf8');
+const src = readFileSync(LONG_RUN, 'utf8');
 
 console.log('=== 1. 源码层面：去重与翻页必须真的实现，而不只是写了注释 ===');
 check('存在持久化的已抓集合 bili-seen.json', /BILI_SEEN_FILE/.test(src) && /bili-seen\.json/.test(src));
@@ -38,8 +45,18 @@ check('翻页参数真的传给了 searchVideos', /searchVideos\(kw,\s*\{\s*page
 
 console.log('\n=== 2. 已抓集合本身必须干净可用 ===');
 const seenFile = path.join(D, 'bili-seen.json');
-check('bili-seen.json 存在', existsSync(seenFile));
-if (existsSync(seenFile)) {
+// 第 2/3 组依赖"这台机器采到哪了"的运行时状态（bili-seen.json + bili-auto-*.json）。
+// 那些文件天然不入库，所以干净 clone 里必然不存在 ——
+// 此时它们不是"失败"，是"没有对象可验"。用 check() 判红会得出
+// "clone 下来就红"的仓库，而红的原因是环境缺数据，不是代码坏了。
+const hasRuntimeState = existsSync(seenFile);
+if (!hasRuntimeState) {
+  console.log(`  ⏭  跳过：没有 ${path.basename(seenFile)}（运行时状态不入库）`);
+  console.log(`     位置：${D}`);
+  console.log('     第 2、3 组需要"本机已采集过什么"的状态才能验证；干净 clone 里没有是正常的。');
+  console.log('     有语料的环境（本机采集后）会自动跑这两组。');
+} else {
+  check('bili-seen.json 存在', true);
   let seen = [];
   try { seen = JSON.parse(readFileSync(seenFile, 'utf8')); } catch (e) { check('可解析为 JSON', false, e.message); }
   check('是数组', Array.isArray(seen));
@@ -51,10 +68,14 @@ if (existsSync(seenFile)) {
 console.log('\n=== 3. 历史语料里的重复必须真的被集合覆盖 ===');
 // 这条是最关键的：集合若漏了历史 BV，采集器就会把那些视频再抓一遍。
 // 用真实语料文件反查，而不是相信集合自己说得好听。
-{
+if (!hasRuntimeState) {
+  console.log('  ⏭  跳过：无运行时状态（同上）');
+} else {
   const histBvs = new Set();
+  let corpusFileCount = 0;
   for (const f of readdirSync(D)) {
     if (!/^bili-auto-.*\.json$/.test(f)) continue;
+    corpusFileCount += 1;
     try {
       const j = JSON.parse(readFileSync(path.join(D, f), 'utf8'));
       if (Array.isArray(j)) for (const v of j) { const bv = v.bv || v.bvid; if (bv) histBvs.add(String(bv)); }

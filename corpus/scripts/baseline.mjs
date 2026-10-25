@@ -10,7 +10,7 @@
 //   node corpus/scripts/baseline.mjs
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { corpusFiles, readJson, ensureOut, OUT_DIR } from './corpus-paths.mjs';
+import { corpusFiles, readJson, ensureOut, OUT_DIR, DATA_DIR, runtimeDir } from './corpus-paths.mjs';
 
 const CJK = /[\u4e00-\u9fa5]/g;
 const cjkLen = (s) => (String(s).match(CJK) || []).length;
@@ -200,6 +200,42 @@ const report = {
 };
 
 const outFile = path.join(ensureOut(), 'baseline.json');
+
+// ── 空语料保护：绝不用全零数据覆盖一份好的基线 ──────────────────────
+//
+// 这是实测踩出来的真 bug，不是假想：
+//   把工具提交进库后，在干净 worktree（无 state/corpus、无 corpus/data）
+//   里跑了一次回归，baseline.mjs 报「语料文件 0 个」，然后**照样写盘**，
+//   把版本库里的 baseline.json 整个换成全零。
+//   于是紧随其后的 verify-numbers 崩在 `null.p50` —— 崩得莫名其妙，
+//   而真正的损坏（基线被清零）已经落盘、git status 里只是一个 M。
+//
+// 这类"沉默的清零"比报错危险得多：它看起来是成功执行（退出码 0），
+// 下一次有人跑校验时会以为"卡片数字错了"，去改卡片。
+//
+// 所以：没有任何语料输入时，只报告、不写盘，非零退出。
+// 想强制覆盖（例如确实要重建空基线）用 --allow-empty。
+const allowEmpty = process.argv.includes('--allow-empty');
+if (scanned === 0 && !allowEmpty) {
+  console.error('');
+  console.error('❌ 没有找到任何语料文件，拒绝写 baseline.json');
+  console.error('   查过的位置：');
+  console.error(`     ${DATA_DIR}   （仓库内快照，默认不入库）`);
+  console.error(`     ${runtimeDir()}   （运行时采集区）`);
+  console.error('');
+  console.error('   这么做的原因：用全零数据覆盖一份好基线，会让后续校验');
+  console.error('   以"卡片数字错了"的形式失败，掩盖真正的原因。');
+  console.error('');
+  console.error('   怎么办：');
+  console.error('     · 若在本机：确认 state/corpus 里有语料（采集或恢复）');
+  console.error('     · 若只想读基线做校验：不必跑 baseline.mjs，直接用仓库自带的那份');
+  console.error('     · 确实要生成空基线：加 --allow-empty');
+  // 退出码 2 = 「本机缺数据，跳过」，与 1（真的出错）区分开。
+  // 这个区分很重要：干净 clone 里没有原始语料是**正常状态**，
+  // 若算作失败，仓库永远是红的，红得没信息量，真问题来了也没人看。
+  process.exit(2);
+}
+
 writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8');
 
 // ── 终端可读输出 ──

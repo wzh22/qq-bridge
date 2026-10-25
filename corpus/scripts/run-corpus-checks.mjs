@@ -116,9 +116,9 @@ for (const item of SUITE) {
     const ms = Date.now() - t0;
 
     // 从被吞掉的输出里挑一行摘要，否则连「跑出了什么」都不知道。
-    let tail = code === 0 ? '通过' : `退出码 ${code}`;
+    let tail = code === 0 ? '通过' : (code === 2 ? '跳过（本机缺数据）' : `退出码 ${code}`);
     const lines = captured.split('\n').filter((l) => l.trim());
-    const hit = [...lines].reverse().find((l) => /总计|全部通过|❌ |跳过/.test(l));
+    const hit = [...lines].reverse().find((l) => /总计|全部通过|❌ |跳过|拒绝写/.test(l));
     if (hit) tail = hit.trim();
     if (code !== 0 && QUIET) {
       // 失败时补打该脚本的输出尾部，不然只剩一句"退出码 1"，没法排查
@@ -126,8 +126,12 @@ for (const item of SUITE) {
       if (head.length) tail += '\n     ' + head.join('\n     ');
     }
 
-    results.push({ ...item, code, ok: code === 0, ms, tail });
-    console.log(`${code === 0 ? '✅' : '❌'} ${item.file.padEnd(32)} ${String(ms).padStart(6)}ms  ${tail}`);
+    results.push({ ...item, code, ok: code === 0, skipped: code === 2, ms, tail });
+    // 退出码 2 = 「本机缺数据，跳过」而不是失败。
+    // 这个区分是必需的：干净 clone 里没有语料，若把跳过算失败，
+    // 仓库就永远是红的，红得没有信息量，真问题来了也没人看。
+    const mark = code === 0 ? '✅' : (code === 2 ? '⏭ ' : '❌');
+    console.log(`${mark} ${item.file.padEnd(32)} ${String(ms).padStart(6)}ms  ${tail}`);
     if (doSync && item.file === 'baseline.mjs' && code === 0) {
       console.log('');
       console.log('=== 同步卡片数字（--sync）===');
@@ -206,12 +210,22 @@ for (const item of SUITE) {
   }
 }
 
-const failed = results.filter((r) => !r.ok);
+const failed = results.filter((r) => !r.ok && !r.skipped);
+const skipped = results.filter((r) => r.skipped);
 const spawnBlocked = results.filter((r) => r.spawnFailed);
 
 console.log('');
 if (failed.length === 0) {
-  console.log(`全部通过（${results.length} 个脚本）`);
+  if (skipped.length) {
+    console.log(`通过（${results.length} 个脚本，其中 ${skipped.length} 个因本机缺数据跳过）：`);
+    for (const s of skipped) console.log(`   ⏭ ${s.file}`);
+    console.log('   跳过不等于通过 —— 这些项在本机没有验证过。');
+    if (skipped.some((s) => s.file === 'baseline.mjs')) {
+      console.log('   注意：baseline.mjs 被跳过说明没有语料，corpus/out/baseline.json 未被重算。');
+    }
+  } else {
+    console.log(`全部通过（${results.length} 个脚本）`);
+  }
   if (collecting) {
     console.log('注：采集期模式下，卡片规模数字的漂移只提示不判失败；');
     console.log('    采集结束后必须不带 --collecting 重跑，届时漂移会判失败。');

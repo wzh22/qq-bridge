@@ -133,6 +133,24 @@ console.log(`采集文件: 贴吧 ${sources.tieba.length} / B站 ${sources.bili.
 console.log(`去重后: 贴吧 ${dTieba.out.length}(去 ${dTieba.removed}) 弹幕 ${dBiliDm.out.length}(去 ${dBiliDm.removed}) 评论 ${dBiliCm.out.length}(去 ${dBiliCm.removed}) 小红书 ${dXhs.out.length}(去 ${dXhs.removed})`);
 console.log(`合计 ${all.length} 条`);
 
+// ── 空语料前置检查 ──────────────────────────────────────────────────
+//
+// 干净 clone 里实测：没有任何语料时照常往下跑，
+// 得到「弹幕 八成以上没句尾标点 前半 0.0% / 后半 0.0%」，
+// 结论是「措辞已失效，需改卡片」——**完全错误的结论**。
+// 卡片没错，只是没有数据。继续判红会让人去改一句本来就对的措辞。
+//
+// 稳定性分析的语义是"语料够不够得出结论"，没有语料时唯一正确的回答是
+// "无法判断"，不是"不通过"。用退出码 2 表示跳过。
+if (all.length === 0) {
+  console.log('');
+  console.log('⏭  跳过：没有任何语料，无法做稳定性分析');
+  console.log('   查过的位置：corpus/data/ 与 state/corpus/（默认都不入库）');
+  console.log('   这不是"卡片措辞失效"——是没有数据可判。');
+  console.log('   要在本机分析：先采集（corpus/collect/longrun.mjs）或恢复 state/corpus。');
+  process.exit(2);
+}
+
 // ── 指标定义：只挑人格卡第十节真正引用的那几项 ──
 const pct = (n, d) => (d ? (n / d) * 100 : 0);
 // 按谓词直接算占比：pctOf(数组, 谓词) -> 百分比

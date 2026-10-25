@@ -34,6 +34,7 @@ export const ROOT = path.resolve(HERE, '..', '..');
 /** 工具 / 基线 / 生成物目录。 */
 export const CORPUS_DIR = path.join(ROOT, 'corpus');
 export const SCRIPTS_DIR = path.join(CORPUS_DIR, 'scripts');
+export const COLLECT_DIR = path.join(CORPUS_DIR, 'collect');
 export const DATA_DIR = path.join(CORPUS_DIR, 'data');
 export const OUT_DIR = path.join(CORPUS_DIR, 'out');
 

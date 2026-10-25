@@ -34,6 +34,27 @@ const COLLECTING = process.argv.includes('--collecting');
 const role = readFileSync(ROLE, 'utf8');
 const base = JSON.parse(readFileSync(BASELINE, 'utf8'));
 
+// ── 基线有效性前置检查 ──────────────────────────────────────────────
+//
+// 实测踩到的现场：干净 clone 里跑过一次 baseline.mjs（当时无任何语料），
+// 它用全零覆盖了 corpus/out/baseline.json；紧接着本脚本崩在
+// `Cannot read properties of null (reading 'p50')`。
+//
+// 那个报错完全指不到问题：真正的病因是"基线被清零了"，
+// 而症状看起来像"脚本有 bug"或"卡片某处写错了"。
+// 在入口处检查规模是否为 0，一句话点明，比让它崩在半路强得多。
+if (!base || !base.scale || !(base.scale.total > 0)) {
+  console.error('');
+  console.error('❌ baseline.json 是空基线（total = 0），无法校验');
+  console.error(`   文件：${BASELINE}`);
+  console.error('');
+  console.error('   这通常意味着有人在没有语料的情况下跑过 baseline.mjs。');
+  console.error('   恢复方式：git checkout -- corpus/out/baseline.json');
+  console.error('             （或从 .roles-backup / 其它机器的 corpus/out/ 取回）');
+  console.error('   需要真实数据时：确认 state/corpus 有语料后重跑 baseline.mjs。');
+  process.exit(1);
+}
+
 let pass = 0;
 let fail = 0;
 let pending = 0;

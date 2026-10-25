@@ -71,6 +71,32 @@ stat(deduped, '去重后  ');
 
 // 对照 baseline.json 的实际值，确认口径一致
 const base = JSON.parse(readFileSync(baselinePath(), 'utf8'));
+
+// ── 前置检查：没语料 / 空基线时把话说清楚 ──────────────────────────
+//
+// 干净 clone 里跑过一次：无任何弹幕语料 + 一份被清零的 baseline，
+// 于是 `base.length.danmaku` 为 null，崩在
+// `Cannot read properties of null (reading 'n')`——
+// 报错指不到"你没有语料"这个真因，只像脚本有 bug。
+//
+// 这个脚本的用途是"用独立实现复算，核对 baseline 口径"，
+// 没有语料就无法复算；那不是失败，是**没有可核对的对象**。
+// 用退出码 2 表示"跳过"（区别于 1 = 真的不一致）。
+if (deduped.length === 0) {
+  console.log('');
+  console.log('⏭  跳过：没有可用的弹幕语料，无法独立复算');
+  console.log('   查过的位置：corpus/data/ 与 state/corpus/（默认都不入库）');
+  console.log('   这不代表 baseline 有问题，只是本机没有原始数据可供核对。');
+  process.exit(2);
+}
+if (!base || !base.length || !base.length.danmaku) {
+  console.log('');
+  console.log('❌ baseline.json 缺少弹幕统计（可能是空基线）');
+  console.log(`   文件：${baselinePath()}`);
+  console.log('   恢复：git checkout -- corpus/out/baseline.json');
+  process.exit(1);
+}
+
 console.log('');
 console.log('=== 与 baseline.json 对照 ===');
 const b = base.length.danmaku;
