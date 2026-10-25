@@ -72,7 +72,10 @@ test('pre-reply quiet checks, waiting for replies and pre-sleep observation have
 test('social autonomy and visual, forwarding, sticker and web capabilities remain described', () => {
   for (const text of [
     '【反 AI 味：拒绝有求必应】', '【保持主体性】', '【学习群友策略】',
-    '【不要当群管家/主持人】', '普通对话默认 1 条，最多 2 条', '不要用空格断句',
+    // 分条上限从「默认 1 条，最多 2 条」放宽到「常是 1~3 条」：
+    // 旧上限配合「短句之间用逗号连写」会逼模型把所有意群缝进一条消息，
+    // 实测就是每条都有好几个逗号（15 字以内真实发言 92% 无逗号）。见 2026-10-25 记录。
+    '【不要当群管家/主持人】', '普通对话常是 1~3 条', '一条里多半不该有逗号', '不要用空格断句',
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',
     'qq_collect_sticker', 'qq_sticker_note', 'qq_get_self_image',
