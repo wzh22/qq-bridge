@@ -89,7 +89,15 @@ const LOCAL_EXECUTION_TOOLS = [
 ];
 
 /** 0.2.1 起 Codex / Claude Code 改为按需安装：这组名字默认扫不到，不算拼错假名。 */
-const OPTIONAL_BUNDLE_TOOLS = new Set(['subagent_codex', 'subagent_claude_code']);
+const OPTIONAL_BUNDLE_TOOLS = new Set([
+  'subagent_codex', 'subagent_claude_code',
+  // dsh-plugin-guard（QQ 的 web profile bundle）**当前没装**，它注册的
+  // dsh_snapshot / dsh_rollback / incident_resolved 就扫不到。
+  // 但这三个名字必须留在守卫名单里：plugin-guard 会改写 package.json/lockfile
+  // 并 spawn pnpm，属于本地执行面。删掉才是真危险——哪天装上了就静默放行。
+  // 所以按「可选装包」处理，而不是当假名清掉。
+  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
+]);
 
 /**
  * 工具名 → 真实存在与否。抽取实现在 `scripts/dsh-tool-names.mjs`（唯一实现，

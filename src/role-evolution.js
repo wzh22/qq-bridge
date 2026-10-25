@@ -395,8 +395,17 @@ export function addProposal(dir, raw) {
 /** 把人格卡的历史版本存一份，供回滚。 */
 export function snapshotRole(dir, roleName, text) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(dir, ROLE_EVOLUTION_FILES.history, `${roleName}.${stamp}.md`);
-  ensureDir(path.dirname(file));
+  const base = path.join(dir, ROLE_EVOLUTION_FILES.history, `${roleName}.${stamp}`);
+  ensureDir(path.dirname(base));
+  // 同一毫秒内连写两次会撞名：第二次把第一次**覆盖**掉，于是一次「保存」静默丢失，
+  // 而历史快照的唯一用途就是「改坏了能回滚」，丢一版等于回滚点少一个且没人发现。
+  // 真实现场是应用提案后立刻再存一次，两次相隔常在同一毫秒内。
+  // 撞名时按 _2、_3 递增，保证两次调用一定落在两个文件上。
+  // 用下划线而不是连字符：listRoleHistory 按文件名字典序倒排，
+  // '_' (95) > '.' (46)，所以「后写的 _2」才会排在「先写的 .md」前面；
+  // 写成 '-2' 的话 '-' (45) < '.'，会把后存的版本排到更旧的位置。
+  let file = `${base}.md`;
+  for (let i = 2; fs.existsSync(file); i += 1) file = `${base}_${i}.md`;
   fs.writeFileSync(file, String(text ?? ''), 'utf8');
   return file;
 }

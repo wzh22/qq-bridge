@@ -295,8 +295,25 @@ function ensureDirLink(linkPath, targetDir, label) {
       return linkPath;
     }
     log(`${label} 存在但指向别处/失效，重建: ${linkPath}`);
-    // 只删链接本身：实测 rmSync(junction, recursive) 不会动目标目录里的内容。
-    fs.rmSync(linkPath, { recursive: true, force: true });
+    // 只删链接本身，**绝不递归**。
+    //
+    // 旧写法是 fs.rmSync(linkPath, { recursive: true, force: true })，注释里写着
+    // 「实测 rmSync(junction, recursive) 不会动目标目录里的内容」——这个结论是错的。
+    // 2026-10-25 实测：跑 scripts/test-setup-dsh-idempotent.mjs 时，它把 junction
+    // 指向的**仓库真实目录** plugins/qq-agent-presets 连同内容整个删空了，
+    // 于是 test-tool-restrict-guard / test-preset-local-tools / test-qq-mode-plugin
+    // 全部报 ERR_MODULE_NOT_FOUND，看起来像功能坏了，实际是测试把源码删了。
+    // unlinkSync 只摘链接、不跟随目标；junction 在某些 Node 版本上要走 rmdirSync，
+    // 所以两级兜底，都失败就 fatal 让人来看，不要退回递归删除。
+    try {
+      fs.unlinkSync(linkPath);
+    } catch {
+      try {
+        fs.rmdirSync(linkPath);
+      } catch (e) {
+        fatal(`${label} 重建失败：无法安全移除旧链接 ${linkPath}（${e.message}）。请手工删除该链接后重跑。`);
+      }
+    }
   }
 
   try {
@@ -322,7 +339,15 @@ function ensureDirLink(linkPath, targetDir, label) {
  * （qq-agent-presets/qq-tool-restrict.mjs），缺了它 preset 会整条挂载失败。
  */
 function ensureBundle(name) {
-  const repoDir = name === 'qq-agent-presets' ? BUNDLE_DIR : path.join(REPO_ROOT, 'plugins', name);
+  // 测试夹具可以指定一个「假仓库根」：把 bundle 源指向副本，避免测试创建出
+  // 指向真实源码的 junction。真实安装不设这个变量，行为完全不变。
+  // 变量值就是「仓库根」（其下有 plugins/），与 REPO_ROOT 同义。
+  const bundleSourceRoot = process.env.QQ_BRIDGE_BUNDLE_SOURCE_ROOT
+    ? path.join(process.env.QQ_BRIDGE_BUNDLE_SOURCE_ROOT, 'plugins')
+    : path.join(REPO_ROOT, 'plugins');
+  const repoDir = name === 'qq-agent-presets'
+    ? path.join(bundleSourceRoot, 'qq-agent-presets')
+    : path.join(bundleSourceRoot, name);
   const linkDir = ensureDirLink(path.join(DSH_HOME, 'plugins', name), repoDir, `bundle ${name} link`);
   ensureDirLink(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', name), linkDir, `bundle ${name} node_modules link`);
   return linkDir;

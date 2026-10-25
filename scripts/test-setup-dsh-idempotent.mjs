@@ -46,14 +46,31 @@ fs.writeFileSync(path.join(tmpHome, 'profiles', 'web', 'package.json'), JSON.str
   dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-approval-toast'] } },
 }, null, 2), 'utf8');
 
-// 用指向本仓库插件的 junction 冒充上一轮已安装的插件链接（与真实安装形态一致），
+// 用指向「本仓库插件的副本」的 junction 冒充上一轮已安装的插件链接（与真实安装形态一致），
 // 这样脚本会走「已存在且指向本仓库 → 跳过」的正常分支。
-fs.symlinkSync(path.join(ROOT, 'plugins', 'qq-mode-console'), path.join(tmpHome, 'plugins', 'qq-mode-console'), 'junction');
+//
+// 为什么是副本而不是直接指向仓库：早期版本直接 symlink 到 ROOT/plugins/<x>，
+// 结果这个测试每跑一次就把仓库里 plugins/qq-agent-presets 和 plugins/qq-mode-console
+// 的内容删空一次（两个 bundle 的 package.json / qq-tool-restrict.mjs / lib/index.js 全没了），
+// 后续 test-tool-restrict-guard、test-preset-local-tools、test-qq-mode-plugin 全部
+// ERR_MODULE_NOT_FOUND —— 看上去像功能坏了，实际是测试删了源码。仓库不是 git 垃圾场，
+// 不能让一个测试有权限动它。副本放在 tmpHome 下，删也只删副本。
+const REPO_PLUGINS_COPY = path.join(tmpHome, 'repo-plugins-copy');
+fs.cpSync(path.join(ROOT, 'plugins'), path.join(REPO_PLUGINS_COPY, 'plugins'), { recursive: true, verbatimSymlinks: true });
+fs.symlinkSync(path.join(REPO_PLUGINS_COPY, 'plugins', 'qq-mode-console'), path.join(tmpHome, 'plugins', 'qq-mode-console'), 'junction');
 
 function runSetup(label) {
   const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'setup-dsh.mjs'), 'web'], {
     // 保留最小 PATH（进程启动需要），但把 dsh CLI 排除在外 → 跳过自动 pnpm 安装那一步
-    env: { ...process.env, DSH_HOME: tmpHome, PATH: path.dirname(process.execPath) },
+    // QQ_BRIDGE_BUNDLE_SOURCE_ROOT：把 bundle 源指向副本，不再指向真实仓库。
+    // 没有这个变量时 setup-dsh 仍会用 REPO_ROOT（真实安装的正确行为），
+    // 于是测试建出来的 junction 必然指向源码，任何一个清理动作都会删到仓库。
+    env: {
+      ...process.env,
+      DSH_HOME: tmpHome,
+      PATH: path.dirname(process.execPath),
+      QQ_BRIDGE_BUNDLE_SOURCE_ROOT: REPO_PLUGINS_COPY,
+    },
     encoding: 'utf8',
     cwd: ROOT,
   });
