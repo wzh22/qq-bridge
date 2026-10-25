@@ -1,0 +1,26 @@
+# 行尾策略
+#
+# 为什么需要这个文件：`core.autocrlf=true` 会让 checkout 把 LF 转成 CRLF，
+# 而脚本自己写文件时用的是 LF。于是**内容和字节都没变**的文件，
+# git 依然报 `M` —— 实测 corpus/out/baseline.json 就是这样：
+# 内容（含 generatedAt 时间戳）完全一致，diff 却一直挂着。
+#
+# 危害不在于多一个 M，而在于它训练人忽略 diff：
+# 一个总是显示"已修改"的文件，等它真的变了的时候，没人会去看。
+# 基线文件的存在意义就是"能 diff 出数字哪天变了"，那就更不能有这个噪音。
+#
+# 约定：
+#   · 代码与 JSON 一律 LF（脚本按 LF 写、按 LF 比，跨平台一致）
+#   · Windows 批处理保留 CRLF（少数工具对它有硬要求）
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制，不做行尾转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.zip binary
+*.xlsx binary

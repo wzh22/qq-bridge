@@ -8,7 +8,7 @@
 //
 // 用法：
 //   node corpus/scripts/baseline.mjs
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { corpusFiles, readJson, ensureOut, OUT_DIR, DATA_DIR, runtimeDir } from './corpus-paths.mjs';
 
@@ -167,7 +167,8 @@ const WORDS = [
 ];
 
 const report = {
-  generatedAt: new Date().toISOString(),
+  // generatedAt 占位，构造完整个对象后再决定（见下方 settleTimestamp）。
+  generatedAt: '',
   // 语料来源快照：记录这次统计到底读了哪些文件，避免「数字变了但不知道是多了哪批语料」。
   // 之前完全没有这个字段，于是卡片的数字和语料之间的对应关系只存在于跑脚本那个人的记忆里。
   sources: { filesScanned: scanned },
@@ -200,6 +201,31 @@ const report = {
 };
 
 const outFile = path.join(ensureOut(), 'baseline.json');
+
+// ── 时间戳只在内容真的变了时才更新 ──────────────────────────────────
+//
+// 这个文件进版本库，作用是 diff 出「数字哪天变了」。
+// 但每跑一次回归都刷新 generatedAt，于是 git diff 里永远有一个
+// 只有时间变化的 M —— 看多了就会形成"这个文件老在变，不用看"的习惯，
+// 而真正数字变化的那次就藏在这个噪音里被忽略。
+// 一个永远在变的字段，等于没有这个字段。
+//
+// 所以：内容（除时间戳外）与旧文件一致 → 沿用旧时间戳；真变了才写新值。
+// 这样 diff 里出现的每一行变化都意味着"数字真的变了"。
+function settleTimestamp(obj, file) {
+  let prev = null;
+  try { prev = JSON.parse(readFileSync(file, 'utf8')); } catch { /* 首次生成 */ }
+  if (prev && prev.generatedAt) {
+    const strip = (o) => { const { generatedAt, ...rest } = o || {}; return JSON.stringify(rest); };
+    if (strip(prev) === strip(obj)) {
+      obj.generatedAt = prev.generatedAt;
+      return false; // 未变化
+    }
+  }
+  obj.generatedAt = new Date().toISOString();
+  return true;
+}
+const contentChanged = settleTimestamp(report, outFile);
 
 // ── 空语料保护：绝不用全零数据覆盖一份好的基线 ──────────────────────
 //
@@ -239,7 +265,9 @@ if (scanned === 0 && !allowEmpty) {
 writeFileSync(outFile, JSON.stringify(report, null, 2), 'utf8');
 
 // ── 终端可读输出 ──
-console.log(`语料文件 ${scanned} 个 → 输出 ${path.relative(process.cwd(), outFile)}`);
+// contentChanged 是给回归入口和人工看的一句话：
+// "内容变了" 才值得去看 diff，"没变" 就该明确说出来，避免误以为又动了数字。
+console.log(`语料文件 ${scanned} 个 → 输出 ${path.relative(process.cwd(), outFile)}${contentChanged ? '' : '（内容与上次一致，时间戳未变）'}`);
 console.log('=== 规模 ===');
 console.log(JSON.stringify(report.scale));
 console.log(`去重移除: ${JSON.stringify(dedupCounts)}`);
