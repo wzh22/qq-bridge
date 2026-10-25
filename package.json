@@ -70,6 +70,8 @@
     "test:bilibili": "node scripts/test-bilibili.mjs",
     "test:bili-subtitle-guard": "node scripts/test-bili-subtitle-guard.mjs",
     "test:bili-cookie-cwd": "node scripts/test-bili-cookie-cwd.mjs",
+    "test:role-evolution": "node scripts/test-role-evolution.mjs",
+    "test:role-evolution:e2e": "node scripts/test-role-evolution-e2e.mjs",
     "test:diary": "node scripts/test-diary.mjs && node scripts/test-diary-e2e.mjs && node scripts/test-diary-mcp.mjs"
   },
   "dependencies": {

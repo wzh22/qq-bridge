@@ -170,7 +170,12 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": false
+      "sendVoice": false,
+      "sendDocument": false,
+      "setAvatar": false,
+      "setNickname": false,
+      "sendQzone": false,
+      "roleEvolve": true
     },
     "wake": {
       "defaultMode": "diving",

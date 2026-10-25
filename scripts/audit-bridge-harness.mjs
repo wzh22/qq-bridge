@@ -20,6 +20,7 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as voiceSynthesis from '../src/voice-synthesis.js';
+import * as roleEvolution from '../src/role-evolution.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
 import * as ownerMemory from '../src/owner-memory.js';
@@ -197,6 +198,25 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 该路径在 VM 里会真正调用 selectRoleText —— 不注入就是
     // `ReferenceError: selectRoleText is not defined`（只影响测试，不影响线上）。
     ...roleCard,
+    // 人格自我演进：bridge.js 顶层 import 了这批函数（观察/反馈/提案/快照）。
+    // 与上面 roleCard / ownerMemory 同理——VM 里不注入就是
+    // `ReferenceError: loadFeedback is not defined`，而且是走到 /api/roles/evo/* 才炸，
+    // 所以只在 persona 相关用例里暴露。逐个显式绑定，避免展开时撞到通用名（如 nowIso）。
+    appendObservation: roleEvolution.appendObservation,
+    readObservations: roleEvolution.readObservations,
+    loadFeedback: roleEvolution.loadFeedback,
+    addFeedback: roleEvolution.addFeedback,
+    loadProfiles: roleEvolution.loadProfiles,
+    loadProposals: roleEvolution.loadProposals,
+    saveProposals: roleEvolution.saveProposals,
+    addProposal: roleEvolution.addProposal,
+    applyProposalToText: roleEvolution.applyProposalToText,
+    classifyFeedback: roleEvolution.classifyFeedback,
+    summarizeFeedback: roleEvolution.summarizeFeedback,
+    snapshotRole: roleEvolution.snapshotRole,
+    listRoleHistory: roleEvolution.listRoleHistory,
+    // 别名：bridge.js 里是 `nowIso as roleEvoNow`
+    roleEvoNow: roleEvolution.nowIso,
     // 主人记忆：bridge.js 顶层 import 了 owner-memory 的这批函数，但 harness 一直没注入，
     // 于是任何真正走到「消息归档」的用例都会 `ReferenceError: appendArchiveLine is not defined`。
     // 显式逐个绑定（不用展开）：避免与 context 里已有的通用名（nowIso/createId 等）撞车。
