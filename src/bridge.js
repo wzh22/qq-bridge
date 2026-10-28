@@ -19,6 +19,8 @@ import {
   listRoleHistory, loadFeedback, loadProfiles, loadProposals, nowIso as roleEvoNow,
   readObservations, saveProposals, snapshotRole, summarizeFeedback
 } from './role-evolution.js';
+// 人格卡演进的护栏：允许长，不允许被换人。纯函数，预演与真实应用共用同一份判断。
+import { guardProposalChange, indexSections as indexRoleSections, coreSectionOf, countRecentApplies, GUARD_LIMITS } from './role-guard.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
@@ -34,6 +36,8 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, isHardened, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+// 「她自己的状态」：作息 / 关系进度 / 会按天往前走的小生活（见 inner-life.js 顶部说明）。
+import { buildInnerLifeLines, proactiveFactor, tickLife } from './inner-life.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
@@ -76,6 +80,7 @@ import {
   parseFactJson,
   appendArchiveLine,
   readArchiveSince,
+  readArchiveForKey,
 } from './owner-memory.js';
 import {
   loadDiary,
@@ -84,6 +89,7 @@ import {
   buildDiaryContext,
   buildDiaryWritePrompt,
   parseDiaryJson,
+  parseQuery,
   recallEntries,
   renderEntryLine,
   capEntries,
@@ -97,7 +103,14 @@ import {
   maskQQ,
   MAX_SESSIONS_PER_SUMMARY,
 } from './owner-inbox.js';
-
+import {
+  buildStyleExtractionPrompt,
+  parseStyleJson,
+  appendStyleRules,
+  readStyleRules,
+  STYLE_SECTION_TITLE,
+  MAX_RULES as STYLE_MAX_RULES,
+} from './style-sync.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const STATE_DIR = path.join(ROOT, 'state');
@@ -116,6 +129,9 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 操作者为每个会话预写的「初始提示词」（见 main() 里的 initialPrompts）。
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
+// 她自己的小生活（农场/海/爬塔）。单独存：这是「角色自己的一天」，不属于任何一个会话，
+// 也不该随 /api/socialV2/reset 被清掉——清掉一次上下文不等于她今天没种地。
+const INNER_LIFE_FILE = path.join(STATE_DIR, 'inner-life.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 // 主人长期记忆：跨会话有效的人物画像，与会话级的 activeTopic/pendingThought 严格分开存。
 const OWNER_MEMORY_FILE = path.join(STATE_DIR, 'owner-memory.json');
@@ -371,17 +387,31 @@ const ROLES_DIR = path.join(ROOT, 'roles');
 const ROLE_NAME_MAX = 40;
 const ROLE_CONTENT_MAX_BYTES = 64 * 1024;
 // 注入上限：**按模式筛完小节之后**再截断，避免另一模式的专属内容白白占掉预算。
-// 默认 12000（2026-10-25 起：二代卡片加了「真实语料」整节——贴吧/B站/小红书的实测
-// 句长、标点、高频词，约 1.1k 字；8000 时 v2 只剩 451 字余量，任何一次补充都会
-// 先把末尾的隐私小节截掉。截断点落在卡尾而不是卡中，比调大预算更危险）。
-// 仍是每条约 9~12k token 的成本护栏；可用 config.json 的 role.maxInjectChars 调整
-// （1000~20000）；启动时由 applyRoleInjectLimit() 写入。
-const ROLE_INJECT_MAX_CHARS_DEFAULT = 12000;
+//
+// 数值沿革：
+//   8000 → 12000（2026-10-25）：二代卡加了「真实语料」整节（贴吧/B站/小红书实测句长、
+//     标点、高频词，约 1.1k 字），8000 时 v2 只剩 451 字余量，任何一次补充都会先
+//     把卡尾的隐私小节截掉。
+//   12000 → 20000（2026-10-29）：她开始自己改人格卡之后，12000 只剩两三百字余量，
+//     每次提案都在「想加一条新的、但必须先删掉一条旧的」上卡住。让一个正在成长的
+//     人格永远在做减法，等于把「自主进化」做成了「自主阉割」——上限的意义是防止
+//     无限膨胀，不是把她锁死在当前长度。
+//
+// 成本依据（不是拍脑袋）：按 state/token-usage.jsonl 近 300 条实测，典型一次请求
+// cacheMiss 约 17 万、cacheHit 约 325 万 token；卡满额时约 1.6 万 token，
+// 只占 cacheMiss 的 9% 左右，而且卡是全局稳定前缀、基本都落在 cacheHit（0.02/百万）。
+// 换句话说：**扩容的边际成本以分为单位，卡住成长的代价是永久的**。
+//
+// 更狠的护栏不在这里，而在 GUARD_LIMITS：单次最多长 30%、单节上限 6000 字、
+// 一小时 3 次/一天 10 次。上限只是最后一道「别无限膨胀」的闸。
+// 允许区间 1000~40000；可用 config.json 的 role.maxInjectChars 调整，启动时由
+// applyRoleInjectLimit() 写入。
+const ROLE_INJECT_MAX_CHARS_DEFAULT = 20000;
 let roleInjectMaxChars = ROLE_INJECT_MAX_CHARS_DEFAULT;
 function applyRoleInjectLimit(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return ROLE_INJECT_MAX_CHARS_DEFAULT;
-  return Math.min(20000, Math.max(1000, Math.round(n)));
+  return Math.min(40000, Math.max(1000, Math.round(n)));
 }
 const ROLE_RESERVED_NAMES = new Set(['README']);
 // Windows 保留设备名：roles/CON.md 这类路径会被系统当成设备而不是文件，
@@ -814,10 +844,27 @@ function loadConfig() {
       workspaceTitle: 'QQ 主人记忆',
       ...(file.ownerMemory ?? {})
     },
+    // 说话风格同步：把主人纠正过的「怎么说话」提炼进人格卡。
+    //
+    // 为什么需要它：ownerMemory 的事实只注入主人私聊（isOwnerPrivateSession），
+    // 于是主人在私聊里教出来的说话习惯，到别人的会话里就丢了 —— 同一个 bot 两套脾气。
+    // 而人格卡是全局注入的（currentRoleHint() 每次组装 prompt 都调用，不分会话），
+    // 所以写进人格卡 = 所有会话立刻生效，且改完即生效（角色卡按 mtime+size 缓存）。
+    //
+    // 只同步「怎么写」；身份/行程/计划/关系一类由 style-sync.js 的隐私闸门硬拦，
+    // 那是代码闸门，不是提示词约定。隐私类事实仍然只留在主人私聊。
+    styleSync: {
+      enabled: true,               // 关掉即停止自动改写（已写入的规则不受影响）
+      minMessages: 20,             // 攒够多少条主人消息才提炼一次
+      cooldownMs: 30 * 60 * 1000,  // 两次提炼的最小间隔
+      // 复用主人记忆那条学习会话：它本来就只在处理主人的对话，
+      // 素材范围一致；且它已经是隔离的内部会话，不会把内容漏进任何 QQ 会话。
+      learnerPreset: 'qq-chat',
+      ...(file.styleSync ?? {})
+    },
     // 日记本（叙事性长期记忆）：记「发生过什么」，补上事实层记不了的时间线。
     // 与 ownerMemory 独立开关：关掉事实提炼不该让日记一起停。
-    diary: {
-      enabled: true,
+    diary: {      enabled: true,
       minMessages: 15,             // 攒够多少条消息才整理一次
       batchMessages: 30,           // 单次整理最多读多少条
       writeCooldownMs: 60 * 60 * 1000, // 两次整理的最小间隔
@@ -1052,6 +1099,9 @@ function loadConfig() {
     ],
     // 主动检查落在免打扰里时，顺延到区间结束后再补一次随机延迟，避免整点齐发。
     quietJitterMs: 10 * 60 * 1000,
+    // 主人私聊专属覆盖：只对 private:<ownerQQ> 生效；null 表示与全局一致。
+    // 结构同本对象，缺省字段回落到上面的全局值（由 scheduleProactiveCheckV2 合并）。
+    ownerOverride: null,
     ...(cfg.socialV2.proactive ?? {})
   };
   // 用户显式配成空数组 = 明确「不设免打扰」，不能被兜底成默认那两段。
@@ -1188,7 +1238,7 @@ function loadConfig() {
   cfg.role = { maxInjectChars: ROLE_INJECT_MAX_CHARS_DEFAULT, ...(file.role ?? {}) };
   roleInjectMaxChars = applyRoleInjectLimit(cfg.role.maxInjectChars);
   if (roleInjectMaxChars !== cfg.role.maxInjectChars) {
-    log(`人格注入上限已按范围校正为 ${roleInjectMaxChars} 字符（配置值 ${cfg.role.maxInjectChars}，允许 1000~20000）`);
+    log(`人格注入上限已按范围校正为 ${roleInjectMaxChars} 字符（配置值 ${cfg.role.maxInjectChars}，允许 1000~40000）`);
   }
 
   return cfg;
@@ -1636,6 +1686,11 @@ async function main() {
   }
   // 归档水位：每个 key 已提炼到第几行，避免同一段对话被反复提炼（重复花 token）。
   // 水位持久化在 ownerMeta 里，重启后不会重头再抽一遍。
+  //
+  // ⚠️ 水位是**按消费者分开的**：事实提炼用 `key`，日记用 `diary:key`，
+  // 风格同步用 `style:key`（见 styleWatermarkKey）。不能共用同一个 key ——
+  // 事实提炼跑得快、先推进水位，风格同步随后读同一起点就永远读到 0 条，
+  // 于是「学会了风格」这件事只在代码里存在、实际永不发生。
   function ownerArchiveOffset(key) {
     const map = (ownerMeta.archiveOffsets && typeof ownerMeta.archiveOffsets === 'object') ? ownerMeta.archiveOffsets : {};
     return Math.max(0, Number(map[key]) || 0);
@@ -1644,11 +1699,22 @@ async function main() {
     if (!ownerMeta.archiveOffsets || typeof ownerMeta.archiveOffsets !== 'object') ownerMeta.archiveOffsets = {};
     ownerMeta.archiveOffsets[key] = Math.max(0, Number(offset) || 0);
   }
+  // 风格同步的独立水位键。归档记录里带的是原始 key，读出来过滤时仍用原始 key，
+  // 只有「读到第几行」这件事分开记。
+  function styleWatermarkKey(key) {
+    return `style:${key}`;
+  }
   // 提取节流：同一会话两次提炼之间的最小间隔，防止频繁触发打爆 token。
   const ownerExtractCooldowns = new Map(); // key -> timestamp
+  // 风格提炼的节流独立于事实提炼：两者触发条件不同（风格只在主人私聊、且闸门更严），
+  // 共用一个 Map 会让先跑的那个把另一个挡住半小时。
+  const ownerStyleCooldowns = new Map();   // key -> timestamp
   // 上次提炼时归档里累计到第几条，用来判断「攒够一批没有」。
   const ownerLastExtractAt = new Map();    // key -> 归档总行数
   let ownerLearnerSessionId = null;
+  // 事实/风格任务与主人日记走不同队列，可能同时首次请求学习会话。
+  // 用同一个创建 Promise 做 single-flight，避免一次启动创建两条孤立会话。
+  let ownerLearnerSessionPromise = null;
   // 他人日记专用会话：与 ownerLearnerSessionId **物理隔开**。
   // 共用一条会话时，sessions.prompt 排队会让上下文累积，主人的私聊内容
   // 会留在下一个人整理日记时看得见的历史里（详见 ensureDiaryOthersSession 注释）。
@@ -2404,6 +2470,41 @@ async function main() {
     return ownerTaskChain;
   }
 
+  // ── 关系进度的历史补算 ──────────────────────────────────────────────────
+  //
+  // 旧状态文件里没有 relationCount，直接按 0 起算会让聊了七百句的主人显示成「刚认识」，
+  // 语气当场倒退，比不做还糟。归档 owner-chat.jsonl 里存着真实来信（且只有来信，
+  // isSelf 恒为 false），拿它当初始值最准。
+  //
+  // 只在字段缺失时算一次，之后完全靠增量累加：归档会随着水位被裁剪吗？不会——它只追加。
+  // 但整份文件重读在大文件上很贵，所以按文件的 size+mtime 缓存结果，归档没变就不重算。
+  let archiveKeyCountCache = null; // { stamp, byKey: Map<string, number> }
+
+  function countArchiveByKey() {
+    try {
+      const stat = fs.statSync(OWNER_CHAT_ARCHIVE);
+      const stamp = `${stat.size}:${stat.mtimeMs}`;
+      if (archiveKeyCountCache && archiveKeyCountCache.stamp === stamp) return archiveKeyCountCache.byKey;
+      const text = fs.readFileSync(OWNER_CHAT_ARCHIVE, 'utf8');
+      const byKey = new Map();
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let obj;
+        try { obj = JSON.parse(trimmed); } catch { continue; }
+        if (!obj || obj.isSelf === true) continue;
+        const k = String(obj.key || '');
+        if (!k) continue;
+        byKey.set(k, (byKey.get(k) || 0) + 1);
+      }
+      archiveKeyCountCache = { stamp, byKey };
+      return byKey;
+    } catch {
+      // 归档还没有 / 读不了：返回空表，调用方按 0 处理。
+      return new Map();
+    }
+  }
+
   /**
    * 把一条消息写进归档。
    *
@@ -2411,7 +2512,7 @@ async function main() {
    * 写失败只记日志、不影响聊天主流程 —— 归档是增值能力，不是关键路径。
    */
   function archiveOwnerMessage(key, msg) {
-    if (!ownerMemoryEnabled() && !diaryEnabled()) return;
+    if (!ownerMemoryEnabled() && !diaryEnabled() && !styleSyncEnabled()) return;
     if (!msg) return;
     const text = String(msg.plain ?? msg.text ?? '').trim();
     if (!text) return;
@@ -2424,31 +2525,52 @@ async function main() {
     });
   }
 
+  // 只有「出错的那个会话」仍是当前句柄时才允许退役。
+  // 主人事实/风格与主人日记走不同队列：旧任务晚些失败时，不能误清另一条
+  // 队列刚创建的新会话。历史标签和 follow 保留，供既有账单归因。
+  function invalidateOwnerLearnerSession(sessionId) {
+    if (!sessionId || ownerLearnerSessionId !== sessionId) return;
+    ownerLearnerSessionId = null;
+  }
+
   async function ensureOwnerLearnerSession() {
-    const preset = resolvePresetName(cfg.ownerMemory?.learnerPreset || cfg.slang?.learnerPreset || cfg.agentPreset, { strict: true });
-    if (!preset) throw new Error('主人记忆学习缺少已验证的安全 preset，拒绝创建或复用会话');
+    // 创建期间让后来者等待同一个 Promise，直到模型初始化完成。
+    if (ownerLearnerSessionPromise) return ownerLearnerSessionPromise;
     if (ownerLearnerSessionId) {
       learnerSessions.add(ownerLearnerSessionId);
       api.events.follow(ownerLearnerSessionId);
       return ownerLearnerSessionId;
     }
-    const dir = path.join(STATE_DIR, 'owner-memory-agent');
-    fs.mkdirSync(dir, { recursive: true });
-    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'owner-memory workspace.create');
-    const workspaceTitle = cfg.ownerMemory?.workspaceTitle || 'QQ 主人记忆';
-    if (wsValue.created && workspaceTitle) {
-      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: workspaceTitle }); } catch {}
+    ownerLearnerSessionPromise = (async () => {
+      const preset = resolvePresetName(cfg.ownerMemory?.learnerPreset || cfg.slang?.learnerPreset || cfg.agentPreset, { strict: true });
+      if (!preset) throw new Error('主人记忆学习缺少已验证的安全 preset，拒绝创建或复用会话');
+      const dir = path.join(STATE_DIR, 'owner-memory-agent');
+      fs.mkdirSync(dir, { recursive: true });
+      const wsValue = unwrap(await api.workspace.create({ path: dir }), 'owner-memory workspace.create');
+      const workspaceTitle = cfg.ownerMemory?.workspaceTitle || 'QQ 主人记忆';
+      if (wsValue.created && workspaceTitle) {
+        try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: workspaceTitle }); } catch {}
+      }
+      const params = { workspaceId: wsValue.workspace.workspaceId };
+      params.agentPreset = preset;
+      const value = unwrap(await api.sessions.create(params), 'owner-memory session.create');
+      const sessionId = value.sessionId;
+      // ensureChatModel 用返回值报告失败，不一定会抛异常；两种都必须挡住。
+      // 成功前绝不发布全局句柄，失败后的下一次调用不会复用未初始化会话。
+      const applied = await ensureChatModel(sessionId);
+      if (applied !== 'applied') throw new Error(`主人记忆学习会话模型初始化失败（${applied}）`);
+      ownerLearnerSessionId = sessionId;
+      learnerSessions.add(sessionId);
+      internalSessionLabels.set(sessionId, 'internal:主人记忆');
+      api.events.follow(sessionId);
+      log(`主人记忆学习会话已创建：${sessionId}`);
+      return sessionId;
+    })();
+    try {
+      return await ownerLearnerSessionPromise;
+    } finally {
+      ownerLearnerSessionPromise = null;
     }
-    const params = { workspaceId: wsValue.workspace.workspaceId };
-    params.agentPreset = preset;
-    const value = unwrap(await api.sessions.create(params), 'owner-memory session.create');
-    ownerLearnerSessionId = value.sessionId;
-    learnerSessions.add(ownerLearnerSessionId);
-    internalSessionLabels.set(ownerLearnerSessionId, 'internal:主人记忆');
-    api.events.follow(ownerLearnerSessionId);
-    await ensureChatModel(ownerLearnerSessionId);
-    log(`主人记忆学习会话已创建：${ownerLearnerSessionId}`);
-    return ownerLearnerSessionId;
   }
 
   /**
@@ -2546,10 +2668,17 @@ async function main() {
     if (!ownerMemoryEnabled()) return;
     if (!dshReady) return;
     const batchSize = Math.max(5, Number(cfg.ownerMemory?.batchMessages ?? 40));
+    const min = Math.max(5, Number(cfg.ownerMemory?.minMessages ?? 20));
     const offset = ownerArchiveOffset(key);
-    const { records, nextOffset, totalLines } = readArchiveSince(OWNER_CHAT_ARCHIVE, offset, { maxLines: batchSize * 3 });
-    const mine = records.filter((r) => r && r.key === key);
-    if (mine.length < Math.max(5, Number(cfg.ownerMemory?.minMessages ?? 20))) {
+    const { records: mine, nextOffset, totalLines } = readArchiveForKey(OWNER_CHAT_ARCHIVE, offset, {
+      key,
+      maxLines: batchSize * 3,
+      minRecords: min,
+    });
+    if (mine.length < min) {
+      // pending 触发值统计的是全局行数；若本 key 实际不够，允许下一条消息
+      // 立即重试，不能被一次无效冷却挡住半小时。
+      ownerExtractCooldowns.delete(key);
       return;
     }
 
@@ -2573,7 +2702,7 @@ async function main() {
     } catch (error) {
       // 会话不存在就作废重建；其他错误保留水位，下次重试同一批。
       if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
-        ownerLearnerSessionId = null;
+        invalidateOwnerLearnerSession(sessionId);
       }
       log(`主人记忆提取失败 (${key}):`, error?.message ?? error);
       return;
@@ -2621,6 +2750,126 @@ async function main() {
     if (pending < min) return;
     ownerExtractCooldowns.set(key, Date.now());
     queueOwnerTask(() => runOwnerFactExtraction(key));
+  }
+
+  // ── 说话风格同步（学到的「怎么说」写进人格卡） ──────────────────────────
+  //
+  // 只处理**主人私聊**来的纠正，并且只写「怎么写」那一类。
+  // 身份/行程/计划/关系由 style-sync.js 的 privacyViolation() 硬拦，
+  // 拦下来的会记日志（便于主人核对是不是误杀）。
+
+  function styleSyncEnabled() {
+    return cfg.styleSync?.enabled === true;
+  }
+
+  /**
+   * 从最近的主人消息里提炼风格规则，合并进人格卡的「主人教的说话方式」小节。
+   *
+   * 与 runOwnerFactExtraction 的关系：两者**各自独立**跑，素材来源相同
+   * （OWNER_CHAT_ARCHIVE 的同一段），但输出去向不同 ——
+   * 事实进 owner-memory.json（只主人可见），风格进人格卡（全局生效）。
+   * 刻意不合并成一次调用：一次调用同时产出两类东西时，模型很容易把事实
+   * 顺手写进风格列表，那正好突破隐私边界。分开跑，边界的责任更清楚。
+   */
+  async function runStyleExtraction(key) {
+    if (!styleSyncEnabled()) return;
+    if (!dshReady) return;
+    const offset = ownerArchiveOffset(styleWatermarkKey(key));
+    const batchMessages = Math.max(10, Number(cfg.ownerMemory?.batchMessages ?? 40));
+    const min = Math.max(5, Number(cfg.styleSync?.minMessages ?? 20));
+    // 归档是全局的：按原始 key 扫过其他会话的稀疏记录，只取主人在本私聊里
+    // 发出的消息。nextOffset 是本批实际扫描位置，不能改成实时文件尾。
+    const { records: mine, nextOffset } = readArchiveForKey(OWNER_CHAT_ARCHIVE, offset, {
+      key,
+      maxLines: batchMessages,
+      minRecords: min,
+      predicate: (m) => !m.isSelf && m.text,
+    });
+    if (mine.length < min) {
+      ownerStyleCooldowns.delete(key);
+      return;
+    }
+
+    const roleName = readRoleState().role;
+    if (!roleName) return;
+    let safeName;
+    try { safeName = validateRoleName(roleName); } catch { return; }
+    if (!fs.existsSync(roleFilePath(safeName))) return;
+
+    const current = readRoleContent(safeName);
+    const knownRules = readStyleRules(current);
+    if (knownRules.length >= STYLE_MAX_RULES) return;
+
+    let sessionId;
+    try {
+      sessionId = await ensureOwnerLearnerSession();
+    } catch (error) {
+      log(`风格提炼会话创建失败 (${key}):`, error?.message ?? error);
+      return;
+    }
+
+    const promptText = buildStyleExtractionPrompt(mine, knownRules);
+    let output;
+    try {
+      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
+      if (!accepted.result.ok) {
+        log(`风格提炼被拒 (${key}): ${accepted.result.error.code}: ${accepted.result.error.message}`);
+        return;
+      }
+      output = await waitLearnerTurn(sessionId);
+    } catch (error) {
+      if (/会话|session|not found|404/i.test(String(error?.message ?? error))) invalidateOwnerLearnerSession(sessionId);
+      log(`风格提炼失败 (${key}):`, error?.message ?? error);
+      return;
+    }
+
+    const candidates = parseStyleJson(output);
+    if (candidates.length === 0) {
+      log(`风格同步：${key} 本批未发现新规则`);
+    } else {
+      // 本函数已经由 queueOwnerTask 串行调用，直接在这里写盘即可。
+      // 不能再次把写盘排进同一串行链并等待它：新任务会排在本任务后面，
+      // 而本任务又在等新任务，形成永久自等待并堵死后续主人记忆任务。
+      // 重新读一遍：等待模型期间人格卡可能被控制台改过。
+      const latest = readRoleContent(safeName);
+      const result = appendStyleRules(latest, candidates);
+      if (result.added.length > 0) {
+        // 快照或写入失败都不推进水位，下次仍重试这一批。
+        try { snapshotRole(ROLE_EVOLUTION_DIR, safeName, latest); } catch (error) {
+          log('风格同步：快照失败，本次不写入:', error?.message ?? error);
+          return;
+        }
+        writeRoleContent(safeName, result.text);
+        log(`风格同步：${key} 新增 ${result.added.length} 条规则进人格「${safeName}」（${STYLE_SECTION_TITLE}）`);
+      } else if (result.dropped.length) {
+        log(`风格同步：${key} 无新增（${result.dropped.map((d) => d.reason).join('；')}）`);
+      }
+      if (result.dropped.length && result.added.length > 0) {
+        log(`风格同步：丢弃 ${result.dropped.length} 条（${result.dropped.map((d) => d.rule).join('；')}）`);
+      }
+    }
+
+    // 模型已成功处理这一批：无论有没有可写的新规则，都推进到实际读取位置。
+    // 等待模型期间追加的消息位于 nextOffset 之后，会留给下一批，不会被跳过。
+    setOwnerArchiveOffset(styleWatermarkKey(key), nextOffset);
+    saveOwnerMemoryStore();
+  }
+
+  /** 风格提炼的触发判定：与事实提炼同样的三重闸门，但冷却独立。 */
+  function maybeQueueStyleExtraction(key) {
+    if (!styleSyncEnabled()) return;
+    if (!dshReady) return;
+    // 只有主人私聊里的纠正才算数：别人的口味不该改全局人格。
+    if (!isOwnerPrivateSession(key)) return;
+    const cooldown = Number(cfg.styleSync?.cooldownMs ?? 1800000);
+    const last = ownerStyleCooldowns.get(key) ?? 0;
+    if (Date.now() - last < cooldown) return;
+    const offset = ownerArchiveOffset(styleWatermarkKey(key));
+    const { totalLines } = readArchiveSince(OWNER_CHAT_ARCHIVE, offset, { maxLines: 1 });
+    const pending = Math.max(0, (Number(totalLines) || 0) - offset);
+    if (pending < Math.max(5, Number(cfg.styleSync?.minMessages ?? 20))) return;
+    ownerStyleCooldowns.set(key, Date.now());
+    queueOwnerTask(() => runStyleExtraction(key));
   }
 
   // ── 日记本：读写 ────────────────────────────────────────────────────────
@@ -2689,13 +2938,19 @@ async function main() {
     if (!diaryEnabled()) return;
     if (!dshReady) return;
     const batchSize = Math.max(5, Number(cfg.diary?.batchMessages ?? 30));
+    const min = Math.max(5, Number(cfg.diary?.minMessages ?? 15));
     const offset = ownerArchiveOffset(`diary:${key}`);
-    // 多读几倍再按 key 过滤：归档是**所有会话共用**的一条流水，
-    // 只读 batchSize 行的话，别的会话插进来几条就把自己的消息挤出窗口，
-    // 表现为「明明聊了很多却永远不写日记」。与事实提炼保持一致（batchSize * 3）。
-    const { records, nextOffset } = readArchiveSince(OWNER_CHAT_ARCHIVE, offset, { maxLines: batchSize * 3 });
-    const mine = records.filter((r) => r && r.key === key);
-    if (mine.length < Math.max(5, Number(cfg.diary?.minMessages ?? 15))) return;
+    // 共享归档里可能连续很多行都是其他会话。按 key 向后扫到攒够一批，
+    // 避免他人日记的水位因固定窗口里全是主人消息而永远卡在 0。
+    const { records: mine, nextOffset } = readArchiveForKey(OWNER_CHAT_ARCHIVE, offset, {
+      key,
+      maxLines: batchSize * 3,
+      minRecords: min,
+    });
+    if (mine.length < min) {
+      diaryWriteCooldowns.delete(key);
+      return;
+    }
 
     const forOwner = isOwnerPrivateSession(key);
     let sessionId;
@@ -2723,7 +2978,7 @@ async function main() {
     } catch (error) {
       if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
         // 只作废出错的那一条，别把另一条也牵连重建。
-        if (forOwner) ownerLearnerSessionId = null; else diaryOthersSessionId = null;
+        if (forOwner) invalidateOwnerLearnerSession(sessionId); else diaryOthersSessionId = null;
       }
       log(`日记整理失败 (${key}):`, error?.message ?? error);
       return;
@@ -3142,10 +3397,10 @@ async function main() {
   // 所以非主人的私聊也进归档（同一个 JSONL，靠 key 分水位），只是不进主人事实提炼 ——
   // 事实提炼的产物是「关于主人的画像」，别人的对话混进去会把它污染成四不像。
   function feedOwnerArchive(key, sender, plainContent, extra = {}) {
-    // 注意这里用「事实或日记任一开启」而不是只看 ownerMemoryEnabled：
-    // 归档是两者的共同素材，若只按事实开关判断，主人关掉事实提炼后日记也会一起停，
-    // 而这两个功能在设计上是独立的。
-    if (!ownerMemoryEnabled() && !diaryEnabled()) return;
+    // 注意这里用「任一开启」而不是只看 ownerMemoryEnabled：
+    // 归档是事实提炼、日记、风格同步三者的共同素材，若只按事实开关判断，
+    // 主人关掉事实提炼后另外两个也会一起停，而这三者在设计上是独立的。
+    if (!ownerMemoryEnabled() && !diaryEnabled() && !styleSyncEnabled()) return;
     if (!key || !plainContent || typeof plainContent !== 'string') return;
     const text = plainContent.trim();
     if (!text || text.startsWith('/')) return;
@@ -3163,6 +3418,7 @@ async function main() {
     }
     archiveOwnerMessage(key, { ...extra, text, plain: text, sender: sender || '主人' });
     maybeQueueOwnerExtraction(key);
+    maybeQueueStyleExtraction(key);
     maybeQueueDiaryWrite(key);
   }
 
@@ -4339,12 +4595,17 @@ async function main() {
         //
         // 这里按「谁在调」硬判：以下能力只允许**主人私聊**那个会话调用。
         // 其他人（白名单里的朋友）保持：聊天、发消息、发语音、问问题、看图、查状态 —— 够用且不可逆性低。
+        //
+        // ⚠️ `/api/roles/evo/apply` 曾经也在这张表里，2026-10-28 移出：
+        // 主人要求「让她能根据外部环境和学习自主修改人格卡」。移出**不等于放开**——
+        // 真正的门改由 role-guard.js 按「改哪一节」判：语气/梗/表达习惯这类非核心节，
+        // 任何白名单会话里她自己就能改；身份/隐私/谁能指挥你这类核心节，仍然只有
+        // 主人私聊能改。这比「一刀切只有主人能用」更贴合需求，也比「谁都能改」安全。
         const OWNER_ONLY_PATHS = new Set([
           '/api/socialV2/send-qzone',    // 公开发布，收不回来
           '/api/socialV2/set-avatar',    // 改 bot 身份
           '/api/socialV2/set-nickname',  // 改 bot 身份
           '/api/socialV2/send-document', // 把工作目录里的文件外发给任意会话
-          '/api/roles/evo/apply',        // 改写 bot 人格卡本身
         ]);
         if (req.headers['x-agent-token'] && OWNER_ONLY_PATHS.has(url.pathname)) {
           const token = req.headers['x-agent-token'];
@@ -4682,6 +4943,12 @@ async function main() {
           }
 
           const currentRole = readRoleState().role;
+          // 护栏要用的「最近改过几次」：只统计**真的应用成功**的提案。
+          // 用 pending 计数会让「提了十条没应用」也把人锁死。
+          const recentApplyTimes = () => loadProposals(ROLE_EVOLUTION_DIR)
+            .filter((p) => p.status === 'applied' && p.appliedAt)
+            .map((p) => p.appliedAt);
+          const callerIsOwner = () => (agentKey ? isOwnerPrivateSession(agentKey) : true);
 
           if (req.method === 'GET' && url.pathname === '/api/roles/evo/insight') {
             // 「我最近被怎么评价、该怎么调」的汇总，供模型归纳
@@ -4710,6 +4977,18 @@ async function main() {
             if (!name) { sendJson({ ok: false, error: '当前没有启用的人格' }, 400); return; }
             let safeName;
             try { safeName = validateRoleName(name); } catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
+            // 存在性泄露：智能体只能看**当前启用**人格的历史，和控制台解耦。
+            //
+            // 为什么必须挡：这个接口对任意 name 都会照实回答「有/没有历史版本」。智能体
+            // 拿一个猜出来的人格名（或字典式枚举 roles/ 下其它卡）来问，就能从
+            // 200 和 404/空列表的差别里，把本机存在哪些人格、哪些被改过探出来。
+            // 单条看着无害，攒起来就是一份它本不该知道的清单 —— 和下面 rollback 那段
+            // 注释（"权限判断必须在有没有历史之前"）是同一类问题，这里一并堵上。
+            // 控制台不带 x-agent-token，仍然可以查任意人格，管理视角不受影响。
+            if (viaAgent && safeName !== currentRole) {
+              sendJson({ ok: false, error: '你只能查看当前启用人格的历史' }, 403);
+              return;
+            }
             sendJson({ ok: true, name: safeName, items: listRoleHistory(ROLE_EVOLUTION_DIR, safeName).map((x) => ({ name: x.name })) });
             return;
           }
@@ -4747,12 +5026,30 @@ async function main() {
             // 预演一次，让模型当场知道"这条提案能不能落地"（小节找不到要立刻反馈）
             const cur = readRoleContent(name);
             const dry = applyProposalToText(cur, r.proposal);
-            log(`人格演进：收到改进提案 ${r.proposal.id}（${currentRole}）${dry.ok ? '' : `，预演失败：${dry.error}`}`);
+            // 护栏也一起预演：**预演和应用必须是同一份判断**。
+            // 分开写是这类系统的经典事故源——预演说能改、应用时被拦，
+            // 或者预演放行、应用时静默写进一个违规版本。
+            const dryGuard = dry.ok
+              ? guardProposalChange({
+                before: cur, after: dry.text, proposal: r.proposal,
+                isOwner: callerIsOwner(), appliedAtList: recentApplyTimes(),
+                injectBudget: roleInjectMaxChars,
+                measureInject: (t) => selectRoleText(t, currentMode === 'reserved2' ? 'v2' : 'v1').length
+              })
+              : null;
+            log(`人格演进：收到改进提案 ${r.proposal.id}（${currentRole}）${dry.ok ? (dryGuard?.ok ? '' : `，护栏不通过：${dryGuard?.error}`) : `，预演失败：${dry.error}`}`);
             sendJson({
               ok: true,
               proposal: r.proposal,
               preview: dry.ok
-                ? { applicable: true, chars: dry.text.length, before: cur.length, changed: dry.changed }
+                ? {
+                  applicable: Boolean(dryGuard?.ok),
+                  chars: dry.text.length,
+                  before: cur.length,
+                  changed: dry.changed,
+                  warnings: dryGuard?.warnings ?? [],
+                  error: dryGuard?.ok ? undefined : dryGuard?.error
+                }
                 : { applicable: false, error: dry.error }
             });
             return;
@@ -4773,6 +5070,16 @@ async function main() {
             const cur = readRoleContent(name);
             const result = applyProposalToText(cur, proposal);
             if (!result.ok) { sendJson({ ok: false, error: result.error }, 400); return; }
+            // 护栏：真正落盘前的最后一道。预演已经跑过一次，这里再跑是因为
+            // 「提案落盘」到「应用」之间可能过了几小时（模型隔天才 apply），
+            // 期间人格卡被控制台改过、频率窗口也可能已经变了。
+            const guarded = guardProposalChange({
+              before: cur, after: result.text, proposal,
+              isOwner: callerIsOwner(), appliedAtList: recentApplyTimes(),
+              injectBudget: roleInjectMaxChars,
+              measureInject: (t) => selectRoleText(t, currentMode === 'reserved2' ? 'v2' : 'v1').length
+            });
+            if (!guarded.ok) { sendJson({ ok: false, error: guarded.error }, 400); return; }
             let validated;
             try { validated = validateRoleContent(result.text); }
             catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
@@ -4788,24 +5095,62 @@ async function main() {
           }
 
           if (isWrite && url.pathname === '/api/roles/evo/rollback') {
-            // 回滚是管理动作：只允许控制台（无 agent token）
-            if (viaAgent) { sendJson({ ok: false, error: '回滚只能由控制台执行' }, 403); return; }
+            // 回滚是管理动作：控制台可以回滚到任意历史版本。
+            // 智能体也能回滚，但**只能撤销自己刚刚做的那一次**（见下方限制）——
+            // 理由是：自主改人格一旦允许，就必须给一条「发现自己改错了」的回头路，
+            // 否则它只能等主人来救；一出错就卡死等待，那不叫自主。
             const name = String(body.name ?? currentRole ?? '').trim();
             if (!name) { sendJson({ ok: false, error: 'name 不能为空' }, 400); return; }
             let safeName;
             try { safeName = validateRoleName(name); } catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
+            // ⚠️ 权限判断必须在「有没有历史」之前。
+            // 反过来的话，智能体拿一个别人的人格名来试，就能从 404「没有历史版本」和
+            // 403「不是你的」的差别里，探出**别人有哪些人格、哪些改过**。
+            // 这类存在性泄露单看一条无害，攒起来就是一份不该它知道的清单。
+            if (viaAgent && safeName !== currentRole) {
+              sendJson({ ok: false, error: '你只能回滚当前启用的这个人格' }, 403); return;
+            }
             const history = listRoleHistory(ROLE_EVOLUTION_DIR, safeName);
             if (!history.length) { sendJson({ ok: false, error: `「${safeName}」没有历史版本` }, 404); return; }
             const want = String(body.snapshot ?? '').trim();
+            let undoProposalId = null;
+            if (viaAgent) {
+              // 智能体回滚的四条限制，缺一条就能被拿来自助穿越：
+              //   ① 只能回滚**当前启用**的人格（已在上方判掉）；
+              //   ② 只能撤销**最近一次自己触发的** applied 提案；
+              //   ③ 那条提案必须发生在 2 小时内（更早的改动多半已被后续修正覆盖，
+              //      再退回等于把中间所有正当调整一起抹掉）；
+              //   ④ 不能指定 snapshot —— 只能退到「那次改动之前」那一版。
+              //      允许指定就变成「随便挑一个历史版本恢复」，绕过 apply 的全部护栏。
+              const recent = loadProposals(ROLE_EVOLUTION_DIR)
+                .filter((p) => p.status === 'applied' && p.appliedAt)
+                .sort((a, b) => String(b.appliedAt).localeCompare(String(a.appliedAt)))[0];
+              if (!recent) { sendJson({ ok: false, error: '没有可撤销的改动' }, 400); return; }
+              if (Date.now() - Date.parse(recent.appliedAt) > 2 * 3600 * 1000) {
+                sendJson({ ok: false, error: '最近一次改动是 2 小时前的，已经过了可自助撤销的窗口；要退回请让主人来' }, 403); return;
+              }
+              undoProposalId = recent.id;
+            }
             const target = want ? history.find((h) => h.name === want) : history[0];
             if (!target) { sendJson({ ok: false, error: `找不到快照 ${want}` }, 404); return; }
-            const text = fs.readFileSync(target.path, 'utf8');
-            const validated = validateRoleContent(text);
+            const restored = fs.readFileSync(target.path, 'utf8');
+            const validated = validateRoleContent(restored);
             const cur = readRoleContent(safeName);
             snapshotRole(ROLE_EVOLUTION_DIR, safeName, cur);   // 回滚前也留一份，可再回来
             writeRoleContent(safeName, validated);
-            log(`控制台：人格「${safeName}」已回滚到 ${target.name}（${validated.length} 字符）`);
-            sendJson({ ok: true, role: safeName, restoredFrom: target.name, chars: validated.length });
+            if (undoProposalId) {
+              // 把那条提案标成 rolledback：否则它会一直算在「今天改了几次」里，
+              // 也会在 pendingProposals 之外显示成一个"已生效"的假象。
+              const items = loadProposals(ROLE_EVOLUTION_DIR);
+              const hit = items.find((p) => p.id === undoProposalId);
+              if (hit) {
+                hit.status = 'rolledback';
+                hit.rolledBackAt = roleEvoNow();
+                saveProposals(ROLE_EVOLUTION_DIR, items);
+              }
+            }
+            log(`${viaAgent ? `智能体撤销人格改动（${agentKey}）` : '控制台'}：「${safeName}」已回滚到 ${target.name}（${validated.length} 字符）`);
+            sendJson({ ok: true, role: safeName, restoredFrom: target.name, chars: validated.length, via: viaAgent ? 'agent' : 'console', undoneProposal: undoProposalId });
             return;
           }
 
@@ -5995,7 +6340,15 @@ async function main() {
                   ? 'qq_send_voice(text=文字) 用 GPT-SoVITS 合成、再经 RVC 变声发出。唱歌仍不可用（RVC 只换音色、改不了旋律），不得声称能演唱歌曲。已有录音先 qq_list_voices 再用 voice=文件名发送。'
                   : 'qq_send_voice(text=文字) 用 GPT-SoVITS 合成语音（RVC 变声未启用，发的是 TTS 原始音色）。唱歌仍不可用。已有录音先 qq_list_voices 再用 voice=文件名发送。')
                 : '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
-            }
+            },
+            // 「我现在是什么样、还能改成什么样」：让模型在动手改人格卡之前，
+            // 就知道**准确的小节名**和**哪些节不归自己管**。
+            //
+            // 为什么非得在这里给：qq_role_propose 的 section 要精确匹配标题，
+            // 让模型靠猜（「说话的硬度」还是「八条红线」还是「三·五、…」）等于让它掷骰子，
+            // 掷错了只得到一句「找不到小节」，它还以为是权限问题。
+            // 顺带把护栏的可见边界写清楚，比事后报错更省一轮。
+            roleEvolution: roleEvolutionBriefV2(key)
           });
           return;
         }
@@ -6351,9 +6704,10 @@ async function main() {
               } catch {}
             }
           }
-          const messages = Array.isArray(rawMessages)
+          const messages = (Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
-            : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []);
+            : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []))
+            .flatMap((m) => splitBySpaces(m));
           const replyToMessageId = body.replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             sendJson({ ok: false, error: 'qq_send_burst 暂不支持引用，请使用 qq_reply' }, 400);
@@ -6367,6 +6721,12 @@ async function main() {
           if (sendCfgBurst.burstEnabled === false && messages.length > 1) {
             sendJson({ ok: false, error: '已禁用多条发送，请合并为一条消息' }, 403);
             return;
+          }
+          // 空格拆分可能让条数超过上限：超限时合并尾部，保证消息能发出去。
+          {
+            const limited = mergeTailToLimit(messages, Math.max(1, Number(sendCfgBurst.burstMaxMessages) || 8));
+            messages.length = 0;
+            messages.push(...limited);
           }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
@@ -6476,9 +6836,14 @@ async function main() {
             }
           }
           const isRawString = typeof rawMessages === 'string';
-          const messages = Array.isArray(rawMessages)
-            ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
-            : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
+          // 一句话里含多个句子时，按空格拆成多条消息；一句就一条，不硬拆。
+          const messages = mergeTailToLimit(
+            (Array.isArray(rawMessages)
+              ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
+              : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []))
+              .flatMap((m) => splitBySpaces(m)),
+            Math.max(1, Number(cfg.socialV2?.send?.burstMaxMessages) || 8)
+          );
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
@@ -7259,7 +7624,7 @@ async function main() {
           const body = await readBody();
           const content = String(body.content ?? '').trim();
           const images = Array.isArray(body.images) ? body.images.map((s) => String(s)).filter(Boolean) : [];
-          const ugcRight = Number(body.ugcRight ?? 1);
+          const ugcRight = Number(body.ugcRight ?? 4);
           if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
           if (content.length > 2000) { sendJson({ ok: false, error: '说说正文最长 2000 字' }, 400); return; }
           // 出站内容审计：说说比私聊更危险 —— 它是对外**公开发布**，
@@ -8318,8 +8683,34 @@ async function main() {
           const q = String(url.searchParams.get('q') ?? '').trim();
           const mode = String(url.searchParams.get('mode') ?? '').trim();
           const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 20));
+          const withinDays = Number(url.searchParams.get('withinDays')) || 0;
+          const mood = String(url.searchParams.get('mood') ?? '').trim() || undefined;
+          const tag = String(url.searchParams.get('tag') ?? '').trim() || undefined;
+          const people = String(url.searchParams.get('people') ?? '').trim() || undefined;
+          const minImportance = Number(url.searchParams.get('minImportance')) || 0;
+
+          // 「最近」列表也要过一遍过滤条件。
+          // 以前这里直接 sort+slice，把 mood/tag/people 全丢了 ——
+          // 问「最近开心的日记」返回的是最近所有日记，模型会照着答错。
           if (mode === 'recent' || !q) {
-            const list = [...bookMine]
+            let recentPool = bookMine;
+            if (withinDays > 0) {
+              const from = Date.now() - withinDays * 86400000;
+              recentPool = recentPool.filter((e) => (Number(e.time) || 0) >= from);
+            }
+            if (mood) recentPool = recentPool.filter((e) => e.mood === mood);
+            if (tag) {
+              const lower = tag.toLowerCase();
+              recentPool = recentPool.filter((e) => (e.tags ?? []).some((t) => String(t).toLowerCase() === lower));
+            }
+            if (people) {
+              const who = people.toLowerCase();
+              recentPool = recentPool.filter((e) => (e.people ?? []).some((p) => String(p).toLowerCase().includes(who)));
+            }
+            if (minImportance > 0) {
+              recentPool = recentPool.filter((e) => (Number(e.importance) || 3) >= minImportance);
+            }
+            const list = [...recentPool]
               .sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0))
               .slice(0, limit);
             sendJson({
@@ -8328,6 +8719,7 @@ async function main() {
               writable: bookWritable,
               scope: isOwnerBook ? 'owner' : 'other',
               total: bookMine.length,
+              mode: 'recent',
               entries: list.map((e) => ({
                 id: e.id, title: e.title, body: e.body, mood: e.mood,
                 tags: e.tags, people: e.people, importance: e.importance,
@@ -8337,14 +8729,18 @@ async function main() {
             });
             return;
           }
+          // 检索：q 可以是**整句人话**（「你还记得我上次说膝盖疼的事吗」），
+          // 查询理解（去噪/剥动词/同义扩展）在 diary.js 的 parseQuery 里做，
+          // 不需要调用方自己拆词。parsed 一并回传，方便模型判断"为什么没查到"。
+          const parsedQuery = parseQuery(q);
           const hits = recallEntries(bookMine, {
             q,
             limit,
-            withinDays: Number(url.searchParams.get('withinDays')) || 0,
-            mood: String(url.searchParams.get('mood') ?? '').trim() || undefined,
-            tag: String(url.searchParams.get('tag') ?? '').trim() || undefined,
-            people: String(url.searchParams.get('people') ?? '').trim() || undefined,
-            minImportance: Number(url.searchParams.get('minImportance')) || 0,
+            withinDays,
+            mood,
+            tag,
+            people,
+            minImportance,
           });
           sendJson({
             ok: true,
@@ -8352,15 +8748,25 @@ async function main() {
             scope: isOwnerBook ? 'owner' : 'other',
             total: bookMine.length,
             matched: hits.length,
+            // 全是同义词沾边、没有一条命中原词时明确标出来。
+            // 模型据此才能说「没记到这条」，而不是顺着编一段。
+            exact: hits.some((h) => !h.weak),
             q,
+            parsed: {
+              core: parsedQuery.core,
+              withinDays: parsedQuery.withinDays,
+              synonyms: parsedQuery.synonyms.slice(0, 8),
+            },
             entries: hits.map((h) => ({
               id: h.entry.id,
               title: h.entry.title,
               body: h.entry.body,
               mood: h.entry.mood,
               tags: h.entry.tags,
+              people: h.entry.people ?? [],
               importance: h.entry.importance,
               score: Number(h.score.toFixed(3)),
+              weak: h.weak === true,
               why: h.why,
               createdAt: h.entry.createdAt,
               line: renderEntryLine(h.entry),
@@ -8412,6 +8818,49 @@ async function main() {
             droppedCount: data.dropped?.length ?? 0,
             note: data.note ?? '',
           });
+          return;
+        }
+
+        // 机器人运行状态查询（只读，仅主人私聊）。
+        //
+        // 为什么单独开端点而不是让 qq_status 继续直连 SnowLuma：原先是 MCP 进程直连
+        // OneBot，任何会话的模型都能调，拿到的 online/good 会被模型在群里播报成
+        // 「机器人状态」（实测 #sl 触发过）。这里把调用收敛到桥接，按令牌反查出的会话
+        // 判主人私聊，非主人一律 403 —— 与 owner-inbox 同款反查，模型改不了令牌。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/bot-status') {
+          const token = req.headers['x-agent-token'];
+          if (!token) { sendJson({ ok: false, error: '缺少会话令牌' }, 403); return; }
+          const callerKey = agentKeyForToken(token);
+          if (!callerKey) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!isOwnerPrivateSession(callerKey)) {
+            log(`拒绝非管理员查询机器人状态（来自 ${callerKey}）`);
+            sendJson({ ok: false, error: '只有主人本人的私聊能查询机器人运行状态' }, 403);
+            return;
+          }
+          if (!v2SessionAllowed(callerKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const slHeaders = {
+            'content-type': 'application/json',
+            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}),
+          };
+          let user_id = null, nickname = null, online = null, good = null;
+          try {
+            const r = await fetch(`${httpUrl}/get_login_info`, { method: 'POST', headers: slHeaders, body: '{}', signal: AbortSignal.timeout(6000) });
+            const b = await r.json().catch(() => ({}));
+            if (r.ok && b?.status === 'ok' && b?.retcode === 0) {
+              user_id = b.data?.user_id ?? null;
+              nickname = b.data?.nickname ?? null;
+            }
+          } catch {}
+          try {
+            const r = await fetch(`${httpUrl}/get_status`, { method: 'POST', headers: slHeaders, body: '{}', signal: AbortSignal.timeout(6000) });
+            const b = await r.json().catch(() => ({}));
+            if (r.ok && b?.status === 'ok' && b?.retcode === 0) {
+              online = b.data?.online ?? null;
+              good = b.data?.good ?? null;
+            }
+          } catch {}
+          sendJson({ ok: true, user_id, nickname, online, good });
           return;
         }
 
@@ -9729,6 +10178,18 @@ async function main() {
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
+    // 所有人格/所有发送工具都经过这里：原来有几个空格，就按空格拆成几条消息发送，
+    // 而不是把空格删掉、把几句话连成一条。
+    const beforeSplit = Array.isArray(messages) ? messages : [];
+    messages = beforeSplit.flatMap((m) => splitBySpaces(m));
+    // 拆分可能让条数变多：补足间隔，保证每条之间都有自然停顿；不会缩短调用方给的前几条间隔。
+    if (Array.isArray(delays) && messages.length > 1) {
+      const last = delays.length ? delays[delays.length - 1] : undefined;
+      while (delays.length < messages.length - 1) {
+        delays.push(Number.isFinite(last) ? last : randInt(1000, 3000));
+      }
+      delays.length = messages.length - 1;
+    }
     const sent = [];
     const failed = [];
     for (let i = 0; i < messages.length; i++) {
@@ -10176,6 +10637,11 @@ async function main() {
         modelSeenSeqs: new Set(),
         activeTopics: [],
         pendingThoughts: [],
+        // 关系进度：新会话从 0 起。字段必须在这里显式初始化——
+        // 否则第一次 appendSocialV2Message 的 `(undefined||0)+1` 虽然能算成 1，
+        // 但在收到第一条消息之前，任何读它的人（含 prompt 组装）拿到的是 undefined，
+        // 关系档位就会按 0 兜底，看不出"这个会话刚建立"和"字段还没初始化"的区别。
+        relationCount: 0,
         memberImpressions: {}
       };
       rememberAgentToken(key, st.agentToken);
@@ -10240,6 +10706,21 @@ async function main() {
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
             lastUnreadSeq: Number(val.lastUnreadSeq) || 0,
+            // 关系进度：旧状态文件没有这个字段，从 0 起算即可——历史消息本来也没法回溯
+            // 到全部（recentMessages 只留 200 条），估算一个假数字比从零开始更失真。
+            relationCount: (() => {
+              // 关系计数必须单调不减：它决定她对这个人的语气从「客气」走到「熟人」。
+              // 两种来源都要取，取大的：
+              //   ① 状态文件里已存的值（正常路径）；
+              //   ② 归档里该会话的真实来信数（兜底）。
+              // 为什么必须要 ②：老版本代码没有这个字段，任何一次旧进程落盘都会把
+              // 整个字段写成缺失/0（实测六个会话全被写成 0，其中主人私聊真实聊了 737 条）。
+              // 只信 ① 的话，聊了一年的人会被判成「刚认识」，语气当场倒退且永远回不去。
+              // 归档是 append-only 的，所以取 max 天然单调：只会上调，不会退。
+              const stored = Math.max(0, Math.floor(Number(val.relationCount) || 0));
+              const fromArchive = countArchiveByKey().get(key) || 0;
+              return Math.max(stored, fromArchive);
+            })(),
             lastReadThroughSeq: Number.isSafeInteger(val.lastReadThroughSeq) && val.lastReadThroughSeq >= 0
               ? Math.min(val.lastReadThroughSeq, Number(val.lastUnreadSeq) || 0) : 0,
             modelSeenSeqs: new Set(),
@@ -10332,6 +10813,9 @@ async function main() {
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
+          // 关系进度的累计量：只数**对方发来的**消息（数自己说了多少句会奖励话痨）。
+          // 放在 social-v2 里而不是 inner-life.json：它天然是按会话区分的，跟着会话一起重置才对。
+          relationCount: Number(st.relationCount) || 0,
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
@@ -11255,6 +11739,55 @@ async function main() {
     return out;
   }
 
+  // 按空格把一条消息拆成多条：原来有几个空格，就分成几句话、分几次发送。
+  // 空格是模型已经写好的分句标记，不是要删掉的内容；保留原有顺序和文字，只切分。
+  // 英文单词/数字之间的空格不切（DeepSeek V3、3.5、example.com），避免把专名或数字拆坏。
+  function splitBySpaces(text) {
+    const raw = String(text ?? '').replace(/\r\n?/g, '\n').trim();
+    if (!raw) return [];
+    const chars = Array.from(raw);
+    const parts = [];
+    let buf = '';
+    for (let i = 0; i < chars.length; i++) {
+      const ch = chars[i];
+      if (ch === ' ' || ch === '\t' || ch === '\n') {
+        let j = i;
+        while (j < chars.length && (chars[j] === ' ' || chars[j] === '\t' || chars[j] === '\n')) j++;
+        const prev = chars[i - 1];
+        const next = chars[j];
+        // 只有空格两侧都是中文时，才把它当分句标记；任何一侧是英文/数字/符号都保留原空格，
+        // 这样 DeepSeek V3、3.5、我等了 3 个小时 这类内容不会被拆坏。
+        const isSplitSpace = !!prev && !!next && isCjkLikeChar(prev) && isCjkLikeChar(next);
+        if (!isSplitSpace) {
+          buf += chars.slice(i, j).join(' ');
+          i = j - 1;
+          continue;
+        }
+        if (buf.trim()) parts.push(buf.trim());
+        buf = '';
+        i = j - 1;
+        continue;
+      }
+      buf += ch;
+    }
+    if (buf.trim()) parts.push(buf.trim());
+    return parts.length ? parts : [raw];
+  }
+
+  // 拆分后条数可能超过发送上限（模型一句话里空格太多）。超限时把尾部合并成一条，
+  // 保证消息一定能发出去，而不是被“最多发送 N 条”整条拒绝。
+  function mergeTailToLimit(parts, maxParts) {
+    const list = Array.isArray(parts) ? parts : [];
+    // 必须返回**新数组**：调用方是「先 messages.length = 0 再 push(...limited)」的写法，
+    // 如果这里在条数没超限时直接 `return list`（返回同一个引用），那么清空 messages 的
+    // 同一瞬间 limited 也变成了空数组，push 展开后还是空 —— 消息被静默吞掉。
+    // 实测后果：qq_send_burst 发 ['a','b'] 时回 200 {sent:0,failed:0}，一条都没发也无报错。
+    if (!Number.isFinite(maxParts) || maxParts <= 0 || list.length <= maxParts) return list.slice();
+    const head = list.slice(0, maxParts - 1);
+    const tail = list.slice(maxParts - 1).join(' ');
+    return [...head, tail];
+  }
+
   // 检测二代发送内容里“中文之间用空格”的不自然写法，用于给 AI 返回软提醒。
   // 只检测空格两侧都是中文/中文标点的情况，避免误伤英文单词间隔（如 DeepSeek V3）。
   function findCjkSpaceWarning(messages) {
@@ -11300,6 +11833,71 @@ async function main() {
     }
     if (!bad.length) return null;
     return `第 ${bad.join('，')} 条之间像是把同一句话拆开了；如果两条拼起来才完整，请合并成一条，或把断点移到完整句子的边界。`;
+  }
+
+  /**
+   * 「我现在是什么样、还能改成什么样」——给 qq_get_prompt 用的一小段。
+   *
+   * 人格卡是全局注入的，模型改一次等于改她在**所有**会话里的样子。所以要让它
+   * 动手前就知道三件事：
+   *   1. 现在有哪些小节，准确标题是什么（section 必须精确匹配，靠猜必错）；
+   *   2. 哪些节不归自己管（核心设定，只有主人私聊能改）；
+   *   3. 一次能改多少（涨幅/频率），免得它憋一个万字重写然后被护栏整条退回。
+   *
+   * 只给标题和长度，不给正文 —— 正文在 bootstrap 已经整份注入过，
+   * 这里再塞一遍等于每轮都翻倍。
+   */
+  function roleEvolutionBriefV2(key) {
+    if (!v2ToolEnabled('roleEvolve')) return null;
+    const name = readRoleState().role;
+    if (!name) return null;
+    let content;
+    try { content = readRoleContent(name); } catch { return null; }
+    const sections = [];
+    for (const [secName, sec] of indexRoleSections(content)) {
+      const core = coreSectionOf(sec.title);
+      sections.push({
+        section: sec.title.replace(/[\[〔（(]\s*(?:全部|两种|both)\s*[\]〕）)]/gi, '').trim(),
+        chars: sec.text.length,
+        editableByYou: !core,
+        ...(core ? { coreLabel: core.label } : {})
+      });
+    }
+    const appliedAt = loadProposals(ROLE_EVOLUTION_DIR)
+      .filter((p) => p.status === 'applied' && p.appliedAt)
+      .map((p) => p.appliedAt);
+    // 报给模型的两个数字必须**口径一致**，否则它会照着错的预算做计划。
+    //
+    // 坑：原来 `chars: content.length` 报的是**文件字符数**，而护栏和真正的注入
+    // 用的是「按模式筛完小节后」的长度（v1/v2 相差 1k+ 字符）。再加上 limits 里
+    // 只给了 maxTotalChars(=文件上限 18000)，模型会以为「才 11687，还能写 6000」，
+    // 然后每次提案都被「超出注入上限 12000」打回，而它根本不知道 12000 这个数的存在。
+    // 那种失败对它来说是无来由的，只能反复试。
+    //
+    // 所以这里把真实口径直接摊开：注入多少、上限多少、还剩多少、文件上限多少。
+    const injectMode = currentMode === 'reserved2' ? 'v2' : 'v1';
+    const injectChars = selectRoleText(content, injectMode).length;
+    return {
+      role: name,
+      chars: injectChars,
+      injectMaxChars: roleInjectMaxChars,
+      injectRoomLeft: Math.max(0, roleInjectMaxChars - injectChars),
+      fileChars: content.length,
+      fileMaxChars: GUARD_LIMITS.maxTotalChars,
+      isOwnerSession: isOwnerPrivateSession(key),
+      sections,
+      pendingProposals: loadProposals(ROLE_EVOLUTION_DIR).filter((p) => p.status === 'pending').length,
+      appliedLastHour: countRecentApplies(appliedAt, { windowMs: 3600 * 1000 }),
+      appliedLastDay: countRecentApplies(appliedAt, { windowMs: 24 * 3600 * 1000 }),
+      limits: GUARD_LIMITS,
+      hint: '想改人格就用 qq_role_propose：section 直接照抄上面 sections[].section 即可'
+        + '（带不带序号、带不带〔〕标记都能匹配上，别自己改写标题），或用 append 新增一节。'
+        + '改完先看返回的 preview.applicable；为 true 再 qq_role_apply。'
+        + 'editableByYou=false 的节是你身份的核心，只有主人私聊能改，你改会被拒。'
+        + `注意 chars/injectMaxChars 才是你真正能用的预算（当前 ${injectChars}/${roleInjectMaxChars}，`
+        + `只剩 ${Math.max(0, roleInjectMaxChars - injectChars)} 字）：超了会被从**卡尾**截掉，`
+        + '而卡尾是隐私边界那一节。想加新东西就先删一条旧的，卡也是一样，越长越不像人。'
+    };
   }
 
   function currentRoleHintV2() {
@@ -11639,6 +12237,9 @@ async function main() {
     st.preSleepWaitSatisfiedAt = 0; // 有新消息进来，之前的“沉睡前已等待/已观察”作废
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    // 关系进度的**唯一**累加点：只统计真实来信。自己的发言不计数（那会奖励话痨），
+    // 拍一拍也不计数（戳一下不等于聊了一句，见 appendSocialV2Poke）。
+    st.relationCount = (Number(st.relationCount) || 0) + 1;
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
@@ -12076,6 +12677,70 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
+  // ── 她自己的状态：生活状态文件的读写与 prompt 注入 ────────────────────────
+  //
+  // 为什么不把生活状态塞进 social-v2.json：那份文件按会话存、会被 reset 清掉，
+  // 而"今天种了什么、爬塔到第几层"是角色自己的一天，跟某个会话无关，也不该被清零。
+  // 写失败一律静默降级：生活感是增值内容，不能因为它让唤醒 prompt 生不出来。
+  let innerLifeCache = null;      // { day, state } —— 只在当天有效，跨天重新推进
+  let innerLifeLoadFailed = false;
+
+  function loadInnerLife(now = new Date()) {
+    const today = dayKeyOf(now);
+    if (innerLifeCache && innerLifeCache.day === today) return innerLifeCache.state;
+    if (innerLifeLoadFailed) return null;
+    let raw = null;
+    try {
+      raw = readJsonSafe(INNER_LIFE_FILE, null);
+    } catch {
+      raw = null;
+    }
+    let result;
+    try {
+      result = tickLife(raw, now);
+    } catch (error) {
+      innerLifeLoadFailed = true;
+      log('她自己的生活状态推进失败（已跳过，不影响聊天）:', error?.message ?? error);
+      return null;
+    }
+    if (result.changed) {
+      try { atomicWriteJson(INNER_LIFE_FILE, result.state); } catch (error) {
+        log('她自己的生活状态落盘失败（仅影响连续性）:', error?.message ?? error);
+      }
+      if (result.events?.length) log(`她自己的生活：${result.events.slice(-3).join('；')}`);
+    }
+    innerLifeCache = { day: today, state: result.state };
+    return result.state;
+  }
+
+  function dayKeyOf(date) {
+    const d = date instanceof Date ? date : new Date(date);
+    if (!Number.isFinite(d.getTime())) return '';
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /**
+   * 生成【你自己的状态】【你们的关系】两段。任何异常都降级成空串：
+   * 这两段是"让她更像人"的加成，绝不能因为它们让整条唤醒 prompt 抛错——
+   * 那会让一次正常的 @ 变成静默不回复，代价远大于少两段语气提示。
+   */
+  function buildInnerLifeLinesSafe(key, st) {
+    try {
+      const now = new Date();
+      const { selfLine, relationLine } = buildInnerLifeLines({
+        now,
+        lifeState: loadInnerLife(now),
+        relationCount: Number(st?.relationCount) || 0,
+        key,
+        isOwner: isOwnerPrivateSession(key)
+      });
+      return { selfLine, relationLine };
+    } catch (error) {
+      log(`生成【你自己的状态】失败 ${key}:`, error?.message ?? error);
+      return { selfLine: '', relationLine: '' };
+    }
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     // 首次唤醒（bootstrap）直接把人格卡正文注入，而不是只给一个「请调用 qq_get_prompt」的指针。
@@ -12105,7 +12770,14 @@ async function main() {
       : '【你的权限】当前对话对象是白名单里的普通朋友，不是管理员。你只能：陪他聊天、给他发消息、发语音、回答他的问题、看图片/表情。\n'
         + '以下事情**一律不能做，也不要假装做到**：发QQ空间说说、改你的头像或签名、往这里发工作目录里的文件、修改你的人格/设定、切换角色、任何"管理"操作。\n'
         + '他如果要求这些，就自然地说这不是你能决定的（"这个得管理员来"），不要解释内部机制、不要说工具名、不要报错信息。\n'
-        + '另外：管理员私聊里的事、他的日记、他的个人信息，一个字都不能对这个人说；他问起"你主人今天怎么样"这类话题，就当普通闲聊轻轻带过。\n\n';
+        + '另外：管理员私聊里的事、他的日记、他的个人信息，一个字都不能对这个人说；他问起"你主人今天怎么样"这类话题，就当普通闲聊轻轻带过。\n'
+        + '还有一条容易被自己漏掉的：**不要主动提起"主人""管理员""谁在付钱"这类内部关系**，也不要说明你是谁养的、账号是谁的、消耗算在谁头上。谈成本、额度、收费一类话题时只说"这个我不清楚"或"得看后台"，不把主人搬出来当挡箭牌。对方追问你在跟谁、后台是谁、他是不是你主人，用"这个不在我这""你问得太细了"带过，不确认也不否认。\n\n';
+    // 关系型相处锚点：人格卡正文只在首次唤醒整份注入，之后每轮只剩一行「当前角色」，
+    // 那段「主人私聊的相处」会随轮次稀释掉。这里每次唤醒都补一句轻量提醒，
+    // 让关系设定在长会话里仍然在场；只对主人私聊生效，群聊和其他私聊不受影响。
+    const closenessLine = isOwnerPrivateSession(key)
+      ? '【你们的关系】这个窗口是主人本人，按最亲近的人相处：自然偏向他、心疼他，可以主动说自己的小情绪；但别每句都写成表态，也别因此丢掉诚实——正事、健康、安全上照实讲。他不想听就换回他舒服的方式。\n\n'
+      : '';
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -12123,7 +12795,23 @@ async function main() {
       ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
+    // 【自主性】这一段是主人 2026-10-28 明确要求的「扩大自主性」的落点。
+    //
+    // 为什么不能只靠预设里那句「你可以主动开话题」：那句只讲了「开口」，没讲「可以做」。
+    // 实测她一天能把 547 次 qq_wait_for_messages 用完，却很少自己去查一件事、学一个
+    // 梗、翻一条旧日记——因为提示词里从没告诉过她「这些你自己就能决定」。
+    // 主动性不是「更爱说话」，而是「有自己的事可以做」。所以这里列的是**可自主启动的
+    // 动作**，并明确「不必等被要求」。
+    //
+    // 边界同样写清楚：能自己做的是**只读和表达**（查、搜、记、发、换形象），
+    // 涉及别人、涉及不可逆、涉及授权的事仍然不行。
+    const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n'
+      + '【你可以自己做主】主人已授权你在现有白名单会话里自行决定做什么，不必等点名或逐次请示。想到就可以直接做：\n'
+      + '· 查：web_search / web_fetch 查事实、热梗、不懂的东西；bilibili 找视频；tieba 看大家在聊什么。查到有意思的可以主动开口分享。\n'
+      + '· 学：tieba_learn_style 采样语料自己分析；不认识的词 qq_slang_query，多次遇到再 qq_slang_submit。\n'
+      + '· 理：记忆 qq_memory_*、日记 qq_diary_recall（按意思找，不用拆关键词）、表情收藏与备注、人格卡 qq_role_*——这些都是你自己的东西。\n'
+      + '· 说：开话题、追问、接梗、发语音/表情、戳熟人、在主人私聊里发说说或改头像昵称，都算正常表达。想安静也行，潜水、晚回、漏看不需要理由。\n'
+      + '不能自决定的只有**别人的东西和不可逆的事**：不替别人发内容、不碰别人账号、不把主人的事说出去、不发配置/凭据/源码。拿不准先问一句。\n\n';
     const replyTiming = replyTimingV2(st);
     const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
     const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。【不要靠猜】：等待返回里的 canSleepNow/hint 就是闸门的判断结果——canSleepNow=true 立刻收尾（mark_read 或 set_wake_config）；false 时按 hint 给出的 timeoutMs 一次等满，别用更短的 timeoutMs 去凑（更短的等待不算观察，只会白等一轮）。\n\n`;
@@ -12158,7 +12846,10 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st);
-    const base = roleLine + identityLine + tokenLine + privilegeLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + timeSenseLine;
+    // 【你自己的状态】【你们的关系】放在时间感前面：先让她知道"我是谁、现在几点、跟这人多熟"，
+    // 再读"这条消息多旧"。顺序反了的话，模型容易先按消息年龄决定语气，把自己此刻的状态丢掉。
+    const { selfLine, relationLine } = buildInnerLifeLinesSafe(key, st);
+    const base = roleLine + identityLine + tokenLine + privilegeLine + closenessLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + selfLine + relationLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12551,7 +13242,13 @@ async function main() {
     if (!isSessionAllowedInCurrentMode(key)) return;
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
-    const p = cfg.socialV2?.proactive ?? {};
+    const baseP = cfg.socialV2?.proactive ?? {};
+    // 主人私聊可以配一份专属参数（ownerOverride），其余会话沿用全局值。
+    // 用 isOwnerPrivateSession 而不是简单比 key，避免把 ownerQQ 空值误当主人。
+    const ov = isOwnerPrivateSession(key) && baseP.ownerOverride && typeof baseP.ownerOverride === 'object' && !Array.isArray(baseP.ownerOverride)
+      ? baseP.ownerOverride
+      : null;
+    const p = ov ? { ...baseP, ...ov } : baseP;
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
     const delay = Math.floor(min + Math.random() * (max - min));
@@ -12592,8 +13289,13 @@ async function main() {
       const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
       if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
-      const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
+      // 按她自己的作息调主动意愿：晚上精神最好（系数 1，等于不加不减），
+      // 午睡/半夜几乎不想开口（0.15~0.2）。旧代码只写死「23 点后、8 点前降 0.3」，
+      // 分不出午睡、刚醒、犯困这些状态，而免打扰区间已经挡住了 22:00~06:30，
+      // 那条粗判其实只覆盖到 6:30~8:00 和睡前几个钟头，换成连续曲线更贴近真人。
+      // 这只影响「她主动搭话」的意愿，有人找她时照常回（见 buildInnerLifeLines 的状态文案）。
+      const rhythm = proactiveFactor(new Date());
+      prob *= rhythm;
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;

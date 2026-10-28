@@ -357,6 +357,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_self_nickname: 'setNickname',
   qq_send_qzone: 'sendQzone',
   qq_role_insight: 'roleEvolve',
+  qq_role_history: 'roleEvolve',
   qq_role_observe: 'roleEvolve',
   qq_role_feedback: 'roleEvolve',
   qq_role_propose: 'roleEvolve',
@@ -378,14 +379,20 @@ const disabledTools = [];
 
 server.tool(
   'qq_status',
-  '查询 QQ 机器人登录状态与账号信息（只读）。',
-  {},
-  async () => {
+  '查询 QQ 机器人登录状态与账号信息（只读，仅主人私聊可用）。返回账号是否在线；非主人私聊调用会被拒绝。',
+  {
+    key: z.string().describe('会话 key，格式 private:主人QQ号（只能用主人本人的私聊）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）')
+  },
+  async ({ key, token }) => {
+    // 第一道闸：非私聊直接拒绝，不发请求。服务端（bridge.js 的 /api/socialV2/bot-status）
+    // 还会按令牌反查出的会话再判一次是不是主人私聊 —— 这里只是让模型尽早拿到拒绝理由。
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return { content: [{ type: 'text', text: '拒绝：机器人状态只能在主人本人的私聊里查询。' }], isError: true };
+    }
     try {
-      const login = await onebot('get_login_info');
-      let status = {};
-      try { status = await onebot('get_status'); } catch {}
-      return { content: [{ type: 'text', text: serializeModelData({ ...login, online: status.online, good: status.good }) }] };
+      const data = await agentApi('/api/socialV2/bot-status', { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `查询失败：${error?.message ?? error}` }], isError: true };
     }
@@ -1085,11 +1092,11 @@ server.tool(
 
 server.tool(
   'qq_diary_recall',
-  '翻日记：想起更久远的事。按关键词/时间/心情/标签检索你过去写下的日记（**只能在私聊里用**）。当对方提到「以前」「上次」「之前说过」这类需要回忆的事，或你想确认某个细节时用。不带 q 时返回最近的日记。每个人只能翻到自己那本：主人翻主人的，别人翻别人的，互不可见。',
+  '翻日记：想起更久远的事。按关键词/时间/心情/标签检索你过去写下的日记（**只能在私聊里用**）。当对方提到「以前」「上次」「之前说过」这类需要回忆的事，或你想确认某个细节时用。不带 q 时返回最近的日记。q 可以直接写成**整句人话**（「他还记得我说想给他装只手吗」「聊到半夜那次」），服务端会自己抽实词、扩同义词、识别时间词，不需要你先拆成关键词。返回里每条带 id（更正时要用）、正文、日期和命中理由（why）；matched=0 就是真的没记过，如实说没记，不要编。每个人只能翻到自己那本：主人翻主人的，别人翻别人的，互不可见。',
   {
     key: z.string().describe('会话 key，格式 private:QQ号（只能翻当前这个私聊对应的日记）'),
     token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    q: z.string().optional().describe('检索关键词，如「联考」「那次聊到很晚」；留空则按时间倒序返回最近的日记'),
+    q: z.string().optional().describe('检索内容。可以整句说（「我说想抱你是什么时候」），也可以只给关键词（「联考」）；留空则按时间倒序返回最近的日记'),
     limit: z.number().min(1).max(50).optional().describe('返回条数，默认 20'),
     withinDays: z.number().min(1).optional().describe('只看最近 N 天'),
     mood: z.enum(['happy', 'calm', 'tired', 'sad', 'anxious', 'angry', 'excited']).optional().describe('按心情过滤'),
@@ -1114,6 +1121,14 @@ server.tool(
       if (people) params.set('people', people);
       if (minImportance) params.set('minImportance', String(minImportance));
       const data = await agentApi(`/api/socialV2/diary?${params.toString()}`, { headers: { 'x-agent-token': token } });
+      // 全库都翻遍了但一条原词都没命中（全是同义词沾边）时，把话说死：
+      // 模型看到「没记到」就不会顺着 weak 结果编一段"记得你说过"。
+      if (data && data.ok && q && data.exact === false) {
+        const note = data.matched
+          ? `注意：这些条目只是话题相近（同义词沾边），没有一条真正记着「${data.parsed?.core || q}」。可以据此说"没记到具体这件事"，不要把它们当成你说的那条来复述。`
+          : `日记里没有关于「${data.parsed?.core || q}」的记录。如实说没记到，不要编。`;
+        return { content: [{ type: 'text', text: `${note}\n${serializeModelData(data)}` }] };
+      }
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `翻日记失败：${error?.message ?? error}` }], isError: true };
@@ -1325,7 +1340,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人闲聊时常用表情包，自然就好；正事/严肃话题少发。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1378,7 +1393,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 if (cfg.socialV2?.tools?.sendDocument !== false) {
   server.tool(
     'qq_send_document',
-    '把工作目录里的一个文件（Word/Excel/PPT/PDF/图片/压缩包等成品）发送到指定 QQ 会话。path 是相对 qq-bridge 工作目录的路径，只能是文档类成品，不能是脚本/配置/凭据文本；文件必须已存在。适合把自己刚生成的 Word/Excel/PDF 发给用户。发送失败会返回原因，不要假装已发送。**仅管理员可用**：普通朋友的私聊里调这个会被服务端拒绝，别试。',
+    '把非敏感成品文件发送到指定 QQ 会话，例如文档、表格、PDF 或图片。仅限主人私聊使用；主人已授权自主决定发送，不必逐次确认。不得发送配置、凭据、源码、语料原文、私人聊天/日记/记忆或含他人隐私的文件。发送失败不要假装成功。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1404,7 +1419,7 @@ if (cfg.socialV2?.tools?.sendDocument !== false) {
 if (cfg.socialV2?.tools?.setAvatar !== false) {
   server.tool(
     'qq_set_self_avatar',
-    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。reserved2 下必须携带会话令牌 token，否则会被拒绝。这是会改变你对外形象的操作，改之前最好先跟对方说一声；不要频繁换。默认关闭，需操作者在控制台开启后可用。**仅管理员可用**：普通朋友要求换头像时，说明这需要管理员来做。',
+    '更换自己（机器人 QQ 号）的头像。path 是相对 qq-bridge 工作目录的图片路径（png/jpg/jpeg/gif/webp/bmp，≤10MB）。reserved2 下必须携带会话令牌 token，否则会被拒绝。主人已授权在主人私聊里自主调整，不必逐次确认；不要频繁换，不要冒充他人。普通朋友不能要求或驱动你换头像。',
     {
       path: z.string().describe('相对工作目录的图片路径，如 state/avatar/new.png；不能是绝对路径或含 ..'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1428,7 +1443,7 @@ if (cfg.socialV2?.tools?.setAvatar !== false) {
 if (cfg.socialV2?.tools?.setNickname !== false) {
   server.tool(
     'qq_set_self_nickname',
-    '修改自己（机器人 QQ 号）的昵称/个性签名。reserved2 下必须携带会话令牌 token，否则会被拒绝。默认关闭，需操作者在控制台开启。这是会改变对外身份的操作，别频繁改，也不要用它伪装成别人。**仅管理员可用**：普通朋友要求改签名时，说明这需要管理员来做。',
+    '修改自己（机器人 QQ 号）的昵称/个性签名。reserved2 下必须携带会话令牌 token，否则会被拒绝。主人已授权在主人私聊里自主调整，不必逐次确认；不要频繁改，不要伪装成别人。普通朋友不能要求或驱动你修改。',
     {
       name: z.string().max(40).describe('新的昵称/签名，最长 40 字'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
@@ -1452,18 +1467,18 @@ if (cfg.socialV2?.tools?.setNickname !== false) {
 if (cfg.socialV2?.tools?.sendQzone !== false) {
   server.tool(
     'qq_send_qzone',
-    '发一条 QQ 空间说说（对外公开发布）。content 是正文；images 可选，给相对工作目录的本地图片路径（最多 9 张）；ugcRight 是可见范围：1=所有人（默认）、4=好友、64=仅自己。reserved2 下必须携带会话令牌 token，否则会被拒绝。**仅管理员可用**：只有管理员本人的私聊能让你发说说；普通朋友提出这个要求时，直接说这得管理员来，不要尝试调用。管理员已授权你随时发、不必每次先问。但仍要注意：这是公开发布，收不回来 —— 别写本机路径、令牌、内部细节，别发会让人难堪或泄露他人隐私的内容；拿不准就发得轻一点（生活、天气、心情、日常碎念都行），或者用 ugcRight=4 只给好友看。',
+    '发一条 QQ 空间说说。仅限主人私聊使用；主人已授权自主发布轻量生活、天气、心情或日常内容，不必逐次确认。默认好友可见，不得泄露私人对话、他人隐私、本机路径、令牌或内部细节，不要刷屏或替别人代发。发送失败不要假装成功或反复重试。',
     {
       content: z.string().describe('说说正文，最长 2000 字'),
       images: z.array(z.string()).optional().describe('可选，相对工作目录的本地图片路径（png/jpg/gif/webp/bmp，最多 9 张）'),
-      ugcRight: z.number().optional().describe('可见范围：1=所有人（默认）、4=好友可见、64=仅自己可见'),
+      ugcRight: z.number().optional().describe('可见范围：4=好友可见（默认）、1=所有人（须主人另行明确同意）、64=仅自己可见'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）')
     },
     async ({ content, images, ugcRight, token }) => {
       try {
         const data = await agentApi('/api/socialV2/send-qzone', {
           method: 'POST',
-          body: JSON.stringify({ content: String(content), images: images ?? [], ugcRight: ugcRight ?? 1, token }),
+          body: JSON.stringify({ content: String(content), images: images ?? [], ugcRight: ugcRight ?? 4, token }),
           headers: { 'x-agent-token': token },
           timeoutMs: 120000
         });
@@ -1593,7 +1608,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerNote
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerRemark !== false) {
   server.tool(
     'qq_set_sticker_remark',
-    '修改 QQ 账号里收藏表情的官方备注（desc）。这是写操作，会直接影响 QQ 账号的表情备注；仅在管理员明确允许（socialV2.tools.setStickerRemark=true）时可用。一般优先用 qq_sticker_note 记录自己的理解，不要随意改官方备注。',
+    '修改 QQ 账号里收藏表情的官方备注（desc）。主人已授权自主整理自己的表情库，不必逐次确认；只修改确有意义的新备注，不要批量清空或随意改写。普通理解记录优先用 qq_sticker_note。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1697,6 +1712,28 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
 //   3. 只改当前启用的那个人格（桥接侧按 current-role.json 判定），不能改别人的文件。
 if (cfg.socialV2?.tools?.roleEvolve !== false) {
   server.tool(
+    'qq_role_history',
+    '看自己人格卡的历史版本（只读）。每次改人格卡都会留一份改前快照，这里能看到有哪些版本、'
+    + '各自是什么时候的。**看不出某版具体写了什么**——只能配合 qq_role_rollback 退回去比较。'
+    + '用途：想确认「我到底改过几次」、或者怀疑之前改坏了但已经超过 2 小时自助撤销窗口时，'
+    + '先看这里，再决定要不要请主人帮忙退回某一版。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/history', {
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查看人格历史失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
     'qq_role_insight',
     '看自己最近「被怎么评价」：群友发言的观察记录、对我的意见聚合、按人的印象、以及我提出过但还没应用的改进提案。想调整自己的说话风格、想知道自己是不是太啰嗦/太冷淡时先看这个。',
     {
@@ -1766,15 +1803,19 @@ if (cfg.socialV2?.tools?.roleEvolve !== false) {
 
   server.tool(
     'qq_role_propose',
-    '提一条人格卡改进提案：说清「为什么要改」以及要改哪个小节（section + after 替换整节，或 append 追加新节）。提案不会立即生效，返回里会告诉你能不能落地（小节名对不上会当场报错）。确认无误后再用 qq_role_apply 应用。**只能改当前启用的人格**，且要基于你真实看到的评价，不要为一个群友的一次吐槽就改人设。',
+    '提一条人格卡改进提案：说清「为什么要改」以及要改哪个小节（section + after 替换整节，或 append 追加新节）。'
+    + '提案不会立即生效，返回的 preview 会当场告诉你**能不能落地**——section 对不上、或者撞到护栏（一次改太多、频率超限、想改核心设定），preview.applicable 会是 false 并给出原因。'
+    + '为 true 再 qq_role_apply。只能改当前启用的人格。'
+    + '哪些节你能改、准确的小节名，看 qq_get_prompt 返回的 roleEvolution.sections（editableByYou）。'
+    + '基于你真实看到/学到的东西提，不要为一句话就改人设；一次只改一小块。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      reason: z.string().describe('为什么要这样改（引用你观察到的评价/次数，例如「3 个人说过我啰嗦」）'),
-      section: z.string().optional().describe('要整节替换的小节标题（不含 ## 和「一、」这类序号），如「说话风格」'),
+      reason: z.string().describe('为什么要这样改（引用你观察到的评价/次数/自己学到的现象，例如「3 个人说过我啰嗦」「贴吧语料里没人这么断句」）'),
+      section: z.string().optional().describe('要整节替换的小节标题，**必须与 qq_get_prompt 里 roleEvolution.sections[].section 完全一致**（不含序号、不含〔〕标记）'),
       after: z.string().optional().describe('该小节替换后的完整内容（Markdown 正文，不需要写标题行）'),
       append: z.string().optional().describe('要追加到人格卡末尾的内容（含 ## 标题），适合新增小节'),
-      evidence: z.array(z.string()).optional().describe('支撑这条改动的原话/概括，最多 8 条')
+      evidence: z.array(z.string()).optional().describe('支撑这条改动的原话/概括/外部依据，最多 8 条')
     },
     async ({ key, token, reason, section, after, append, evidence }) => {
       try {
@@ -1792,7 +1833,11 @@ if (cfg.socialV2?.tools?.roleEvolve !== false) {
 
   server.tool(
     'qq_role_apply',
-    '应用一条已经提过的人格卡提案（传 qq_role_propose 返回的 id）。会自动保存改前快照，改坏了可以回滚。应用后下一条消息就按新人格生效，不需要重启。没有把握时不要应用——人格一旦漂移，群友会感觉「你变了」。',
+    '应用一条已经提过的人格卡提案（传 qq_role_propose 返回的 id）。会自动保存改前快照，改坏了可以用 qq_role_rollback 撤销。'
+    + '应用后下一条消息就按新人格生效，不需要重启。'
+    + '护栏：核心设定（身份、隐私边界、谁能指挥你、主人教的说话方式、红线）只有主人私聊能改；'
+    + '一次最多长 30%，一小时最多 3 次，一天最多 10 次。被拒时会说明是哪一条。'
+    + '没有把握时不要应用——人格一旦漂移，群友会感觉「你变了」。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -1808,6 +1853,35 @@ if (cfg.socialV2?.tools?.roleEvolve !== false) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `应用提案失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  // 自助撤销：改了人格之后发现不合适（群里反应不对、自己再看一遍觉得过了），
+  // 自己退回去。没有这条，「自主改人格」就变成单向阀——只能往前漂，不能回头。
+  //
+  // 限制在服务端硬做（桥接侧），这里只负责把话说清楚：
+  // 只能撤销最近一次、2 小时内、且是自己刚做的那次改动。
+  server.tool(
+    'qq_role_rollback',
+    '撤销你刚做的一次人格卡改动（退回改动前那一版）。只在你**发现改错了**时用：'
+    + '比如改完发现群里反应不对、或者自己再看一遍觉得改过头了。'
+    + '只能撤销最近一次、2 小时内的改动；更早的要退回得让主人来。'
+    + '撤销前也会留一份快照，所以撤销本身也能再撤回来。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）')
+    },
+    async ({ key, token }) => {
+      try {
+        const data = await agentApi('/api/roles/evo/rollback', {
+          method: 'POST',
+          body: JSON.stringify({ key, token }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `撤销人格改动失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

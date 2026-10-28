@@ -530,19 +530,29 @@ try {
     await navigate('persona');
     await page.waitForFunction(() => document.querySelectorAll('#roleList .persona-item').length > 0);
     const before = await page.locator('#roleInjectMax').inputValue();
-    assert.equal(Number(before), 12000, '默认上限应为 12000');
-    await page.locator('#roleInjectMax').fill('12000');
+    // 断言**服务端口径**，而不是把某个具体数字钉死。
+    // 上限会跟着人格卡的成长需要调整（8000→12000→20000→以后可能更高），
+    // 把数字写进测试只会让每次调参都要改测试，而红的原因跟功能好坏无关。
+    // 真正该守的是：控制台显示的值 == 服务端 limits.injectMaxChars，改完能存回来。
+    const seeded = await page.evaluate(async () => {
+      const r = await fetch('/api/roles');
+      const j = await r.json();
+      return j.limits?.injectMaxChars ?? null;
+    });
+    assert.ok(Number(seeded) > 0, '服务端应给出注入上限');
+    assert.equal(Number(before), Number(seeded), '输入框初值应等于服务端上限');
+    await page.locator('#roleInjectMax').fill('16000');
     const [saved] = await Promise.all([
       page.waitForResponse(r => new URL(r.url()).pathname === '/api/roles/limit' && r.request().method() === 'POST'),
       page.locator('#roleInjectMaxSave').click(),
     ]);
     assert.equal(saved.status(), 200);
-    assert.equal((await saved.json()).maxInjectChars, 12000);
-    assert.match(await page.locator('#roleInjectMaxMsg').textContent(), /12000/);
-    // 改回默认
-    await page.locator('#roleInjectMax').fill('6000');
+    assert.equal((await saved.json()).maxInjectChars, 16000);
+    assert.match(await page.locator('#roleInjectMaxMsg').textContent(), /16000/);
+    // 改回原值
+    await page.locator('#roleInjectMax').fill(String(seeded));
     await page.locator('#roleInjectMaxSave').click();
-    await page.waitForFunction(() => document.getElementById('roleInjectMaxMsg').textContent.includes('6000'));
+    await page.waitForFunction((v) => document.getElementById('roleInjectMaxMsg').textContent.includes(v), String(seeded));
   });
 
   if (!original) await test('思考强度：档位来自 DSH、默认 max、可切换并明示全局副作用', async () => {

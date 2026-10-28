@@ -297,7 +297,10 @@ export function makeFixtureState() {
       'qq-chat-v2': '你是 QQ 群里的仿真群友。\n\n【二代仿真模式 —— 安全规则（最高优先级，不可违反）】\n1. 你没有本地工具。\n\n【二代仿真模式 —— 工具协议（最高优先级）】\n1. 文本输出不会自动发送到 QQ。',
       'qq-chat': '你是 QQ 群里的仿真群友（一代）。\n\n【一代仿真模式 —— 安全规则】\n1. 你没有本地工具。\n\n【一代仿真模式 —— 工具协议】\n1. 回复会自动转发到 QQ。',
     },
-    roleInjectMax: 12000,
+    // 与 bridge.js 的 ROLE_INJECT_MAX_CHARS_DEFAULT 保持一致。控制器 UI 测试
+    // 现在断言「输入框初值 == 服务端 limits.injectMaxChars」，不再写死数字，
+    // 所以这里改不改都不会让测试变红；保持同步只是让 fixture 不像个过期快照。
+    roleInjectMax: 20000,
     dshEffort: 'max',
     whitelist: { allow: { groups: [123456789, 100003], private: [100001] }, deny: { groups: [], private: [] }, ownerQQ: '100001' },
     sessions: [

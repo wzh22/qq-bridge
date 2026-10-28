@@ -1845,9 +1845,9 @@ button:active:not(:disabled) {
           <div class="meta" id="roleEditorMeta">当前是「新建」模式：填好名称与内容后点「新建人格」。</div>
           <div class="row">
             <label style="flex:0 0 auto">注入上限（字符）</label>
-            <input type="number" id="roleInjectMax" min="1000" max="20000" step="500" style="flex:0 1 140px">
+            <input type="number" id="roleInjectMax" min="1000" max="40000" step="500" style="flex:0 1 140px">
             <button id="roleInjectMaxSave" class="small">保存上限</button>
-            <span class="meta" id="roleInjectMaxMsg">每条约 4~6k token 的成本护栏；按模式筛完小节后才截断。</span>
+            <span class="meta" id="roleInjectMaxMsg">上限是防止无限膨胀的闸，不是目标值；卡是稳定前缀，基本都落在缓存命中区。按模式筛完小节后才截断。</span>
           </div>
           <label>人格名（中文 / 字母 / 数字 / 横线）</label>
           <input type="text" id="newRoleName" placeholder="如：猫娘">
