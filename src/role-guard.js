@@ -155,6 +155,28 @@ export function guardProposalChange({
 
   if (!next.trim()) return { ok: false, error: '改动后的人格卡是空的', warnings, core };
 
+  // ⓪ 谁能改：人格卡只认主人私聊。
+  //
+  // 2026-10-29 主人要求「不会因为其他私聊或者群聊而改变自己」。
+  //
+  // 这条为什么**也要**放在护栏里，而不是只放服务端：
+  // 护栏是纯函数，谁都能 import 来用（控制台预演、将来的批量工具、测试脚本）。
+  // 服务端那道 403 只管 HTTP，管不到"别的代码直接调护栏"这条路。
+  // 把判据收在一处、两层都过一遍，才不会出现"服务端拦了，换个入口照样能改"。
+  //
+  // 注意与下面 ② 的区别：② 管的是「改哪一节」（核心节连主人也受保护），
+  // 这里管的是「谁在改」（非主人连语气节都不许改）。两条不重叠，都要留着。
+  // 只有 isOwner 明确为 true 才放行；默认值 false 表示「不能改」，宁可多拦。
+  if (isOwner !== true) {
+    return {
+      ok: false,
+      error: '人格卡只能在主人本人的私聊里改。群聊和其他私聊里，别人对你的评价可以记进记忆、'
+        + '也可以当你当下怎么接话的依据，但不改「你是谁」——你对所有会话共用同一张卡，'
+        + '因为某个人一句话就改，改的是你对所有人的样子',
+      warnings, core
+    };
+  }
+
   // ① 内容长度：单次涨幅 + 绝对上限
   if (next.length > GUARD_LIMITS.maxTotalChars) {
     return { ok: false, error: `改后 ${next.length} 字符，超过上限 ${GUARD_LIMITS.maxTotalChars}`, warnings, core };

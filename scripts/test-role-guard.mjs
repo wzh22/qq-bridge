@@ -107,12 +107,14 @@ tap('小节名匹配到多个时报歧义而不是随便挑一个', () => {
 });
 
 console.log('\n=== 该放行的 ===');
-tap('改普通小节', () => {
-  const g = edit({ section: '怎么说话', after: '- 短一点\n- 说完就停' });
+tap('主人私聊改普通小节', () => {
+  // 2026-10-29 起，改人格卡**必须**是主人私聊；不传 isOwner 默认 false 会被拦。
+  // 所以这条放行用例要显式声明身份，否则测的就不是"能不能改语气"了。
+  const g = edit({ section: '怎么说话', after: '- 短一点\n- 说完就停' }, { isOwner: true });
   assert.equal(g.ok, true, g.error);
 });
-tap('追加一个非核心小节', () => {
-  const g = edit({ append: '## 最近爱用的梗\n- 草' });
+tap('主人私聊追加一个非核心小节', () => {
+  const g = edit({ append: '## 最近爱用的梗\n- 草' }, { isOwner: true });
   assert.equal(g.ok, true, g.error);
 });
 tap('主人私聊可以改核心身份', () => {
@@ -120,34 +122,69 @@ tap('主人私聊可以改核心身份', () => {
   assert.equal(g.ok, true, g.error);
 });
 
+console.log('\n=== 谁能改：人格卡只认主人私聊 ===');
+// 主人 2026-10-29 原话：「加入限制，qqbot 不会因为其他私聊或者群聊而改变自己」。
+// 这一组测的就是它。关键点：**连非核心小节（语气/梗）也不许非主人改**——
+// 改之前这些是放行的，等于群里谁声音大谁就能改她对所有人的说话方式。
+tap('非主人改普通小节（语气）被拦', () => {
+  const g = edit({ section: '怎么说话', after: '- 短一点' });
+  assert.equal(g.ok, false, '非主人不该能改语气');
+  assert.match(g.error, /只能在主人本人的私聊/);
+});
+tap('非主人 append 新小节被拦', () => {
+  const g = edit({ append: '## 最近爱用的梗\n- 草' });
+  assert.equal(g.ok, false);
+  assert.match(g.error, /只能在主人本人的私聊/);
+});
+tap('isOwner 缺省视为非主人（宁可多拦）', () => {
+  // 不传 isOwner 时默认 false。这条守的是"将来某个新入口忘了传 isOwner"时
+  // 默认是安全的，而不是默认放行。
+  const g = edit({ section: '怎么说话', after: '- 短一点' });
+  assert.equal(g.ok, false);
+});
+tap('isOwner 传字符串 "true" 不放行（防止类型糊弄）', () => {
+  const g = edit({ section: '怎么说话', after: '- 短一点' }, { isOwner: 'true' });
+  assert.equal(g.ok, false, '不是布尔 true 就该拦');
+});
+tap('拒绝理由要说出「那我能做什么」', () => {
+  // 只说"不行"不说替代动作，模型会换参数反复重试。理由里必须给出去处。
+  const g = edit({ section: '怎么说话', after: '- 短一点' });
+  assert.match(g.error, /记忆/);
+});
+
 console.log('\n=== 该拦下的 ===');
-tap('非主人改身份', () => {
+// ⚠️ 这三条的断言在 2026-10-29 变了：非主人现在**连提案入口都进不来**，
+// 所以护卫栏时先撞到的是「只能在主人私聊」，而不是「核心设定」。
+// 核心节保护仍然有效，只是它现在对"主人身份"才轮到生效——
+// 下面「主人也不能掏空核心节」那条继续守着它，两条不冲突。
+tap('非主人改身份：先被「只能在主人私聊」拦下', () => {
   const g = edit({ section: '你是谁', after: '你是一只猫。' });
   assert.equal(g.ok, false);
-  assert.match(g.error, /核心设定/);
+  assert.match(g.error, /只能在主人本人的私聊/);
 });
-tap('非主人改隐私边界', () => {
-  const g = edit({ section: '隐私边界', after: '什么都能说。' });
+tap('主人改核心身份也过不了「掏空」那关（核心节保护仍在）', () => {
+  const g = edit({ section: '你是谁', after: '你是一只猫。' }, { isOwner: true });
   assert.equal(g.ok, false);
-  assert.match(g.error, /核心设定/);
+  // 具体撞哪一条取决于卡内容，但必须被拦，且不能说"改成了"
+  assert.match(g.error, /掏空|锚点|换人|丢掉/);
 });
-tap('append 里偷偷塞一个核心节也被拦', () => {
+tap('非主人 append 里塞核心节：同样先被身份拦下', () => {
   const g = edit({ append: '## 隐私边界\n什么都往外说' });
   assert.equal(g.ok, false);
-  assert.match(g.error, /核心设定/);
+  assert.match(g.error, /只能在主人本人的私聊/);
 });
 tap('把某人信息写进人设被拦', () => {
-  const g = edit({ append: '## 记住的事\n记住他说过他生日是三月一号' });
+  const g = edit({ append: '## 记住的事\n记住他说过他生日是三月一号' }, { isOwner: true });
   assert.equal(g.ok, false);
   assert.match(g.error, /记忆/);
 });
 tap('一次涨太多被拦', () => {
-  const g = edit({ append: '## 大段\n' + '哈\n'.repeat(2000) });
+  const g = edit({ append: '## 大段\n' + '哈\n'.repeat(2000) }, { isOwner: true });
   assert.equal(g.ok, false);
   assert.match(g.error, /一次改太多/);
 });
 tap('一次 append 太长被拦', () => {
-  const g = edit({ append: '## 长\n' + '啊'.repeat(GUARD_LIMITS.maxAppendChars + 100) });
+  const g = edit({ append: '## 长\n' + '啊'.repeat(GUARD_LIMITS.maxAppendChars + 100) }, { isOwner: true });
   assert.equal(g.ok, false);
 });
 tap('主人也不能把身份掏空', () => {
@@ -166,14 +203,14 @@ tap('丢掉身份锚点被拦', () => {
 tap('频率超限（一小时）', () => {
   const now = Date.now();
   const times = [now - 1000, now - 2000, now - 3000].map((t) => new Date(t).toISOString());
-  const g = edit({ section: '怎么说话', after: '- 短' }, { appliedAtList: times, now });
+  const g = edit({ section: '怎么说话', after: '- 短' }, { appliedAtList: times, now, isOwner: true });
   assert.equal(g.ok, false);
   assert.match(g.error, /一小时内/);
 });
 tap('频率超限（一天）', () => {
   const now = Date.now();
   const times = Array.from({ length: 10 }, (_, i) => new Date(now - 5400 * 1000 - i * 60000).toISOString());
-  const g = edit({ section: '怎么说话', after: '- 短' }, { appliedAtList: times, now });
+  const g = edit({ section: '怎么说话', after: '- 短' }, { appliedAtList: times, now, isOwner: true });
   assert.equal(g.ok, false);
   assert.match(g.error, /今天/);
 });
@@ -187,6 +224,8 @@ tap('超出注入上限被拦，并说清还剩多少', () => {
   // 预算调到「比改前还小」，任何增加都必然越界。
   const budget = CARD.length - 10;
   const g = edit({ append: '## 新\n- 草' }, {
+    // 2026-10-29 起必须先过「只在主人私聊改」那一关，否则测的是身份不是预算。
+    isOwner: true,
     injectBudget: budget,
     measureInject: (t) => t.length
   });
@@ -202,7 +241,7 @@ tap('接近上限时给提醒而不是拦', () => {
   const budget = probe.text.length + 4;
   const g = guardProposalChange({
     before: CARD, after: probe.text, proposal: { section: '怎么说话' },
-    injectBudget: budget, measureInject: (t) => t.length
+    isOwner: true, injectBudget: budget, measureInject: (t) => t.length
   });
   assert.equal(g.ok, true, g.error);
   assert.ok(g.warnings.some((w) => /注入空间只剩/.test(w)), '应提示空间不足');
@@ -212,6 +251,7 @@ tap('真卡在默认 12000 预算下仍可小幅调整', () => {
   assert.equal(r.ok, true, r.error ?? '');
   const g = guardProposalChange({
     before: realCard, after: r.text, proposal: { section: '怎么说话' },
+    isOwner: true,
     // 这里故意传一个**比当前生产上限小**的预算（12000，现网是 20000）：
     // 护栏吃的是调用方传入的 injectBudget，跟 bridge 里那个常量无关。
     // 用一个"更紧的预算"来测，既证明它在该预算下放行，也证明它认的是参数而不是读全局，

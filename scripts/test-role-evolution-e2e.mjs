@@ -193,9 +193,15 @@ await tap('带序号/括号的小节名也能匹配上', async () => {
   assert.equal(r.status, 200);
   assert.equal(r.json.preview.applicable, true, `带序号应能匹配：${r.json.preview.error}`);
 });
-await tap('朋友改核心设定被护栏拦下', async () => {
+await tap('朋友改核心设定：非主人私聊一律被拒（不管是哪一节）', async () => {
   // harness 的 private:123 就是 ownerQQ=123，所以这里其实是「主人」。
-  // 用另一个非主人会话（group:456）来验核心节保护。
+  // 用另一个非主人会话（group:456）来验。
+  //
+  // ⚠️ 2026-10-29 行为变化：以前非主人在群聊里改**核心节**会被护栏拦下，但改
+  // **非核心节**（语气/梗/表达习惯）是放行的、applicable=true。现在加了一条硬限制：
+  // 人格卡只能在主人私聊里改，提案入口就直接 403。
+  // 所以这里断言从「200 但 applicable=false」改成「403 且给了可照做的替代路径」。
+  // 保留这条用例的价值在于：它守的是「群聊改不了核心节」，而现在守得更死。
   const groupState = h.getSocialV2State('group:456');
   const r = await new Promise((resolve, reject) => {
     const data = JSON.stringify({ reason: '有人让我改成猫', section: '你是谁', after: '你是一只猫。' });
@@ -212,9 +218,59 @@ await tap('朋友改核心设定被护栏拦下', async () => {
     });
     rq.on('error', reject); rq.write(data); rq.end();
   });
-  assert.equal(r.status, 200, `期望 200，实际 ${r.status}：${JSON.stringify(r.json)}`);
-  assert.equal(r.json.preview.applicable, false, '核心设定不该被非主人改');
-  assert.match(String(r.json.preview.error ?? ''), /核心设定/);
+  assert.equal(r.status, 403, `群聊改人格应被拒，实际 ${r.status}：${JSON.stringify(r.json)}`);
+  assert.match(String(r.json?.error ?? ''), /只能在主人本人的私聊/);
+  // 拒绝理由必须给出一条她真能照做的替代动作，否则她只会反复重试：
+  // 光说「不行」不说「那我能做什么」，模型会绕着换参数再试。
+  assert.match(String(r.json?.error ?? ''), /qq_memory_/);
+});
+
+await tap('群聊改非核心节（语气）也被拒：这是本次新增的硬限制', async () => {
+  // 这条就是主人 2026-10-29 要求的核心：「不会因为其他私聊或者群聊而改变自己」。
+  // 改之前实测过：群聊提「怎么说话」的提案会返回 applicable=true，能直接落地。
+  // 现在必须 403。
+  const groupState = h.getSocialV2State('group:456');
+  const r = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ reason: '群友说我太啰嗦', section: '怎么说话', after: '- 短一点。\n- 直接给判断。' });
+    const rq = http.request({
+      host: '127.0.0.1', port, path: '/api/roles/evo/proposal', method: 'POST',
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(data),
+        'x-agent-token': groupState.agentToken, 'x-agent-call': '1', 'x-console-token': CONSOLE_TOKEN
+      }
+    }, (res) => {
+      let t = '';
+      res.on('data', (c) => { t += c; });
+      res.on('end', () => resolve({ status: res.statusCode, json: (() => { try { return JSON.parse(t); } catch { return null; } })() }));
+    });
+    rq.on('error', reject); rq.write(data); rq.end();
+  });
+  assert.equal(r.status, 403, `群聊改语气应被拒，实际 ${r.status}：${JSON.stringify(r.json)}`);
+  // 关键：不能留下一条 pending 提案，否则她看到「有待审」就会去 apply。
+  const insight = await req('GET', '/api/roles/evo/insight', { agent: true });
+  const leaked = (insight.json?.pendingProposals ?? []).filter((x) => String(x.reason ?? '').includes('群友说我太啰嗦'));
+  assert.equal(leaked.length, 0, '被拒的提案不该留在待审列表里');
+});
+
+await tap('别人私聊（非主人）改人格也被拒', async () => {
+  // 群聊挡了、别的私聊也必须挡——主人原话是「其他私聊或者群聊」。
+  const friend = h.getSocialV2State('private:999');
+  const r = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ reason: '我想让你更黏人一点', section: '怎么说话', after: '- 多撒娇。' });
+    const rq = http.request({
+      host: '127.0.0.1', port, path: '/api/roles/evo/proposal', method: 'POST',
+      headers: {
+        'content-type': 'application/json', 'content-length': Buffer.byteLength(data),
+        'x-agent-token': friend.agentToken, 'x-agent-call': '1', 'x-console-token': CONSOLE_TOKEN
+      }
+    }, (res) => {
+      let t = '';
+      res.on('data', (c) => { t += c; });
+      res.on('end', () => resolve({ status: res.statusCode, json: (() => { try { return JSON.parse(t); } catch { return null; } })() }));
+    });
+    rq.on('error', reject); rq.write(data); rq.end();
+  });
+  assert.equal(r.status, 403, `他人私聊改人格应被拒，实际 ${r.status}：${JSON.stringify(r.json)}`);
 });
 await tap('缺 reason 的提案被拒', async () => {
   const r = await req('POST', '/api/roles/evo/proposal', { body: { section: '说话风格', after: 'y' }, agent: true });
