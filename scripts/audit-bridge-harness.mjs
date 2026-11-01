@@ -23,9 +23,16 @@ import * as voiceSynthesis from '../src/voice-synthesis.js';
 import * as roleEvolution from '../src/role-evolution.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
+import * as roleGuard from '../src/role-guard.js';
 import * as ownerMemory from '../src/owner-memory.js';
+import * as memoryDecay from '../src/memory-decay.js';
+import * as diaryCore from '../src/diary-core.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as quietHours from '../src/quiet-hours.js';
+// 「她自己的状态」：bridge.js 顶层 import 了 buildInnerLifeLines / proactiveFactor / tickLife，
+// VM 里没有 import 机制，不注入的话任何走到 buildWakePromptV2 或 scheduleProactiveCheckV2
+// 的用例都会 ReferenceError（表现为「唤醒 prompt 生不出来」这类假失败）。
+import * as innerLife from '../src/inner-life.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -217,6 +224,16 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     listRoleHistory: roleEvolution.listRoleHistory,
     // 别名：bridge.js 里是 `nowIso as roleEvoNow`
     roleEvoNow: roleEvolution.nowIso,
+    // 人格演进护栏：bridge.js 顶层也 import 了这批（预演与真实应用共用同一份判断）。
+    // 不注入的话，任何走 /api/roles/evo/proposal 或 /apply 的用例都会
+    // `ReferenceError: guardProposalChange is not defined` —— 表现是 500，
+    // 而测试只断言 200，于是失败信息看起来像「路由坏了」，实际是 VM 少注入了名字。
+    guardProposalChange: roleGuard.guardProposalChange,
+    indexRoleSections: roleGuard.indexSections,
+    indexSections: roleGuard.indexSections,
+    coreSectionOf: roleGuard.coreSectionOf,
+    countRecentApplies: roleGuard.countRecentApplies,
+    GUARD_LIMITS: roleGuard.GUARD_LIMITS,
     // 主人记忆：bridge.js 顶层 import 了 owner-memory 的这批函数，但 harness 一直没注入，
     // 于是任何真正走到「消息归档」的用例都会 `ReferenceError: appendArchiveLine is not defined`。
     // 显式逐个绑定（不用展开）：避免与 context 里已有的通用名（nowIso/createId 等）撞车。
@@ -228,6 +245,33 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     parseFactJson: ownerMemory.parseFactJson,
     appendArchiveLine: ownerMemory.appendArchiveLine,
     readArchiveSince: ownerMemory.readArchiveSince,
+    // 记忆衰减：bridge.js 顶层 import 了这几个（日记的「想起/活跃日」计分要用），
+    // 而且**模块顶层**就要用到 `saveDecayState`（DECAY_SAVE_REGISTRY 的默认注入）。
+    // 不注入的话整个 VM 在求值阶段就 ReferenceError，表现为全部用例一起红，
+    // 错误信息只指向那行赋值，看着完全不像「测试 harness 少注入了一个名字」。
+    // 逐个显式绑定，不用展开：retention / memoryScore 这类通用名容易撞车。
+    DECAY_DEFAULTS: memoryDecay.DECAY_DEFAULTS,
+    loadDecayState: memoryDecay.loadDecayState,
+    saveDecayState: memoryDecay.saveDecayState,
+    markActiveDay: memoryDecay.markActiveDay,
+    touchEntries: memoryDecay.touchEntries,
+    pruneDecayState: memoryDecay.pruneDecayState,
+    // 日记核层（不该遗忘的那一类）：bridge.js 顶层 import 了这批。
+    // 不注入的话构建唤醒 prompt 时会 ReferenceError（coreBlockFor → renderCoreContext），
+    // 而**错误被 prompt 组装路径吞掉**，表现出来完全不像「少注入一个名字」：
+    // test-reply-wait 的两个用例变成「arrived 应为 false 却是 true」
+    // 和「newMessages 里多了一条旧消息」——看起来像等待逻辑坏了，实际是注入块没生成。
+    // 这正是本文件反复记录过的同一类坑，不要再踩。
+    loadDiaryCore: diaryCore.loadCore,
+    appendDiaryCore: diaryCore.appendCore,
+    writeDiaryCore: diaryCore.writeCore,
+    renderCoreContext: diaryCore.renderCoreContext,
+    buildCoreExtractPrompt: diaryCore.buildCoreExtractPrompt,
+    parseCoreJson: diaryCore.parseCoreJson,
+    mergeCoreEntries: diaryCore.mergeCoreEntries,
+    closeCorePromise: diaryCore.closePromise,
+    CORE_INJECT_MAX_CHARS: diaryCore.CORE_INJECT_MAX_CHARS,
+    CORE_KINDS: diaryCore.CORE_KINDS,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     // 免打扰时段：bridge.js 顶层 import 了这几个纯函数（主动冒泡排期要用），
     // VM 里没有 import 机制，必须显式注入，否则走到 scheduleProactiveCheckV2 就 ReferenceError。
@@ -236,6 +280,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     normalizeQuietRanges: quietHours.normalizeQuietRanges,
     parseClockMinutes: quietHours.parseClockMinutes,
     formatClockMinutes: quietHours.formatClockMinutes,
+    // 同上：作息/关系/生活这几段在唤醒 prompt 里，主动机会排期还要用 proactiveFactor。
+    buildInnerLifeLines: innerLife.buildInnerLifeLines,
+    proactiveFactor: innerLife.proactiveFactor,
+    tickLife: innerLife.tickLife,
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,
     planNormalization: mediaNormalize.planNormalization,

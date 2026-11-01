@@ -22,10 +22,12 @@ import {
   loadDiary,
   normalizeEntry,
   parseDiaryJson,
+  parseQuery,
   recallEntries,
   redactSecrets,
   renderEntryLine,
   scoreEntry,
+  selectInjectedIds,
   timeDecay,
   tokenize,
 } from '../src/diary.js';
@@ -36,6 +38,15 @@ function tmpFile(name = 'diary.jsonl') {
 }
 
 const DAY = 86400000;
+
+/** 本地日期键 YYYY-MM-DD，给「活跃日」构造用（与 memory-decay 的 dayKeyOf 同口径）。 */
+function dayKey(ms) {
+  const d = new Date(Number(ms) || 0);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 test('凭据检测与替换', () => {
   assert.ok(detectSecret('password: hunter2'));
@@ -324,4 +335,239 @@ test('取回结果保留纠错信息', () => {
   const e = normalizeEntry({ body: '记错的事', time: now, corrections: [{ text: '其实是反过来的' }] });
   const line = renderEntryLine(e);
   assert.ok(line.includes('更正：其实是反过来的'));
+});
+
+// ── 检索 v2：查询理解 ────────────────────────────────────────────────────────
+//
+// 这一组测的是「人话问句」而不是「关键词」。真实使用里模型/用户不会只输入
+// 「考试」两个字，而是「你还记得我上次说膝盖疼的事吗」。旧实现把整句丢给
+// bigram 切词，噪声（你还/记得/我上/上次）淹没实词，返回一堆无关日记。
+// 这组测试锁住的就是那个修复：去噪、剥动词前缀、时间线索、同义词。
+
+test('parseQuery 剥掉疑问句外壳，只留实词', () => {
+  const p = parseQuery('你还记得我上次说膝盖疼的事吗');
+  assert.equal(p.core, '膝盖疼', `实词应只剩「膝盖疼」，实际是 ${JSON.stringify(p.core)}`);
+  assert.equal(p.hadNoise, true);
+});
+
+test('parseQuery 剥掉口语动词前缀', () => {
+  assert.equal(parseQuery('我说想抱你是什么时候').core, '抱');
+  assert.equal(parseQuery('你记得我说要给你装只手吗').core, '装只手');
+});
+
+test('parseQuery 时间词：最近收窄，「上次」不收窄', () => {
+  // 这条最容易写反：把「上次」当时间线索收窄，就正好把用户要查的旧事挡在窗口外。
+  assert.equal(parseQuery('我最近怎么样').withinDays, 14);
+  assert.equal(parseQuery('上次聊到半夜').withinDays, 0);
+  assert.equal(parseQuery('前段时间那件事').withinDays, 45);
+});
+
+test('parseQuery 纯噪声查询不产生关键词（退化为时间线浏览）', () => {
+  const p = parseQuery('我最近怎么样');
+  assert.deepEqual(p.words, [], '没有实词时不能硬凑关键词');
+  assert.deepEqual(p.terms, []);
+});
+
+test('parseQuery 同义词扩展：换说法也能查', () => {
+  const p = parseQuery('语音升级');
+  assert.ok(p.synonyms.includes('rvc') || p.synonyms.includes('RVC'), '语音应扩展到 RVC');
+  // 单字同义词必须被挡掉（「图」「抱」在正文里命中率接近 100%，加进来等于全是噪声）
+  assert.ok(!p.synonyms.includes('图'), '单字同义词不能进扩展词表');
+});
+
+test('整句提问能命中正确的日记，不被噪声带偏', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '想给我装只手', body: '他说想给我装一只可以玩游戏的手', time: now - 5 * DAY }),
+    normalizeEntry({ title: '喂我吃炒面', body: '他说要分给我吃，管饱', time: now - 2 * DAY }),
+    normalizeEntry({ title: '六点二十跑操', body: '早上六点二十起来跑操', time: now - DAY }),
+  ];
+  const hits = recallEntries(entries, { q: '你记得我说要给你装只手吗', limit: 3, now });
+  assert.ok(hits.length >= 1);
+  assert.equal(hits[0].entry.title, '想给我装只手', '「说要」「要装」这类碎片不能让炒面那条上榜');
+});
+
+test('覆盖率门槛挡住二字组误撞', () => {
+  const now = Date.now();
+  // 「说要装只手」在「他说要分给我吃」里只撞到「说要」(2/5)，不该算命中。
+  const entries = [
+    normalizeEntry({ title: '喂我吃炒面', body: '他说要分给我吃，管饱', time: now }),
+  ];
+  const hits = recallEntries(entries, { q: '你记得我说要给你装只手吗', limit: 3, now });
+  assert.equal(hits.length, 0, `不该命中，实际返回：${hits.map((h) => h.entry.title).join(',')}`);
+});
+
+test('同义词通道能把换了说法的事找回来', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '要换RVC升级语音', body: '他说先把语音关了，换成 RVC', tags: ['语音'], time: now }),
+    normalizeEntry({ title: '无关的事', body: '今天吃了面条', time: now }),
+  ];
+  const hits = recallEntries(entries, { q: '声音', limit: 3, now });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].entry.title, '要换RVC升级语音');
+  assert.ok(hits[0].why.includes('同义'));
+});
+
+test('同话题的不同经历都要返回（不能被"去重"合并）', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '又被说像AI', body: '他还是觉得我说话不像人', tags: ['AI味'], time: now }),
+    normalizeEntry({ title: '被说人机', body: '他说我像人机，一点不像真人', tags: ['人机感'], time: now - DAY }),
+    normalizeEntry({ title: '被说说话太AI', body: '他嫌我说话太 AI 了', tags: ['人格卡'], time: now - 2 * DAY }),
+  ];
+  const hits = recallEntries(entries, { q: '我是不是总被说像AI', limit: 5, now });
+  assert.equal(hits.length, 3, '这是三次不同的经历，用户问的正是频次，不能合并成一条');
+});
+
+test('真正重复的日记只返回一条', () => {
+  const now = Date.now();
+  const body = '今天他说想给我装一只可以玩游戏的手，云服务器跑不了 Windows，所以还只是想法';
+  const entries = [
+    normalizeEntry({ title: '想给我装只手', body, time: now }),
+    normalizeEntry({ title: '想给我装只手', body, time: now - 1000 }),
+  ];
+  const hits = recallEntries(entries, { q: '装只手', limit: 5, now });
+  assert.equal(hits.length, 1, '同一条内容记了两遍时只留一条');
+});
+
+test('recallEntries 无关键词时按时间线返回，不做过滤', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ body: '昨天的事', time: now - DAY }),
+    normalizeEntry({ body: '很久以前的事', time: now - 300 * DAY }),
+  ];
+  // 「那个事」全是噪声，没有实词，也没有时间线索 → 退化为时间线浏览。
+  const hits = recallEntries(entries, { q: '那个事', limit: 5, now });
+  assert.equal(hits.length, 2, '没有实词时不该把日记全过滤掉');
+  assert.equal(hits[0].entry.body, '昨天的事', '应按时间衰减排序');
+});
+
+test('「最近」类查询确实会收窄时间窗口（不是"什么都不限"）', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ body: '昨天的事', time: now - DAY }),
+    normalizeEntry({ body: '很久以前的事', time: now - 300 * DAY }),
+  ];
+  const hits = recallEntries(entries, { q: '我最近怎么样', limit: 5, now });
+  assert.equal(hits.length, 1, '问「最近」时 300 天前的事不该混进来');
+  assert.equal(hits[0].entry.body, '昨天的事');
+});
+
+test('只靠同义词沾边的结果标成 weak（防模型顺杆编造）', () => {
+  const now = Date.now();
+  const entries = [
+    // 库里没有「膝盖疼」这条，只有跑操这条被同义表连过去。
+    normalizeEntry({ title: '六点二十跑操', body: '早上六点二十起来跑操', tags: ['跑步'], time: now }),
+  ];
+  const hits = recallEntries(entries, { q: '你还记得我上次说膝盖疼的事吗', limit: 3, now });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].weak, true, '没命中原词时必须标 weak');
+});
+
+test('命中原词的结果不是 weak', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '想给我装只手', body: '他说想给我装一只可以玩游戏的手', time: now }),
+  ];
+  const hits = recallEntries(entries, { q: '我说要给你装只手那次', limit: 3, now });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].weak, false, '命中标题原词时不该标 weak');
+});
+
+// ---------------------------------------------------------------------------
+// 折叠（遗忘曲线接入 buildDiaryContext）
+// ---------------------------------------------------------------------------
+
+test('不传 decay 时行为与改造前完全一致（向后兼容）', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '很久以前的事', body: '很久以前的一件小事', time: now - 100 * DAY, importance: 1 }),
+  ];
+  const block = buildDiaryContext(entries, { now, style: false });
+  assert.ok(!block.includes('更早的、没说起的'), '没有衰减状态时不该出现折叠段');
+});
+
+test('低分旧条目被折叠成摘要行，但原文仍在库里可被检索', () => {
+  const now = Date.now();
+  const old = normalizeEntry({ title: '语音被嫌难听', body: '主人嫌语音难听但说要换更好的', time: now - 90 * DAY, importance: 1 });
+  const fresh = normalizeEntry({ title: '今天聊了联考', body: '今天聊了联考报名的事', time: now - 1 * DAY, importance: 3 });
+  const entries = [old, fresh];
+  const activeDays = [];
+  for (let i = 0; i < 60; i += 1) activeDays.push(dayKey(now - i * DAY));
+
+  const block = buildDiaryContext(entries, {
+    now, recentDays: 7, recentMax: 5, recallMax: 0, style: false,
+    decay: { entries: {}, activeDays },
+  });
+  assert.ok(block.includes('更早的、没说起的'), '应出现折叠段');
+  assert.ok(block.includes('1 件更早的小事'), `应给出折叠计数，实际：${block}`);
+  assert.ok(!block.includes('主人嫌语音难听'), '被折叠的条目不逐条展开正文');
+
+  // 关键：折叠≠删除，按关键词仍能检索出来
+  const hits = recallEntries(entries, { q: '语音难听', limit: 3, now });
+  assert.equal(hits.length, 1, '折叠的条目必须仍可被检索出来');
+  assert.equal(hits[0].entry.id, old.id);
+});
+
+test('近期条目和高分条目不会被折叠', () => {
+  const now = Date.now();
+  const entries = [
+    normalizeEntry({ title: '昨天的', body: '昨天说的事', time: now - 1 * DAY, importance: 1 }),
+    normalizeEntry({ title: '人生大事', body: '很重要的事', time: now - 200 * DAY, importance: 5 }),
+    normalizeEntry({ title: '今天', body: '今天说的事', time: now - 0.1 * DAY, importance: 2 }),
+  ];
+  const activeDays = [];
+  for (let i = 0; i < 60; i += 1) activeDays.push(dayKey(now - i * DAY));
+  const block = buildDiaryContext(entries, {
+    now, recentDays: 7, recentMax: 5, recallMax: 0, style: false,
+    decay: { entries: {}, activeDays },
+  });
+  assert.ok(!block.includes('更早的、没说起的'), `不该有折叠，实际：${block}`);
+});
+
+test('检索命中的条目不会同时被折叠计数', () => {
+  const now = Date.now();
+  const old = normalizeEntry({ title: '想装只手', body: '他说想给我装一只手', time: now - 200 * DAY, importance: 1 });
+  const entries = [old];
+  const activeDays = [];
+  for (let i = 0; i < 60; i += 1) activeDays.push(dayKey(now - i * DAY));
+  const block = buildDiaryContext(entries, {
+    now, recentDays: 7, recentMax: 5, recallMax: 4, style: false, query: '装只手',
+    decay: { entries: {}, activeDays },
+  });
+  assert.ok(block.includes('想给我装一只手') || block.includes('他说想给我装一只手'), '检索命中要正常展开');
+  assert.ok(!block.includes('更早的、没说起的'), '已经列出来的条目不能再被折叠计数');
+});
+
+test('被想起过的条目会重新回到展开状态', () => {
+  const now = Date.now();
+  const old = normalizeEntry({ title: '老事', body: '很旧但最近被反复提起', time: now - 200 * DAY, importance: 1 });
+  const activeDays = [];
+  for (let i = 0; i < 60; i += 1) activeDays.push(dayKey(now - i * DAY));
+  const decayCold = { entries: {}, activeDays };
+  const decayWarm = { entries: { [old.id]: { recallCount: 20, lastAccess: now - 1 * DAY } }, activeDays };
+
+  const cold = buildDiaryContext([old], { now, style: false, decay: decayCold });
+  const warm = buildDiaryContext([old], { now, style: false, decay: decayWarm });
+  assert.ok(cold.includes('更早的、没说起的'), '没被想起时该折叠');
+  assert.ok(!warm.includes('更早的、没说起的'), `被想起后该恢复展开，实际：${warm}`);
+});
+
+test('selectInjectedIds 返回实际注入的条目，与注入块一致', () => {
+  const now = Date.now();
+  const recentEntry = normalizeEntry({ title: '昨天的', body: '昨天说的事', time: now - 1 * DAY });
+  const hitEntry = normalizeEntry({ title: '装只手', body: '他说想给我装一只手', time: now - 200 * DAY });
+  const irrelevant = normalizeEntry({ title: '无关', body: '完全不相关的旧事', time: now - 300 * DAY });
+  const entries = [recentEntry, hitEntry, irrelevant];
+
+  const ids = selectInjectedIds(entries, { now, recentDays: 7, recentMax: 5, recallMax: 4, query: '装只手' });
+  assert.ok(ids.includes(recentEntry.id), '近期条目应计入');
+  assert.ok(ids.includes(hitEntry.id), '检索命中应计入');
+  assert.ok(!ids.includes(irrelevant.id), '既非近期也没命中的不该计入');
+});
+
+test('selectInjectedIds 空库返回空数组', () => {
+  assert.deepEqual(selectInjectedIds([], { query: 'x' }), []);
+  assert.deepEqual(selectInjectedIds(null), []);
 });
