@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
-import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
+import { GEN1_ROLE_LINE_RE, isGen1RoleLine, parseRoleSections, roleCharStats, roleSectionReport, selectPersistentRoleText, selectRoleText } from './role-card.js';
 import {
   addFeedback, addProposal, appendObservation, applyProposalToText, classifyFeedback,
   listRoleHistory, loadFeedback, loadProfiles, loadProposals, nowIso as roleEvoNow,
@@ -93,9 +93,31 @@ import {
   recallEntries,
   renderEntryLine,
   capEntries,
+  selectInjectedIds,
   DIARY_MAX_ENTRIES,
   MOODS,
 } from './diary.js';
+import {
+  DECAY_DEFAULTS,
+  loadDecayState,
+  saveDecayState,
+  markActiveDay,
+  touchEntries,
+  pruneDecayState,
+} from './memory-decay.js';
+import {
+  loadCore as loadDiaryCore,
+  appendCore as appendDiaryCore,
+  writeCore as writeDiaryCore,
+  renderCoreContext,
+  buildCoreExtractPrompt,
+  parseCoreJson,
+  mergeCoreEntries,
+  closePromise as closeCorePromise,
+  CORE_INJECT_MAX_CHARS,
+  CORE_KINDS,
+} from './diary-core.js';
+import { ruleTags } from './diary-grade.js';
 import {
   buildInboxSummaryPrompt,
   parseInboxSummary,
@@ -150,6 +172,58 @@ const DIARY_FILE = path.join(STATE_DIR, 'diary.jsonl');
 //   保证 A 的日记不会出现在 B 的会话里 —— 一份文件、逻辑隔离、
 //   比「一人一个文件」更好维护，也不会有文件名注入的风险。
 const DIARY_OTHERS_FILE = path.join(STATE_DIR, 'diary-others.jsonl');
+// 记忆衰减状态（sidecar）：哪条日记被想起过几次、哪天有互动。
+//
+// 为什么不写进 diary.jsonl：那是 append-only 的用户数据，normalizeEntry 会
+// 丢弃未知字段，历史条目也没有这些字段——硬塞等于重写整个库，风险远大于收益。
+// sidecar 坏了最多丢衰减状态（记忆重新变新鲜），日记本体毫发无损。
+//
+// 为什么与主人日记**分开两个文件**：与 diary.jsonl / diary-others.jsonl 同一个理由。
+// sidecar 只存 id 和计数、不含正文，但「谁的记忆被想起过几次」本身仍是行为数据，
+// 混在一起就是又一条会串人的路径。分开存，成本是两行常量。
+const DIARY_DECAY_FILE = path.join(STATE_DIR, 'diary-decay.json');
+const DIARY_OTHERS_DECAY_FILE = path.join(STATE_DIR, 'diary-others-decay.json');
+// 核层（diary-core）：从日记里提炼出「不该被遗忘」的东西（承诺/边界/关系/偏好），
+// 常驻注入、不参与衰减。与 diary.jsonl 分开存：核层是提炼产物，日记是原始记录，
+// 混在一起就没法「重跑提炼」了。同样一人一本。
+const DIARY_CORE_FILE = path.join(STATE_DIR, 'diary-core.jsonl');
+const DIARY_OTHERS_CORE_FILE = path.join(STATE_DIR, 'diary-others-core.jsonl');
+
+/**
+ * 记忆衰减状态的写盘注册表。挂在模块顶层是刻意的：
+ * SIGINT/SIGTERM/exit 处理器在模块作用域，够不到 main() 里的局部变量。
+ * 用模块级对象装，两边共享同一份引用，节流中的状态才能在退出时落盘。
+ */
+const DECAY_SAVE_REGISTRY = {
+  timers: new Map(),   // file -> timeout id
+  dirty: new Map(),    // file -> () => 当前状态
+  save: saveDecayState, // 注入进来便于测试替换；生产就是 memory-decay 的实现
+};
+
+/**
+ * 把节流中的记忆衰减状态立刻落盘。挂在所有进程退出路径上。
+ *
+ * 为什么必须显式调用：节流是 60 秒一次，用户随时可能点重启。
+ * 不 flush 的话，最后几十秒的「想起/活跃日」全丢——表现为
+ * 「明明刚聊过，重启后记忆又变旧了」，这种 bug 极难复现。
+ */
+function flushDecayStateOnExit() {
+  for (const [file, getter] of [...DECAY_SAVE_REGISTRY.dirty.entries()]) {
+    DECAY_SAVE_REGISTRY.dirty.delete(file);
+    const timer = DECAY_SAVE_REGISTRY.timers.get(file);
+    if (timer) { clearTimeout(timer); DECAY_SAVE_REGISTRY.timers.delete(file); }
+    try {
+      const result = DECAY_SAVE_REGISTRY.save(file, getter());
+      if (!result?.ok) {
+        // 退出路径上不能抛，也不能等——只能记一行。用 console 兜底，
+        // 因为此时 log() 依赖的流可能已经关了。
+        try { console.error(`[bridge] 记忆衰减状态退出落盘失败：${result?.error ?? 'unknown'}`); } catch {}
+      }
+    } catch (error) {
+      try { console.error(`[bridge] 记忆衰减状态退出落盘异常：${error?.message ?? error}`); } catch {}
+    }
+  }
+}
 // 对话归档（append-only JSONL）。只用于「回炉再提炼」，永不进 prompt。
 const OWNER_CHAT_ARCHIVE = path.join(STATE_DIR, 'owner-chat.jsonl');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
@@ -447,7 +521,7 @@ function roleWarnings(content, mode = 'v2') {
     .filter((section) => section.mode === 'all')
     .map((section) => section.lines.join('\n'))
     .join('\n');
-  if (GEN1_ROLE_LINE_RE.test(untagged)) {
+  if (untagged.split('\n').some((line) => isGen1RoleLine(line))) {
     warnings.push('未标记的小节里含一代仿真专用指令（[SILENT] / 空格分句 / 自动转发…），二代下这些行会被兜底过滤——建议把它们移到带 〔一代〕 标记的小节里');
   }
   if (/回复示例/.test(untagged) && /[\u4e00-\u9fff]\s+[\u4e00-\u9fff]/.test(untagged)) {
@@ -1038,7 +1112,9 @@ function loadConfig() {
         syncTtlMs: 60000,          // QQ 收藏表情刷新缓存 TTL（毫秒）
         maxListCount: 100,         // qq_list_stickers 单次最大返回数
         includeInPrompt: true,     // 是否在 qq_get_prompt / 唤醒提示里附带表情摘要与策略
-        promptMaxStickers: 8,      // 提示里最多列出的常用表情数
+        promptMaxStickers: 8,      // 提示里最多列出几个表情（默认 8；表情多时调大，列表里带别名就不用翻全库）
+        promptMaxChars: 1200,      // 表情摘要的字符硬上限。条目上限挡不住长备注（一条最多 200 字），这道闸才是真正的体积天花板
+        promptNamedOnlyThreshold: 40, // 收藏总数超过这个数后，只列有别名/备注的；没备注的列出来模型也选不出来，纯占地方
         collect: {
           enabled: true,           // AI 收藏他人表情总开关
           maxPerMinute: 2,         // 每分钟最多收藏次数
@@ -1182,6 +1258,8 @@ function loadConfig() {
     maxListCount: 100,
     includeInPrompt: true,
     promptMaxStickers: 8,
+    promptMaxChars: 1200,
+    promptNamedOnlyThreshold: 40,
     collect: {
       enabled: true,
       maxPerMinute: 2,
@@ -1760,6 +1838,63 @@ async function main() {
   } catch (error) {
     diaryOthersWritable = false;
     log(`⚠️ 他人日记本加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
+  }
+  // 记忆衰减状态。读失败**绝不**阻断日记功能：衰减状态丢了只是
+  // 「所有记忆重新变新鲜」，比让桥接起不来、或让模型看不到日记强得多。
+  // 所以这里只 log 一行，不设 writable 开关。
+  let diaryDecay = loadDecayState(DIARY_DECAY_FILE);
+  let diaryOthersDecay = loadDecayState(DIARY_OTHERS_DECAY_FILE);
+  if (!diaryDecay.activeDays.length && diaryEntries.length) {
+    log('ℹ️ 记忆衰减状态为空（首次启用或状态被清），将从现在起记录活跃日；已有日记按写入时间起算');
+  }
+  // 核层（不该遗忘的那一类）。与日记同样：读失败降级为空核层，绝不让桥接起不来。
+  // 核层为空是**正常状态**——它靠每日巩固慢慢长出来，不是启动时就有东西。
+  let diaryCore = [];
+  try {
+    const loadedCore = loadDiaryCore(DIARY_CORE_FILE, { onCorrupt: (message) => log(`⚠️ ${message}`) });
+    diaryCore = loadedCore.entries;
+    if (diaryCore.length) log(`日记核层已加载：${diaryCore.length} 条`);
+  } catch (error) {
+    log(`⚠️ 日记核层加载失败（降级为空，不影响日记与对话）：${error?.message ?? error}`);
+  }
+  let diaryOthersCore = [];
+  try {
+    const loadedOthersCore = loadDiaryCore(DIARY_OTHERS_CORE_FILE, { onCorrupt: (message) => log(`⚠️ ${message}`) });
+    diaryOthersCore = loadedOthersCore.entries;
+    if (diaryOthersCore.length) log(`他人日记核层已加载：${diaryOthersCore.length} 条`);
+  } catch (error) {
+    log(`⚠️ 他人日记核层加载失败（降级为空）：${error?.message ?? error}`);
+  }
+
+  // 衰减状态的落盘节流：抖动写入会把 state/ 目录写穿，也没必要。
+  // 60 秒内的多次更新合并成一次写盘；进程退出时会 flush（见下方 process.on）。
+  //
+  // 注意这两个 Map 挂在**模块顶层**（见文件下方的 DECAY_SAVE_REGISTRY），
+  // 不能只在 main() 里定义：SIGINT/SIGTERM/exit 的处理器在模块作用域，
+  // 够不到 main() 内的局部变量，节流中的状态会在重启时静默丢失。
+  const decaySaveTimers = DECAY_SAVE_REGISTRY.timers;
+  const decayDirty = DECAY_SAVE_REGISTRY.dirty;
+  function scheduleDecaySave(file, getter) {
+    decayDirty.set(file, getter);
+    if (decaySaveTimers.has(file)) return;
+    const id = setTimeout(() => {
+      decaySaveTimers.delete(file);
+      flushDecaySave(file);
+    }, 60000);
+    if (typeof id.unref === 'function') id.unref();
+    decaySaveTimers.set(file, id);
+  }
+  function flushDecaySave(file) {
+    const getter = decayDirty.get(file);
+    if (!getter) return;
+    decayDirty.delete(file);
+    const timer = decaySaveTimers.get(file);
+    if (timer) { clearTimeout(timer); decaySaveTimers.delete(file); }
+    const result = saveDecayState(file, getter());
+    if (!result.ok) log(`⚠️ 记忆衰减状态写入失败（不影响日记本身，下次再试）：${result.error}`);
+  }
+  function flushAllDecaySaves() {
+    for (const file of [...decayDirty.keys()]) flushDecaySave(file);
   }
   // 日记水位与事实提炼各自独立：两者处理同一条消息，但成功/失败互不牵连。
   // 共用水位会导致「事实提炼成功、日记失败」时那段对话被日记永久跳过。
@@ -2986,10 +3121,11 @@ async function main() {
 
     const parsed = parseDiaryJson(output);
     let written = 0;
+    const writtenEntries = [];
     // 归属由 key 决定（writeDiaryEntry 内部再判一次），这里不写死 scope：'owner'。
     for (const item of parsed) {
       const r = writeDiaryEntry({ ...item, key }, { key });
-      if (r.ok) written += 1;
+      if (r.ok) { written += 1; writtenEntries.push(r.entry); }
     }
     if (written) log(`日记整理：${key} 写入 ${written} 条`);
     else log(`日记整理：${key} 本批没有值得记的事`);
@@ -2997,6 +3133,75 @@ async function main() {
     // 成功（无论写没写）才推进水印，失败则下次重试同一批。
     setOwnerArchiveOffset(`diary:${key}`, nextOffset);
     saveOwnerMemoryStore();
+
+    // 巩固：把这一批新日记里「不该遗忘的」提进核层。
+    // 纯规则筛选、零模型调用——理由见 consolidateDiaryCore 的注释
+    // （第一版排第二次 turn，实测会撞上 120 秒超时）。
+    // 只传**真正写成功**的条目（带 id），不能传 parsed——那些还没落盘，也没有 id。
+    if (writtenEntries.length) {
+      consolidateDiaryCore(key, forOwner, writtenEntries);
+    }
+  }
+
+  /**
+   * 把日记里的「不该遗忘的东西」提炼进核层。
+   *
+   * **不调用模型**。为什么（真实踩到的）：
+   *   第一版把提炼写成「往同一个学习会话再排一次 prompt，然后 waitLearnerTurn」。
+   *   上线后日志立刻出现「核层巩固失败：等待学习会话 turn 超时(120000ms)」——
+   *   因为日记整理本身上下文的 turn 可能还没结束，第二条 prompt 排队后
+   *   与第一个 waiter 的对应关系就乱了，最多白等 2 分钟。
+   *   日记整理那条链是**每轮对话都可能在跑**的热路径，不能在这里多挂一次 LLM 往返。
+   *
+   * 所以改成纯规则筛选：本次写进日记的条目已经过 diary-grade 的分级，
+   * 这里只看标签与分级结果决定是否进核层。零额外调用、零额外延迟、可单测。
+   *
+   * 代价：提炼质量不如 LLM（措辞可能偏长、边界判断可能漏）。
+   * 缓解：模型随时可以用 qq_diary_core(action=add) 主动补一条，
+   * 而 qq_diary_promise_close 负责关闭。规则只是**兜底**，不是唯一入口。
+   */
+  function consolidateDiaryCore(key, forOwner, written) {
+    if (cfg.diary?.core === false) return;
+    try {
+      const items = Array.isArray(written) ? written.filter((e) => e && e.body) : [];
+      if (!items.length) return;
+      const core = forOwner ? diaryCore : diaryOthersCore;
+
+      // 只从本次新写的条目里提炼：核层的价值在"少而硬"。
+      const candidates = [];
+      for (const e of items) {
+        const text = `${e.title ?? ''} ${e.body ?? ''}`;
+        const tags = ruleTags(text);
+        if (tags.includes('promise')) {
+          // 用标题当核层正文：标题是模型自己压缩过的 8 字摘要，比正文更适合常驻。
+          candidates.push({
+            kind: 'promise',
+            text: String(e.title ?? '').slice(0, 40) || String(e.body).slice(0, 40),
+            sourceDiaryId: e.id,
+            key: forOwner ? '' : (canonicalV2Key(key) ?? key),
+          });
+        }
+        if (tags.includes('boundary')) {
+          candidates.push({
+            kind: 'boundary',
+            text: String(e.title ?? '').slice(0, 40) || String(e.body).slice(0, 40),
+            sourceDiaryId: e.id,
+            key: forOwner ? '' : (canonicalV2Key(key) ?? key),
+          });
+        }
+      }
+      if (!candidates.length) return;
+
+      const merged = mergeCoreEntries(core, candidates);
+      if (!merged.added.length) return;
+
+      const coreFile = forOwner ? DIARY_CORE_FILE : DIARY_OTHERS_CORE_FILE;
+      writeDiaryCore(coreFile, merged.entries);
+      if (forOwner) diaryCore = merged.entries; else diaryOthersCore = merged.entries;
+      log(`核层巩固：${key} 新增 ${merged.added.length} 条（${merged.added.map((e) => e.kind).join('/')}），共 ${merged.entries.length} 条`);
+    } catch (error) {
+      log(`核层巩固失败（不影响日记与对话）：${error?.message ?? error}`);
+    }
   }
 
   /**
@@ -3123,6 +3328,29 @@ async function main() {
    *      这是比文件混用更隐蔽的一类泄漏（文件是分开的，但注入时串了人）；
    *   3) 两本日记永不互相注入 —— 主人看不到别人的，别人也看不到主人的。
    */
+  /**
+   * 核层注入：承诺/边界/关系/偏好，常驻、不衰减。
+   *
+   * 为什么单独一段、且放在日记之前：
+   *   「我答应过他什么」「我不做什么」是**身份与义务**级别的事，
+   *   比「上周三聊了什么」更该先立住。先立人设与承诺，再谈共同经历。
+   *
+   * 隐私边界与 diaryBlockFor 完全一致：群聊不注入、他人私聊只注入他自己那本。
+   */
+  function coreBlockFor(key) {
+    if (!diaryEnabled() || cfg.diary?.core === false) return '';
+    const opts = { maxChars: Number(cfg.diary?.coreInjectMaxChars ?? CORE_INJECT_MAX_CHARS) };
+    if (isOwnerPrivateSession(key)) {
+      return renderCoreContext(diaryCore, opts);
+    }
+    if (!/^private:\d+$/.test(String(key ?? ''))) return '';
+    // 他人核层同样按 key 过滤：该文件所有人共用，不过滤就会串人。
+    const canonical = canonicalV2Key(key) ?? String(key ?? '');
+    const mine = diaryOthersCore.filter((e) => String(e.key ?? '') === canonical);
+    if (!mine.length) return '';
+    return renderCoreContext(mine, opts);
+  }
+
   function diaryBlockFor(key, query) {
     if (!diaryEnabled()) return '';
     const opts = {
@@ -3132,10 +3360,14 @@ async function main() {
       recentMax: Number(cfg.diary?.injectRecent ?? 5),
       recallMax: Number(cfg.diary?.injectRecall ?? 4),
       styleMax: Number(cfg.diary?.injectStyle ?? 3),
+      // 折叠开关：默认开。config.diary.fold === false 可完全退回旧行为
+      // （所有条目按条数上限展开，不折叠）。留这个开关是因为折叠会改变
+      // 模型"看得见哪些旧事"——万一人设跑偏，得有一条立即可用的退路。
+      fold: cfg.diary?.fold !== false,
     };
     if (isOwnerPrivateSession(key)) {
       if (!diaryEntries.length) return '';
-      return buildDiaryContext(diaryEntries, opts);
+      return buildDiaryContext(diaryEntries, { ...opts, decay: diaryDecay });
     }
     // 非主人：只给「本人私聊」注入他自己的那本。
     // 群聊 / 主人私聊都走不到这里（主人已被上面 return）。
@@ -3143,7 +3375,53 @@ async function main() {
     const canonical = canonicalV2Key(key) ?? String(key ?? '');
     const mine = diaryOthersEntries.filter((e) => String(e.key ?? '') === canonical);
     if (!mine.length) return '';
-    return buildDiaryContext(mine, opts);
+    // 衰减状态是**按本本独立**的：只给这个人的那些条目算分。
+    // 复用同一个 sidecar 对象没问题——里面的 key 是日记 id，天然不串人。
+    return buildDiaryContext(mine, { ...opts, decay: diaryOthersDecay });
+  }
+
+  /**
+   * 把「本轮真正注入了哪些日记」记成一次「被想起」，并刷新活跃日。
+   *
+   * 两个细节决定了这个机制有没有用：
+   *   1) 只记**实际注入**的条目（selectInjectedIds），不是检索候选。
+   *      否则凡是能检索到的永远不过期，衰减机制等于没开。
+   *   2) 失败静默。这是纯粹的优化路径，绝不能因为它让一条 QQ 消息发不出去。
+   */
+  function noteDiaryInjection(key, query) {
+    if (!diaryEnabled() || cfg.diary?.fold === false) return;
+    try {
+      const now = Date.now();
+      const isOwner = isOwnerPrivateSession(key);
+      if (!isOwner && !/^private:\d+$/.test(String(key ?? ''))) return;
+      const book = isOwner
+        ? diaryEntries
+        : diaryOthersEntries.filter((e) => String(e.key ?? '') === (canonicalV2Key(key) ?? String(key ?? '')));
+      if (!book.length) return;
+
+      const opts = {
+        query: String(query ?? '').slice(0, 500),
+        now,
+        recentDays: Number(cfg.diary?.recentDays ?? 7),
+        recentMax: Number(cfg.diary?.injectRecent ?? 5),
+        recallMax: Number(cfg.diary?.injectRecall ?? 4),
+      };
+      const ids = selectInjectedIds(book, opts);
+      if (!ids.length) return;
+
+      const file = isOwner ? DIARY_DECAY_FILE : DIARY_OTHERS_DECAY_FILE;
+      let state = isOwner ? diaryDecay : diaryOthersDecay;
+      state = touchEntries(state, ids, now);
+      // 活跃日全局只有一份（主人和其他人共用「今天 bot 有没有被使用」这个事实），
+      // 但主/他人的两个 sidecar 各自记一份，避免一个人的活跃把另一个人的记忆续命。
+      state = { ...state, activeDays: markActiveDay(state, now) };
+      // 顺带清掉已经不在库里的 id，防止 sidecar 无限膨胀。
+      state = pruneDecayState(state, book.map((e) => e.id));
+      if (isOwner) diaryDecay = state; else diaryOthersDecay = state;
+      scheduleDecaySave(file, () => (isOwner ? diaryDecay : diaryOthersDecay));
+    } catch (error) {
+      log(`⚠️ 记忆衰减状态更新失败（不影响对话）：${error?.message ?? error}`);
+    }
   }
 
 
@@ -3511,10 +3789,20 @@ async function main() {
       const ownerBlock = buildOwnerMemoryContext(ownerFacts, { max: Number(cfg.ownerMemory?.injectMax ?? 30) });
       if (ownerBlock) parts.push(ownerBlock);
     }
+    // 核层：不该遗忘的那一类（承诺/边界/关系/偏好），常驻、不参与衰减。
+    // 放在日记之前是刻意的：「我答应过他什么」「我不做什么」属于身份与义务，
+    // 比「上周三聊了什么」更该先立住。先立承诺，再谈共同经历。
+    const coreBlock = coreBlockFor(key);
+    if (coreBlock) parts.push(coreBlock);
     // 日记本：同样只给主人私聊（理由见 diaryBlockFor 的注释）。
     // 放在事实之后、黑话之前：先"知道他这个人"，再"想起一起发生过的事"，最后才是说话方式。
     const diaryBlock = diaryBlockFor(key, query);
-    if (diaryBlock) parts.push(diaryBlock);
+    if (diaryBlock) {
+      parts.push(diaryBlock);
+      // 只有日记块**真的进了 prompt** 才记一次「被想起」。
+      // 放在 if 里面是刻意的：没注入就没有强化，衰减才符合直觉。
+      noteDiaryInjection(key, query);
+    }
     // 黑话与贴吧语感是「公开的表达方式」，不含个人事实，可以给所有会话。
     if (cfg.slang?.enabled !== false) {
       const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
@@ -5970,6 +6258,10 @@ async function main() {
           }
           const isV2 = currentMode === 'reserved2';
           const roleState = readRoleState();
+          // Keep the persona present here too: an admin reminder is still a turn
+          // the model answers as this character.
+          const persistentRoleText = currentMode === 'reserved2' ? currentPersistentRoleHintV2() : '';
+          const persistentRoleLine = persistentRoleText ? `【人设要点·常驻】\n${persistentRoleText}\n\n` : '';
           const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
           // 二代必须带会话令牌，否则 AI 调用任何 MCP 状态/发送工具都会被拒。
           let tokenLine = '';
@@ -5977,7 +6269,7 @@ async function main() {
             const stV2 = getSocialV2State(key);
             tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
           }
-          const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
+          const promptText = `${roleLine}${persistentRoleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
           let popSilent = null;
           try {
@@ -6043,7 +6335,14 @@ async function main() {
           // 新增开关必须登记在这里，否则控制台保存时 `typeof merged.tools[k] !== 'boolean'`
           // 会按 `current !== false` 兜底 —— 对默认关闭的能力（sendDocument/setAvatar/
           // setNickname/sendQzone）等于"保存一次就被静默打开"，与默认 false 的意图相反。
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendDocument', 'setAvatar', 'setNickname', 'sendQzone'];
+          // 2026-10-29 补登记 diary / roleEvolve / ownerMemory / ownerInbox /
+          // getGroupMembers / selfRuntime。这六个是「早就注册好、服务端也放行，但一直没进
+          // toolMap 所以模型看不见」的那批（见 mcp-snowluma-safe.js 的 TOOL_CONFIG_FLAGS）。
+          // 不补进这里的话，控制台**保存任意一次设置**都会走下面 `current.tools?.[k] !== false`
+          // 的兜底 —— 对这几个「文件里根本没写过」的 flag 来说，兜底值恒为 true，
+          // 等于保存一次就静默打开。它们本来就该是开着的，但"碰巧结果一样"不是理由：
+          // 哪天要把其中某个改成默认关，这条兜底会把它悄悄打开。
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'sendDocument', 'setAvatar', 'setNickname', 'sendQzone', 'diary', 'roleEvolve', 'ownerMemory', 'ownerInbox', 'getGroupMembers', 'selfRuntime'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -6120,14 +6419,18 @@ async function main() {
           if (body.sticker && typeof body.sticker === 'object') {
             merged.sticker = { ...(current.sticker ?? {}), ...body.sticker };
             if (merged.sticker.enabled !== undefined) merged.sticker.enabled = merged.sticker.enabled === true;
-            for (const k of ['syncTtlMs', 'maxListCount', 'promptMaxStickers']) {
+            for (const k of ['syncTtlMs', 'maxListCount', 'promptMaxStickers', 'promptMaxChars', 'promptNamedOnlyThreshold']) {
               if (merged.sticker[k] !== undefined) {
                 const n = Number(merged.sticker[k]);
                 merged.sticker[k] = Number.isFinite(n) ? Math.max(0, Math.round(n)) : current.sticker?.[k] ?? 0;
               }
             }
             if (merged.sticker.maxListCount !== undefined) merged.sticker.maxListCount = Math.min(500, Math.max(1, merged.sticker.maxListCount));
-            if (merged.sticker.promptMaxStickers !== undefined) merged.sticker.promptMaxStickers = Math.min(30, Math.max(1, merged.sticker.promptMaxStickers));
+            if (merged.sticker.promptMaxStickers !== undefined) merged.sticker.promptMaxStickers = Math.min(80, Math.max(1, merged.sticker.promptMaxStickers));
+            // 表情摘要的两道闸。给下限是为了「填错不要变成 0」：字符预算填 0 会让摘要
+            // 只剩表头、模型以为一个表情都没有；命名阈值填 0 会让所有没备注的表情瞬间沉底。
+            if (merged.sticker.promptMaxChars !== undefined) merged.sticker.promptMaxChars = Math.min(20000, Math.max(200, merged.sticker.promptMaxChars));
+            if (merged.sticker.promptNamedOnlyThreshold !== undefined) merged.sticker.promptNamedOnlyThreshold = Math.min(1000, Math.max(1, merged.sticker.promptNamedOnlyThreshold));
             if (merged.sticker.includeInPrompt !== undefined) merged.sticker.includeInPrompt = merged.sticker.includeInPrompt === true;
             if (body.sticker.collect && typeof body.sticker.collect === 'object') {
               merged.sticker.collect = { ...(current.sticker?.collect ?? {}), ...body.sticker.collect };
@@ -6326,7 +6629,26 @@ async function main() {
             sendDocument: 'qq_send_document',
             setAvatar: 'qq_set_self_avatar',
             setNickname: 'qq_set_self_nickname',
-            sendQzone: 'qq_send_qzone'
+            sendQzone: 'qq_send_qzone',
+            // ── 2026-10-29 补齐：这些工具早就注册了、服务端也一直放行，
+            // 只是没登记进这张表，于是模型在 enabledTools 里根本看不到它们。
+            // 表现是「她明明有这个能力却完全不知道自己能用」——
+            // 日记、人格演进、主人记忆、个人收件箱、群成员，全是这种状态。
+            //
+            // 为什么只登记就够了、不用改权限：v2ToolEnabled 的判据是
+            // `cfg.socialV2.tools[flag] !== false`，缺省即放行。这些 flag 在
+            // config.json 里压根没出现，所以调用期一直是通的（实测：
+            // /api/socialV2/diary、/owner-memory、/owner-inbox 都返回 200），
+            // 卡住的只是「模型不知道」，不是「服务端不让」。
+            diary: 'qq_diary_write / qq_diary_recall / qq_diary_correct',
+            roleEvolve: 'qq_role_propose / qq_role_apply / qq_role_rollback / qq_role_history / qq_role_insight / qq_role_observe / qq_role_feedback',
+            ownerMemory: 'qq_owner_memory',
+            ownerInbox: 'qq_owner_inbox',
+            getGroupMembers: 'qq_get_group_members',
+            // 「看看我自己现在的运行状态」（只读、字段白名单，不含任何密钥）。
+            // 方案 A 的落点：让她能自查、能理解自己被什么限制着，
+            // 但不开 shell / 文件读写 / 插件安装。
+            selfRuntime: 'qq_self_runtime'
           };
           const tools = cfg.socialV2?.tools ?? {};
           const stickerToolFlags = new Set(['listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker']);
@@ -6367,7 +6689,7 @@ async function main() {
             stickers: {
               enabled: cfg.socialV2?.sticker?.enabled !== false,
               total: stickerEntries.length,
-              context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
+              context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8, { maxChars: cfg.socialV2?.sticker?.promptMaxChars, namedOnlyThreshold: cfg.socialV2?.sticker?.promptNamedOnlyThreshold }) : '',
               strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
             },
             // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
@@ -6658,7 +6980,9 @@ async function main() {
           // 预写的初始提示词（群环境/氛围）」。若用手动唤醒的 admin 文案顶掉它，这个会话就
           // 永远拿不到引导 —— 而 bootstrapSent 一旦置真，后续再也不会补发。
           const firstWake = !st.bootstrapSent;
-          if (firstWake) st.bootstrapSent = true;
+          // 不在这里预置 bootstrapSent：与 scheduleWakeV2 同一契约——只有 sendWakePromptV2
+          // 真正以 bootstrap 投递成功才置真。否则 paused / 模式不符 / 会话繁忙被暂存时，
+          // 标记已经被消费，这个会话的引导与人格卡全文就永久丢失。
           const effectiveReason = firstWake ? 'bootstrap' : reason;
           saveSocialV2State();
           // 和其它唤醒入口保持一致：sendWakePromptV2 是异步的，这里不 await（不能让 HTTP 回复
@@ -8817,7 +9141,125 @@ async function main() {
           return;
         }
 
-        // 主人跨会话动态（B 方案：只给概括，不给原文）。
+        // 核层（承诺/边界/关系/偏好）：读写与状态变更。
+        //
+        // 与日记共用同一套隐私闸门：群聊一律拒绝、他人只能碰自己那本。
+        // 核层比日记更敏感——它常驻每一轮注入，写错一条会长期污染人设。
+        if (url.pathname === '/api/socialV2/diary/core') {
+          {
+            const isWrite = req.method === 'POST';
+            let body = {};
+            if (isWrite) {
+              try {
+                body = await readBody();
+              } catch (error) {
+                sendJson({ ok: false, error: error?.message ?? '请求体解析失败' }, error?.statusCode || 400);
+                return;
+              }
+            }
+            const key = String(isWrite ? (body.key ?? '') : (url.searchParams.get('key') ?? '')).trim();
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            const token = isWrite ? body.token : req.headers['x-agent-token'];
+            if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (token && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            if (token && !v2ToolEnabled('diary')) { sendJson({ ok: false, error: '工具未启用：qq_diary_*' }, 403); return; }
+            const isOwnerBook = isOwnerPrivateSession(key);
+            if (!isOwnerBook && !/^private:\d+$/.test(key)) {
+              sendJson({ ok: false, error: '核层只能在私聊中读写；群聊不提供日记能力' }, 403);
+              return;
+            }
+            if (!diaryEnabled()) { sendJson({ ok: false, error: '日记本已关闭' }, 403); return; }
+            if (cfg.diary?.core === false) { sendJson({ ok: false, error: '核层已关闭（config.diary.core=false）' }, 403); return; }
+
+            const canonicalKey = canonicalV2Key(key) ?? key;
+            const coreFile = isOwnerBook ? DIARY_CORE_FILE : DIARY_OTHERS_CORE_FILE;
+            const bookAll = isOwnerBook ? diaryCore : diaryOthersCore;
+            const bookMine = isOwnerBook
+              ? bookAll
+              : bookAll.filter((e) => String(e.key ?? '') === canonicalKey);
+
+            const action = String(isWrite ? (body.action ?? 'add') : 'list').trim();
+
+            // close：只关闭承诺，不删除（保留「答应过」这个事实）
+            if (isWrite && action === 'close') {
+              const id = String(body.id ?? '').trim();
+              if (!id) { sendJson({ ok: false, error: 'id 不能为空' }, 400); return; }
+              if (!bookMine.some((e) => e.id === id)) {
+                sendJson({ ok: false, error: '没有找到这条承诺（只能关闭你自己的）' }, 404);
+                return;
+              }
+              const r = closeCorePromise(bookAll, id, String(body.status ?? 'done'));
+              if (!r.ok) { sendJson({ ok: false, error: r.error }, 400); return; }
+              try {
+                writeDiaryCore(coreFile, r.entries);
+              } catch (error) {
+                sendJson({ ok: false, error: `核层写入失败：${error?.message ?? error}` }, 500);
+                return;
+              }
+              if (isOwnerBook) diaryCore = r.entries; else diaryOthersCore = r.entries;
+              sendJson({ ok: true, entry: { id: r.entry.id, text: r.entry.text, status: r.entry.status } });
+              return;
+            }
+
+            // add：手工写入一条（模型主动记承诺时用）
+            if (isWrite && action === 'add') {
+              const kind = String(body.kind ?? '').trim().toLowerCase();
+              if (!CORE_KINDS.includes(kind)) {
+                sendJson({ ok: false, error: `kind 只能是 ${CORE_KINDS.join(' / ')}` }, 400);
+                return;
+              }
+              const cand = {
+                kind,
+                text: body.text,
+                sourceDiaryId: body.sourceDiaryId,
+                key: isOwnerBook ? '' : canonicalKey,
+              };
+              const merged = mergeCoreEntries(bookAll, [cand]);
+              if (!merged.added.length) {
+                // 重复不算错误：模型重复提炼同一件事是常态，如实告知即可。
+                sendJson({
+                  ok: true,
+                  added: 0,
+                  duplicate: merged.skipped[0]?.duplicateOf ?? null,
+                  note: '这条已经记过了，没有重复写入',
+                  total: bookAll.length,
+                });
+                return;
+              }
+              try {
+                writeDiaryCore(coreFile, merged.entries);
+              } catch (error) {
+                sendJson({ ok: false, error: `核层写入失败：${error?.message ?? error}` }, 500);
+                return;
+              }
+              if (isOwnerBook) diaryCore = merged.entries; else diaryOthersCore = merged.entries;
+              sendJson({ ok: true, added: 1, entry: merged.added[0], total: merged.entries.length });
+              return;
+            }
+
+            // list（GET 或 action=list）
+            const kind = String(url.searchParams.get('kind') ?? '').trim().toLowerCase();
+            let list = bookMine;
+            if (kind && CORE_KINDS.includes(kind)) list = list.filter((e) => e.kind === kind);
+            const status = String(url.searchParams.get('status') ?? '').trim().toLowerCase();
+            if (status) list = list.filter((e) => e.status === status);
+            sendJson({
+              ok: true,
+              enabled: diaryEnabled(),
+              scope: isOwnerBook ? 'owner' : 'other',
+              total: bookMine.length,
+              entries: [...list]
+                .sort((a, b) => (Number(b.time) || 0) - (Number(a.time) || 0))
+                .map((e) => ({
+                  id: e.id, kind: e.kind, text: e.text, status: e.status,
+                  sourceDiaryId: e.sourceDiaryId, sourceDate: e.sourceDate,
+                  createdAt: e.createdAt, updatedAt: e.updatedAt,
+                })),
+              block: coreBlockFor(key),
+            });
+            return;
+          }
+        }
         //
         // 为什么需要这个端点：二代模式每个 QQ 会话一条独立 DSH 会话 + 独立 agentToken，
         // 主人在自己窗口里用 qq_get_recent_messages 只能读到主人这条会话。
@@ -8867,6 +9309,82 @@ async function main() {
         //
         // 为什么单独开端点而不是让 qq_status 继续直连 SnowLuma：原先是 MCP 进程直连
         // OneBot，任何会话的模型都能调，拿到的 online/good 会被模型在群里播报成
+        // ── 「我自己的状态」：给她一个只读的自省窗口 ─────────────────────────
+        //
+        // 2026-10-29 扩权（主人选方案 A：开一部分，但不给 shell）。
+        //
+        // 为什么不直接让她读 config.json 或复用 /api/socialV2/config：
+        //   那个端点被明确限定为「仅控制台可用」（agent 带队令牌也被 403），而且
+        //   config.json 里有 snowluma.accessToken、consoleToken、pixiv 之类的凭据。
+        //   给她一个「读配置」的口子，等于把这些一起递过去。
+        // 所以这里是**字段白名单**，不是整体返回：只答"我现在怎么运转的"，
+        // 不含任何密钥、路径、模型凭据。新增字段必须显式加进下面的 byName。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/self-runtime') {
+          const token = req.headers['x-agent-token'];
+          if (!token) { sendJson({ ok: false, error: '缺少会话令牌' }, 403); return; }
+          const callerKey = agentKeyForToken(token);
+          if (!callerKey) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(callerKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          const v2 = cfg.socialV2 ?? {};
+          const send = v2.send ?? {};
+          const wake = v2.wake ?? {};
+          const pro = v2.proactive ?? {};
+          const stAll = socialV2;
+          const myState = stAll?.conversations?.get(callerKey) ?? null;
+          const roleStateNow = readRoleState();
+          const roleText = roleStateNow.role ? roleRawContent() : '';
+          const all = {
+            // —— 运行模式与身份 ——
+            mode: currentMode,
+            isOwnerSession: isOwnerPrivateSession(callerKey),
+            role: roleStateNow.role ?? null,
+            roleInjectChars: roleText ? selectRoleText(roleText, 'v2').length : 0,
+            roleInjectMaxChars: roleInjectMaxChars,
+            // —— 发送限制（她现在能自己看到天花板在哪）——
+            send: {
+              maxSendPerMinute: send.maxSendPerMinute ?? null,
+              maxSendPerHour: send.maxSendPerHour ?? null,
+              maxMessageChars: send.maxMessageChars ?? null,
+              burstMaxMessages: send.burstMaxMessages ?? null,
+            },
+            // —— 唤醒与主动 ——
+            wake: {
+              defaultMode: wake.defaultMode ?? null,
+              maxWakePerMinute: wake.maxWakePerMinute ?? null,
+              maxWakePerHour: wake.maxWakePerHour ?? null,
+            },
+            proactive: {
+              enabled: pro.enabled !== false,
+              probability: pro.probability ?? null,
+              idleThresholdMs: pro.idleThresholdMs ?? null,
+            },
+            // —— 本轮会话自身 ——
+            // 发信时间戳在 state 里叫 sendTimes（数组，毫秒），不是 sentAt。
+            // 自己算而不是复用 countRecentApplies：那个函数是人格演进用的「提案受理计数」，
+            // 语义完全不同，套上来会得到一个看起来合理、实际错误的数字。
+            session: myState ? {
+              exists: true,
+              mySendCountLastMinute: (myState.sendTimes ?? []).filter((t) => Number(t) > Date.now() - 60 * 1000).length,
+              mySendCountLastHour: (myState.sendTimes ?? []).filter((t) => Number(t) > Date.now() - 3600 * 1000).length,
+            } : { exists: false },
+            // —— 工具开关概况 ——
+            // 只报「被显式关掉」的项。不要报 tools 段的键数：那 34 个是历史上写进
+            // config.json 的键，和她实际拥有的工具数（约 51 个，由 toolMap 展开决定）
+            // 是两回事。报错数会让她误以为自己能力变少了。
+            toolsDisabled: Object.entries(v2.tools ?? {}).filter(([, v]) => v === false).map(([k]) => k),
+            time: new Date().toISOString(),
+          };
+          // 按调用方要的字段裁剪；不传 names 就返回上面这一整份（已脱敏的白名单）。
+          const names = String(url.searchParams.get('names') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+          if (!names.length) { sendJson({ ok: true, runtime: all }); return; }
+          const byName = {};
+          for (const n of names) {
+            if (n in all) byName[n] = all[n];
+          }
+          const unknown = names.filter((n) => !(n in all));
+          sendJson({ ok: true, runtime: byName, unknown });
+          return;
+        }
         // 「机器人状态」（实测 #sl 触发过）。这里把调用收敛到桥接，按令牌反查出的会话
         // 判主人私聊，非主人一律 403 —— 与 owner-inbox 同款反查，模型改不了令牌。
         if (req.method === 'GET' && url.pathname === '/api/socialV2/bot-status') {
@@ -11975,7 +12493,7 @@ async function main() {
       }
       if (inExampleSection) {
         kept.push(convertExampleSpacesToComma(line));
-      } else if (!GEN1_ROLE_LINE_RE.test(line)) {
+      } else if (!isGen1RoleLine(line)) {
         kept.push(line);
       }
     }
@@ -11985,6 +12503,28 @@ async function main() {
     const fb = roleFeedbackHint();
     if (!fb) return body;
     return body ? `${body}\n\n${fb}` : fb;
+  }
+
+  // Compact persona reminder injected on non-bootstrap wakes: only the role-card
+  // sections tagged persistent. Keeps the sharpest lines in context every turn
+  // without re-sending the whole card (which would grow linearly with turns).
+  const PERSISTENT_ROLE_MAX_CHARS = 1400;
+  let persistentRoleCache = { key: '', text: '' };
+  function currentPersistentRoleHintV2() {
+    const raw = roleRawContent();
+    if (!raw) return '';
+    if (persistentRoleCache.key === raw) return persistentRoleCache.text;
+    let text = '';
+    try {
+      const picked = selectPersistentRoleText(raw, 'v2');
+      if (picked) {
+        text = picked.length > PERSISTENT_ROLE_MAX_CHARS ? truncateText(picked, PERSISTENT_ROLE_MAX_CHARS) : picked;
+      }
+    } catch {
+      text = '';
+    }
+    persistentRoleCache = { key: raw, text };
+    return text;
   }
 
   /**
@@ -12844,7 +13384,7 @@ async function main() {
     const sendRuleLine = '【必须用工具发】你的文本输出不会自动发送到 QQ。想说话就用 qq_send_message / qq_reply 发出去；只写正文不调用发送工具，对方什么都不会收到。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
+      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8, { maxChars: stickerCfg.promptMaxChars, namedOnlyThreshold: stickerCfg.promptNamedOnlyThreshold })}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     // 【自主性】这一段是主人 2026-10-28 明确要求的「扩大自主性」的落点。
@@ -12901,7 +13441,10 @@ async function main() {
     // 【你自己的状态】【你们的关系】放在时间感前面：先让她知道"我是谁、现在几点、跟这人多熟"，
     // 再读"这条消息多旧"。顺序反了的话，模型容易先按消息年龄决定语气，把自己此刻的状态丢掉。
     const { selfLine, relationLine } = buildInnerLifeLinesSafe(key, st);
-    const base = roleLine + identityLine + tokenLine + privilegeLine + closenessLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + selfLine + relationLine + timeSenseLine;
+    // Non-bootstrap wakes carry only the role name above; append the persistent sections.
+    const persistentRoleText = roleCardBody ? '' : currentPersistentRoleHintV2();
+    const persistentRoleLine = persistentRoleText ? `【人设要点·常驻】\n${persistentRoleText}\n\n` : '';
+    const base = roleLine + persistentRoleLine + identityLine + tokenLine + privilegeLine + closenessLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + selfLine + relationLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12929,12 +13472,16 @@ async function main() {
 
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
+    // Same persistent persona reminder as the wake prompt: this path also only
+    // used to carry the role name, so the persona vanished on retry prompts.
+    const persistentRoleText = currentPersistentRoleHintV2();
+    const persistentRoleLine = persistentRoleText ? `【人设要点·常驻】\n${persistentRoleText}\n\n` : '';
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${persistentRoleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   async function sendWakePromptV2(key, reason) {
@@ -12945,6 +13492,14 @@ async function main() {
       return;
     }
     const st = getSocialV2State(key);
+    // 契约：bootstrap 标记只在「真的以 bootstrap 原因投递」时才消费。
+    // 放在这里而不是 scheduleWakeV2：那里只是排队，合并窗口可能把原因升级掉，
+    // 或会话繁忙被暂存、超限被丢弃 —— 任一情况都不该算作「人格卡全文已发过」。
+    if (String(reason).split(':')[0] === 'bootstrap' && !st.bootstrapSent) {
+      st.bootstrapSent = true;
+      saveSocialV2State();
+      log(`[reserved2] ${key} 已投递 bootstrap，人格卡全文注入并标记完成`);
+    }
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
     if (isConversationBusyV2(key, st)) {
@@ -13128,6 +13683,9 @@ async function main() {
   }
 
   const WAKE_PRIORITY = {
+    // bootstrap 必须高于一切：它承载人格卡全文注入，每个会话只有一次机会。
+    // 若被合并窗口内的普通消息升级掉，全文就永久丢失（roleCardBody 只在 reason==='bootstrap' 时赋值）。
+    bootstrap: 200,
     private: 100,
     atMention: 90,
     question: 80,
@@ -13583,8 +14141,8 @@ async function main() {
       }
       const st = getSocialV2State(key);
       if (!st.bootstrapSent) {
-        st.bootstrapSent = true;
-        saveSocialV2State();
+        // 先不落盘：标记在真正以 bootstrap 原因唤醒时才置真（见 scheduleWakeV2/发送处）。
+        // 原实现先置真再排队，一旦被升级或丢弃就再也没机会重发人格卡全文。
         scheduleWakeV2(key, 'bootstrap');
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
@@ -13916,8 +14474,7 @@ async function main() {
     if (socialV2.paused) return;
     const st = getSocialV2State(key);
     if (!st.bootstrapSent) {
-      st.bootstrapSent = true;
-      saveSocialV2State();
+      // 同消息路径：先排队，真正投递时才在 sendWakePromptV2 里消费标记。
       scheduleWakeV2(key, 'bootstrap');
     } else if (st.wakeConfig?.triggers?.poke) {
       scheduleWakeV2(key, 'poke');
@@ -14713,11 +15270,13 @@ async function main() {
 
 process.on('SIGINT', () => {
   log('退出中…');
+  flushDecayStateOnExit();
   saveState();
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
+  flushDecayStateOnExit();
   saveState();
   releaseLock();
   process.exit(0);
@@ -14737,11 +15296,16 @@ process.on('unhandledRejection', (error) => {
  */
 process.on('uncaughtException', (error) => {
   try { log('致命异常（进程即将退出）:', error?.stack ?? error?.message ?? error); } catch {}
+  try { flushDecayStateOnExit(); } catch {}
   try { saveState(); } catch {}
   releaseLock();
   process.exit(1);
 });
-process.on('exit', () => releaseLock());
+process.on('exit', () => {
+  // 最后一道保险：正常 process.exit 之外的路径（比如主流程自然结束）也兜住。
+  try { flushDecayStateOnExit(); } catch {}
+  releaseLock();
+});
 
 main().catch((error) => {
   console.error('[bridge] 启动失败:', error);

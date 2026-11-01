@@ -27,6 +27,7 @@ import * as roleGuard from '../src/role-guard.js';
 import * as ownerMemory from '../src/owner-memory.js';
 import * as memoryDecay from '../src/memory-decay.js';
 import * as diaryCore from '../src/diary-core.js';
+import * as diaryGrade from '../src/diary-grade.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as quietHours from '../src/quiet-hours.js';
 // 「她自己的状态」：bridge.js 顶层 import 了 buildInnerLifeLines / proactiveFactor / tickLife，
@@ -272,6 +273,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     closeCorePromise: diaryCore.closePromise,
     CORE_INJECT_MAX_CHARS: diaryCore.CORE_INJECT_MAX_CHARS,
     CORE_KINDS: diaryCore.CORE_KINDS,
+    // 分级：bridge.js 的核层巩固用 ruleTags 判断「这条日记里有没有承诺/边界」。
+    ruleTags: diaryGrade.ruleTags,
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     // 免打扰时段：bridge.js 顶层 import 了这几个纯函数（主动冒泡排期要用），
     // VM 里没有 import 机制，必须显式注入，否则走到 scheduleProactiveCheckV2 就 ReferenceError。
