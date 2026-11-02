@@ -89,6 +89,16 @@ audio/
 # 媒体归一化的临时工作区（makeTempWorkspace 默认落在 state/tmp，避免用 %TEMP%）
 /state/tmp/
 
+# ── 测试临时目录（跑测试时把 TEMP/TMP 指向仓库内的落脚点）────────────────────
+# 为什么需要显式忽略：本机 C: 盘紧张，跑回归时会把 $env:TEMP / $env:TMP 指向
+# 仓库根下的 tmp/，让临时文件落在数据盘。代价是**测试夹具的产物进了仓库目录**——
+# setup / bridge-harness / diary 这些用例会 mkdtemp 出一堆目录，其中夹具里的
+# 配置文件含本机绝对路径，于是 privacy-scan 把它们当真实泄露扫出来（实测 4 条命中）。
+# 它们本来就不该入库（可重建、机器专用），与上面 state/tmp 同一条理由。
+/tmp/
+# 同名的一次性探针脚本（tmp-*.mjs 是当次调试用的，换环境就跑不通）
+/tmp-*.mjs
+
 # Local backups created before voice updates; may contain private configuration.
 /.voice-backup-*/
 
@@ -103,6 +113,14 @@ audio/
 /tools/rvc-aux/
 /tools/tts-aux/
 /tools/**/models/
+# vecsvc 的第三方 Python 依赖：pylibs(96MB/4603 文件) + _pkg-backup(49MB/2179 文件)。
+# 都能用 pip 按脚本现场重建，入库只会把仓库撑爆，并让 privacy-scan 报一屏第三方
+# 包自带的测试数据误报（urllib3 的 https://user:pass@ 样例、HF token 占位符等）。
+# 手写脚本 vec_server.py / qwen3_emb.py 要入库，不要整体忽略 tools/vecsvc/。
+/tools/vecsvc/pylibs/
+/tools/vecsvc/_pkg-backup/
+/tools/vecsvc/__pycache__/
+/tools/vecsvc/*.log
 *.pth
 *.onnx
 *.index
@@ -114,6 +132,10 @@ audio/
 /roles/*.pre-finalize-*
 /roles/*.bak-*
 
+# 本机专用人格卡：贴吧口吻，未定稿，且不属于随发行版交付的角色。
+# 与 roles/README.md、小鲸鱼.md、傲娇助手.md 三个已发布角色区分开。
+/roles/贴吧鱼.md
+
 # profile 配置回滚备份（setup-dsh.mjs / 改 preset 前手动拷的 cordis.yml 等）。
 # 里面是**本机绝对路径**和当时的完整 profile 配置，既是机器专用、又能被本机重建。
 # 与上面两条同一个理由：留着是为回滚，不是为了发布。
@@ -124,4 +146,15 @@ audio/
 # 一次性探查脚本：绑定了当次运行的端口/会话/产物，换个环境就跑不通。
 # 与上面「Local one-off dev/debug/patch scripts」同一条约定。
 /scripts/_probe-*.mjs
+
+# 通用：任何以 . 开头的本地备份/回滚快照目录。
+#
+# 这类目录是「改文件前拷一份」的产物，里面是**原样的完整源码与 config.json**——
+# 也就是说它必然带着本机绝对路径、accessToken、SESSDATA 这类凭据。不忽略它们时，
+# privacy-scan 会把它们当"将要提交的内容"扫出来（它扫 git ls-files + 未跟踪且未忽略的文件），
+# 于是一次正常的改代码会被 4 个测试报红（2026-10-30 实测：test-hardening / test-privacy-scan /
+# test-audit-setup-guards / test-audit 全因这一个原因失败）。
+# 备份本来就该放在仓库外（如 %TEMP%）；这条是兜底，防止下次又有谁顺手建在这里。
+/.backup-*/
+/.*-backup-*/
 
