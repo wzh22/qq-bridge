@@ -1875,6 +1875,53 @@ async function main() {
     log('ℹ️ 向量检索已在配置中关闭');
   }
 
+  // ── 向量索引的增量同步 ────────────────────────────────────────────────
+  //
+  // 只在启动时同步是不够的：新写的日记不会进索引，于是"刚发生的事"
+  // 反而查不到 —— 这是实测发现的问题（写入 2 条后索引仍是旧条数）。
+  //
+  // 策略是「写入后防抖 + 定时兜底」：
+  //   防抖：连着写多条时只重建一次（日记一天也就几条，成本可忽略）
+  //   兜底：服务重启/同步失败后，下一次定时会补上，不会永久漏
+  // 服务端按文本 sha256 缓存，没变的条目不会重算，所以定时同步几乎零开销。
+  //
+  // 全程「尽力而为」：失败只记一行日志，绝不影响日记本身落盘和检索。
+  let vectorSyncTimer = null;
+  let vectorSyncRunning = false;
+  async function runVectorSync(reason = '') {
+    if (cfg.vectorRecall?.enabled === false) return;
+    if (vectorSyncRunning) return;
+    vectorSyncRunning = true;
+    try {
+      if (!(await vectorAvailable())) return;
+      const all = [...diaryEntries, ...diaryOthersEntries];
+      if (!all.length) return;
+      const r = await syncVectorIndex(all);
+      if (r.ok && r.computed > 0) {
+        log(`🧠 向量索引已更新：${all.length} 条（新算 ${r.computed} 条${reason ? '，' + reason : ''}）`);
+      }
+    } catch (error) {
+      // 静默降级：bridge 会用纯关键词继续服务，用户无感。
+      // 只在日志留痕，方便事后排查"为什么记得不准"。
+      log(`ℹ️ 向量索引同步失败（不影响检索，将自动重试）：${error?.message ?? error}`);
+    } finally {
+      vectorSyncRunning = false;
+    }
+  }
+  function scheduleVectorSync(delayMs = 4000) {
+    if (cfg.vectorRecall?.enabled === false) return;
+    if (vectorSyncTimer) clearTimeout(vectorSyncTimer);
+    vectorSyncTimer = setTimeout(() => {
+      vectorSyncTimer = null;
+      runVectorSync('写入后').catch(() => {});
+    }, delayMs);
+  }
+  // 定时兜底：15 分钟一次。有 sha 缓存，没变化时服务端一行计算都不会做。
+  const vectorSyncInterval = setInterval(() => {
+    runVectorSync('定时兜底').catch(() => {});
+  }, 15 * 60 * 1000);
+  if (typeof vectorSyncInterval.unref === 'function') vectorSyncInterval.unref();
+
   // 记忆衰减状态。读失败**绝不**阻断日记功能：衰减状态丢了只是
   // 「所有记忆重新变新鲜」，比让桥接起不来、或让模型看不到日记强得多。
   // 所以这里只 log 一行，不设 writable 开关。
@@ -3093,6 +3140,8 @@ async function main() {
       }
     }
     log(`日记已写入[${forOwner ? '主人' : '他人'}]：[${result.entry.title}] (${result.entry.body.length} 字)`);
+    // 补进向量索引：不补的话"刚发生的事"反而检索不到（见 scheduleVectorSync 注释）。
+    scheduleVectorSync();
     return result;
   }
 
@@ -6735,10 +6784,10 @@ async function main() {
               names: voiceLibrary().slice(0, 12).map((v) => v.name),
               maxSeconds: voiceCfg().maxSeconds,
               synthesis: cfg.socialV2?.voice?.synthesis?.enabled === true,
+              // RVC 已于 2026-11-02 整体移除，音色只由 GPT-SoVITS 的参考音频与采样参数决定，
+              // 所以这里不再按 rvc.enabled 分叉，只有「能合成」和「只能用已有录音」两种说法。
               hint: cfg.socialV2?.voice?.synthesis?.enabled === true
-                ? (cfg.socialV2?.voice?.synthesis?.rvc?.enabled === true
-                  ? 'qq_send_voice(text=文字) 用 GPT-SoVITS 合成、再经 RVC 变声发出。唱歌仍不可用（RVC 只换音色、改不了旋律），不得声称能演唱歌曲。已有录音先 qq_list_voices 再用 voice=文件名发送。'
-                  : 'qq_send_voice(text=文字) 用 GPT-SoVITS 合成语音（RVC 变声未启用，发的是 TTS 原始音色）。唱歌仍不可用。已有录音先 qq_list_voices 再用 voice=文件名发送。')
+                ? 'qq_send_voice(text=文字) 用 GPT-SoVITS 合成语音发出。唱歌仍不可用（没有歌声合成引擎），不得声称能演唱歌曲。已有录音先 qq_list_voices 再用 voice=文件名发送。'
                 : '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             },
             // 「我现在是什么样、还能改成什么样」：让模型在动手改人格卡之前，
