@@ -7784,7 +7784,9 @@ async function main() {
               return;
             }
             const sent = await sendVoiceForV2(key, voiceRef, {
-              label: body.label ? String(body.label).slice(0,100) : (generated ? (generated.mode === 'sing' ? '电子合成短歌' : '文字合成语音') : ''),
+              // sing 在 normalizeSynthesis 就被拒了，generated.mode 不可能是 'sing'，
+              // 短歌那条 label 分支已不可达（2026-11-02 随 RVC 一起清掉）。
+              label: body.label ? String(body.label).slice(0,100) : (generated ? '文字合成语音' : ''),
               verify: body.verify, readback: body.readback,
               audio: (body.volume !== undefined || body.normalize === true || body.loudness !== undefined)
                 ? {volume:body.volume,normalize:body.normalize===true,loudness:body.loudness} : null

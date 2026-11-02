@@ -8,7 +8,8 @@ import { generateVoice, normalizeSynthesis, encodeWave } from '../src/voice-synt
 import { inspectAudio, cleanupTemp } from '../src/voice-core.js';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 
-// espeak 已删除（2026-10-25）：说话只有 GPT-SoVITS 一条路，唱歌暂时拒绝。
+// espeak 已删除（2026-10-25），RVC 变声也已移除（2026-11-02）：
+// 说话只有 GPT-SoVITS 一条路，唱歌保持拒绝（没有可用的歌声合成引擎）。
 // 这里起一个本地假 SoVITS 服务，验证「配置 → 请求 → 校验 WAV → 落盘」整条链路。
 const RATE = 16000;
 
@@ -50,7 +51,7 @@ test('espeak is gone: wrong provider and any singing are refused', async () => {
       generateVoice({ text: '你好' }, { dir, synthesis: { provider: 'espeak' } }),
       /只支持 gpt-sovits/
     );
-    // 唱歌整条路径关闭，等待 RVC。
+    // 唱歌整条路径关闭：没有歌声合成引擎，RVC 变声已于 2026-11-02 整体移除，不再等它。
     await assert.rejects(generateVoice({ mode: 'sing', song: '小星星' }, { dir }), /已停用/);
     await assert.rejects(generateVoice({ mode: 'sing', text: '一二三四' }, { dir }), /已停用/);
     assert.equal(fs.readdirSync(dir).length, 0);

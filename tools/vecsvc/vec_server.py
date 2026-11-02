@@ -40,7 +40,12 @@ sys.path.insert(0, _HERE)
 
 import numpy as np
 
-DEFAULT_MODEL_DIR = r"E:\dsh\qq-bridge\tools\models\Qwen3-Embedding-0.6B"
+# 模型目录按脚本位置推导（tools/vecsvc → ../models/），不写死本机盘符：
+# 写死 `E:\...` 既会让隐私扫描把本机路径判成泄露，换台机器 clone 下来也直接跑不起来。
+# 模型放在别处时用环境变量 VEC_MODEL_DIR 覆盖。
+DEFAULT_MODEL_DIR = os.environ.get("VEC_MODEL_DIR") or os.path.normpath(
+    os.path.join(_HERE, "..", "models", "Qwen3-Embedding-0.6B")
+)
 DEFAULT_CACHE = os.path.join(_HERE, "state", "emb-cache.npz")
 MAX_LEN = 512
 OUT_DIM = 1024

@@ -24,11 +24,14 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
     'mcp__snowluma_host__snowluma_status', 'mcp__web-search-safe__web_fetch']) {
     assert.equal(guard({ name }), undefined, `${preset}: expected allowed ${name}`);
   }
-  // 连字符形态不该被放行：DSH 不会注册这个名字，放行它只会扩大攻击面而不提供功能。
-  for (const presetUnused of [0]) {
-    void presetUnused;
-    assert.equal(typeof guard({ name: 'mcp__snowluma-host__snowluma_status' }), 'string',
-      `${preset}: 连字符形态不该在白名单里（真实名字是下划线）`);
+  // 连字符形态**要**放行，别再改回「拒绝」。
+  // 2026-11-02 复核 state/tool-calls.jsonl.1：实际被注册并调用的是
+  // `mcp__snowluma-host__*`（连字符 14 条 / 下划线 0 条），当前 DSH 会话暴露的
+  // 工具名也是连字符。早先「实测是下划线」的结论随 DSH 版本变化已不再成立；
+  // DSH 0.2.1 适配时把两种形态都放进白名单是为了跨版本都能用，
+  // 拒绝连字符等于把当下真正在用的工具全部拦掉。
+  for (const name of ['mcp__snowluma-host__snowluma_status', 'mcp__snowluma_host__snowluma_status']) {
+    assert.equal(guard({ name }), undefined, `${preset}: 连字符/下划线两种形态都应放行（${name}）`);
   }
   for (const name of ['web_fetch', 'web_search', 'bash', 'read_file', 'dev_future_tool',
     'mcp__untrusted__web_fetch', '', null, undefined]) {

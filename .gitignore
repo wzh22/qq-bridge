@@ -115,7 +115,7 @@ audio/
 /tools/**/models/
 # vecsvc 的第三方 Python 依赖：pylibs(96MB/4603 文件) + _pkg-backup(49MB/2179 文件)。
 # 都能用 pip 按脚本现场重建，入库只会把仓库撑爆，并让 privacy-scan 报一屏第三方
-# 包自带的测试数据误报（urllib3 的 https://user:pass@ 样例、HF token 占位符等）。
+# 包自带的测试数据误报（urllib3 里的"带账号密码的示例 URL"、HF token 占位符等）。
 # 手写脚本 vec_server.py / qwen3_emb.py 要入库，不要整体忽略 tools/vecsvc/。
 /tools/vecsvc/pylibs/
 /tools/vecsvc/_pkg-backup/

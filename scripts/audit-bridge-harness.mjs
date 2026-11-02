@@ -35,6 +35,9 @@ import * as quietHours from '../src/quiet-hours.js';
 // 的用例都会 ReferenceError（表现为「唤醒 prompt 生不出来」这类假失败）。
 import * as innerLife from '../src/inner-life.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
+// 向量召回（日记的「关键词 + 语义」混合检索）：bridge.js 顶层按别名导入了这批函数，
+// VM 里没有 import 机制，必须在这里引入、并在 context 里按别名绑定。
+import * as vectorRecall from '../src/vector-recall.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {} } = {}) {
@@ -291,6 +294,20 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     sniffImage: mediaNormalize.sniffImage,
     planNormalization: mediaNormalize.planNormalization,
     planAnimation: mediaNormalize.planAnimation,
+    // 向量召回：bridge.js 顶层是**别名**导入（`setLogger as setVectorLogger`、
+    // `configure as configureVector` …）。所以这里必须按别名逐个绑定，不能展开：
+    // 展开注入的是 setLogger / configure / status 这些通用名，既对不上 bridge.js
+    // 里真正调用的名字，又容易和 context 里已有名字撞车。
+    // 漏注入的后果：bridge.js 顶层的 setVectorLogger(log) 直接 ReferenceError，
+    // 于是所有走 bridgeHarness 的用例一起变红，而堆栈指向本文件 ——
+    // 看着像被测逻辑坏了，实际只是这里少绑了几个名字（同一类坑见上面 ownerMemory /
+    // memoryDecay / diaryCore 的注释）。
+    setVectorLogger: vectorRecall.setLogger,
+    configureVector: vectorRecall.configure,
+    syncVectorIndex: vectorRecall.syncIndex,
+    vectorAvailable: vectorRecall.isAvailable,
+    vectorStatus: vectorRecall.status,
+    vectorHybridSearch: vectorRecall.hybridSearch,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),

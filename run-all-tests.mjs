@@ -22,7 +22,7 @@ const FAST = argv.includes('--fast');
 const filterIdx = argv.indexOf('--filter');
 const FILTER = filterIdx >= 0 ? argv[filterIdx + 1] : null;
 
-// 这些测试要么依赖外部服务（语音合成、RVC、GIF 编解码），要么要起浏览器，
+// 这些测试要么依赖外部服务（语音合成、GIF 编解码），要么要起浏览器，
 // 单跑几分钟且容易因环境缺件失败。--fast 时跳过，但**不算通过**，
 // 单独列为 skipped 并在末尾明确报出来，避免「跳过」被读成「通过」。
 //
@@ -35,7 +35,7 @@ const FILTER = filterIdx >= 0 ? argv[filterIdx + 1] : null;
 //   即便有人把它加回 --fast，也不会在没显式 --allow-live 时动生产。
 const SLOW = new Set([
   'test-voice', 'test-voice-gui', 'test-voice-system', 'test-voice-synthesis',
-  'test-voice-preview', 'test-voice-volume', 'test-gpt-sovits', 'test-rvc',
+  'test-voice-preview', 'test-voice-volume', 'test-gpt-sovits',
   'test-gif-e2e', 'test-media-search', 'test-vision-media', 'test-console-ui',
   'test-console', 'test-dsh-session-retire', 'test-mux-reconnect', 'test-onebot-connection',
   'test-snowluma-upstream-health', 'test-diary-e2e', 'test-owner-memory-e2e',

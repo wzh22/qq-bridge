@@ -1544,7 +1544,7 @@ if (cfg.socialV2?.tools?.sendQzone !== false) {
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
-    '发送 QQ 语音。两种用法：① text=要说的话（1–400字），由 GPT-SoVITS 自然音色合成；② voice=qq_list_voices 返回的文件名，发送已有录音。voice 与 text 不能同时使用。唱歌（mode=sing）已停用，等接入 RVC 后再开放；不要声称能唱任意歌曲，没有录音就如实说明。保持 verify=true；只有返回 verified=true 才可确认语音已落地。只能在白名单会话发，受时长和频率限制。',
+    '发送 QQ 语音。两种用法：① text=要说的话（1–400字），由 GPT-SoVITS 自然音色合成；② voice=qq_list_voices 返回的文件名，发送已有录音。voice 与 text 不能同时使用。唱歌（mode=sing）已停用：没有歌声合成引擎，不要声称能唱任意歌曲，没有录音就如实说明。保持 verify=true；只有返回 verified=true 才可确认语音已落地。只能在白名单会话发，受时长和频率限制。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
