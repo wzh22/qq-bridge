@@ -74,6 +74,72 @@ console.log('## sticker-lib 纯函数');
   ok(buildStickerStrategyHint().includes('qq_send_sticker'), '策略提示包含发送工具');
 }
 
+// ── 表情摘要的三道体积闸 ───────────────────────────────────────────────
+// 背景：主人担心「表情一多，这张表会把每个会话的提示词撑大」。
+// 三道闸各管一件事，缺一道都会漏：条目上限挡不住长备注、字符预算挡不住
+// 「没备注的表情全列出来」、命名阈值挡不住收藏数慢慢涨。
+console.log('## 表情摘要体积闸');
+{
+  const mk = (i, extra = {}) => normalizeStickerEntry({
+    emoji_id: `id${i}`, resId: `id${i}`, url: `https://x/${i}`, md5: `M${i}`,
+    ...extra
+  });
+
+  // ① 条目上限：只取 max 条，其余不再出现。
+  {
+    const many = Array.from({ length: 12 }, (_, i) => mk(i, { alias: `别名${i}` }));
+    const ctx = buildStickerContext(many, 5);
+    ok(!ctx.includes('6. 别名5'), '条目上限：第 6 条起不列');
+    ok(ctx.includes('别名0') && ctx.includes('别名4'), '条目上限：前 5 条都在');
+    ok(ctx.includes('另有 7 个没列出'), '条目上限：注明省略数量');
+  }
+
+  // ② 字符预算：备注很长时按字符截断，不会无限膨胀。
+  {
+    const longNote = '很长的备注'.repeat(30); // 180 字
+    const many = Array.from({ length: 20 }, (_, i) => mk(i, { alias: `A${i}`, localNote: longNote }));
+    const ctx = buildStickerContext(many, 20, { maxChars: 400 });
+    // 正文（去掉表头/表尾）必须落在预算内
+    const body = ctx.split('\n').filter((l) => /^\d+\. /.test(l));
+    const bodyLen = body.join('\n').length;
+    ok(bodyLen <= 400 + 60, `字符预算：正文 ${bodyLen} 字被压在 400 附近`);
+    ok(body.length >= 1 && body.length < 20, `字符预算：实际列了 ${body.length} 条（少于 20）`);
+    // 单条备注必须被截短，不能一条占满整张表
+    const firstLine = body[0] || '';
+    ok(firstLine.length < 120, `单条备注已截短（${firstLine.length} 字）`);
+    ok(firstLine.endsWith('…'), '长备注以省略号收尾，提示被截断');
+  }
+
+  // ③ 命名阈值：收藏超过阈值后，没备注的不再列进表里。
+  {
+    // 阈值 40：25 个没备注 + 5 个有备注 = 30 条，总数没超阈值 → 全列
+    const under = [...Array.from({ length: 25 }, (_, i) => mk(i)), ...Array.from({ length: 5 }, (_, i) => mk(100 + i, { alias: `有备注${i}` }))];
+    const ctxUnder = buildStickerContext(under, 60, { namedOnlyThreshold: 40 });
+    ok(ctxUnder.includes('#1') || ctxUnder.includes('#2'), '命名阈值：总数未超时，没备注的也列出');
+
+    // 总数 45 超过阈值 → 只列有备注的 5 条
+    const over = [...Array.from({ length: 40 }, (_, i) => mk(i)), ...Array.from({ length: 5 }, (_, i) => mk(200 + i, { alias: `有备注${i}` }))];
+    const ctxOver = buildStickerContext(over, 60, { namedOnlyThreshold: 40 });
+    ok(ctxOver.includes('有备注0') && ctxOver.includes('有备注4'), '命名阈值：超阈值时保留有备注的');
+    ok(!/(^|\n)\d+\. #\d+/m.test(ctxOver), '命名阈值：超阈值时不再列「#序号」这种无名条目');
+    ok(ctxOver.includes('还没起备注'), '命名阈值：提示有多少个没起备注');
+
+    // 全库都没备注时必须退回全列，否则表会空掉
+    const allUnnamed = Array.from({ length: 45 }, (_, i) => mk(i));
+    const ctxBare = buildStickerContext(allUnnamed, 60, { namedOnlyThreshold: 40 });
+    ok(/(^|\n)\d+\. #\d+/m.test(ctxBare), '命名阈值：全都没备注时退回全列（不留空表）');
+  }
+
+  // 参数容错：坏值不能把表变成空串或直接抛错。
+  {
+    const one = [mk(0, { alias: '唯一' })];
+    ok(buildStickerContext(one, 0).includes('唯一'), 'max=0 时退回默认值而不是空表');
+    ok(buildStickerContext(one, 'abc').includes('唯一'), 'max 非数字时退回默认值');
+    ok(buildStickerContext(one, 8, { maxChars: 'x' }).includes('唯一'), 'maxChars 非数字时退回默认值');
+    ok(buildStickerContext([], 8) === '', '空库返回空串');
+  }
+}
+
 {
   const list = mergeStickerLibrary([], [
     { emoji_id: 'a', resId: 'a', url: 'https://x/a', md5: 'ABC', desc: '笑死' }
@@ -92,9 +158,25 @@ console.log('## 配置文件');
   ok(tools.getStickerImage === true, 'config getStickerImage=true');
   ok(tools.sendSticker === true, 'config sendSticker=true');
   ok(tools.stickerNote === true, 'config stickerNote=true');
-  ok(tools.setStickerRemark === false, 'config setStickerRemark=false（默认禁用）');
   ok(cfg.socialV2?.sticker?.enabled === true, 'config sticker.enabled=true');
   ok(!('sendCaptionMaxChars' in (cfg.socialV2?.sticker ?? {})), 'config sticker 不再包含 sendCaptionMaxChars');
+
+  // setStickerRemark 这里**不能**断言 config.json 的值。
+  // 它是「默认关闭的高风险开关」，但**开不开由主人/控制台决定**，属于运行期配置，
+  // 会随运维操作变化（本机就已被打开）。早期这条写成
+  //   ok(tools.setStickerRemark === false, 'config setStickerRemark=false（默认禁用）')
+  // 于是在主人自己打开它就变红，而红的原因跟「表情功能是否正常」毫无关系 ——
+  // 把运维决定当代码契约，测试就会替主人做决定。
+  //
+  // 该守的是**代码里的默认值**：新装一份（config 里没写这一项）时必须是关的，
+  // 否则「一次控制台保存就把风险操作静默打开」那个老坑会回来。
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const defaultHits = [...bridgeSrc.matchAll(/setStickerRemark:\s*(true|false)/g)].map((m) => m[1]);
+  ok(defaultHits.length >= 2, `代码里应有两处默认值定义（实际 ${defaultHits.length}）`);
+  ok(defaultHits.every((v) => v === 'false'), `setStickerRemark 代码默认必须是 false，实际 ${defaultHits.join('/')}`);
+  // 归一化兜底那段的关键不变量：文件里没写该键时，不得被写成 true。
+  ok(/current\.tools\?\.\[k\]\s*!==\s*false/.test(bridgeSrc),
+    '工具开关归一化应以「当前生效配置」兜底，而不是默认 true');
 }
 
 console.log('## 表情单气泡约束');

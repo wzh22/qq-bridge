@@ -63,6 +63,8 @@ const DEFAULT_RULES = {
     //    今后新增的真实泄漏不会被扫出来。要收紧，正确做法是给扫描器加
     //    「文件 + 规则名」粒度（或让凭据规则只认高熵字面量），而不是继续往这里加文件。
     'docs/guides/PRIVACY.md', 'src/bridge.js', 'src/dsh-client.js',
+    // 一次性 codemod：其中旧绝对路径是「要被替换的输入」，不是当前部署配置。
+    'corpus/scripts/migrate-collect-paths.mjs',
   ],
 };
 
@@ -219,7 +221,13 @@ for (const rel of files) {
   // ② 内容级：一个文件里同一规则最多报 3 处（带行号），方便直接定位；不要把整文件刷屏。
   for (const rule of rules.deny) {
     let re;
-    try { re = new RegExp(rule.pattern, rule.flags ?? 'g'); }
+    try {
+      // 必须始终全局扫描。flags 为 '' 时若原样传入，RegExp.exec 会反复
+      // 返回同一个匹配；噪音过滤后又不会增加 hits，最终误报「5000 次过多」
+      // 并提前跳过这个文件的后续内容。
+      const flags = rule.flags ?? '';
+      re = new RegExp(rule.pattern, flags.includes('g') ? flags : `${flags}g`);
+    }
     catch (error) { console.error(`[privacy-scan] 规则「${rule.name}」正则非法：${error.message}`); continue; }
     re.lastIndex = 0;
     let m;

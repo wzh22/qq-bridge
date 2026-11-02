@@ -1,5 +1,5 @@
-// 注：本文件里的 E:\dsh\... 是**测试输入数据**（模拟的进程命令行），
-// 故意保留绝对路径形态，不要替换成 ROOT/runtimeDir——
+// 注：本文件里的 C:\qq-bridge-test\... 是**虚构测试输入**（模拟进程命令行），
+// 故意保留固定的绝对路径形态，不要替换成 ROOT/runtimeDir——
 // 换成动态路径会让测试输入随部署变化，度量意义就没了。
 // 守护逻辑自测：证明 findCollector 真的能区分「采集器活着」「只有守护自己」「都死了」。
 //
@@ -67,9 +67,9 @@ if (pids === null) {
 console.log('\n=== 2. 自我排除：模拟只有守护在场时必须返回空 ===');
 // 直接构造假命令行验证过滤规则，不依赖机器上真实跑了什么
 const FAKE = [
-  { pid: '111', cmd: '"node.exe" E:\\dsh\\qq-bridge\\state\\corpus\\guard-longrun.mjs --until 2026-10-25T11:30:00+08:00' },
-  { pid: '222', cmd: '"node.exe" E:\\dsh\\qq-bridge\\state\\corpus\\longrun.mjs --until 2026-10-25T11:30:00+08:00' },
-  { pid: '333', cmd: '"node.exe" E:\\dsh\\qq-bridge\\src\\bridge.js' },
+  { pid: '111', cmd: '"node.exe" C:\\qq-bridge-test\\state\\corpus\\guard-longrun.mjs --until 2026-10-25T11:30:00+08:00' },
+  { pid: '222', cmd: '"node.exe" C:\\qq-bridge-test\\state\\corpus\\longrun.mjs --until 2026-10-25T11:30:00+08:00' },
+  { pid: '333', cmd: '"node.exe" C:\\qq-bridge-test\\src\\bridge.js' },
 ];
 function simulate(lines) {
   const hits = [];

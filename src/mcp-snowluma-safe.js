@@ -333,6 +333,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_diary_write: 'diary',
   qq_diary_recall: 'diary',
   qq_diary_correct: 'diary',
+  qq_diary_core: 'diary',
+  qq_diary_promise_close: 'diary',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
@@ -363,6 +365,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_role_propose: 'roleEvolve',
   qq_role_apply: 'roleEvolve',
   qq_owner_inbox: 'ownerInbox',
+  qq_self_runtime: 'selfRuntime',
 };
 const disabledTools = [];
 {
@@ -427,6 +430,28 @@ const bootBridgeMode = (() => {
 const registerLegacyReadTools = bootBridgeMode === '' || bootBridgeMode === 'closed-agent';
 if (!registerLegacyReadTools) {
   console.error(`[snowluma-safe] 当前桥接模式 ${bootBridgeMode}：不注册旧只读工具（qq_list_groups / qq_get_group_history），改用带令牌的 v2 读工具`);
+}
+
+// ── 旧发送工具：同样按启动模式裁剪 ─────────────────────────────────────────
+//
+// 这两个（qq_send_group_message / qq_reply / qq_send_private_message）走 /api/send/*，
+// 在 bridge.js 里明确放行 closed-agent 与 reserved2 两种模式；而 qq_send_message 走
+// /api/socialV2/send-message，那里写着 `currentMode !== 'reserved2' ⇒ 403`。
+//
+// 也就是说两者是**模式互补、不是重复**：
+//   · reserved2：qq_send_message 一个就够——它同时支持单发/多条、replyToMessageId 引用、
+//     atUserId 点名、gapMode 间隔，三个旧工具的每一项能力都被它覆盖；
+//   · closed-agent：qq_send_message 根本不可用，这三个是唯一的发送途径，必须留着。
+//   · chat / reserved（一代）：三个旧工具在 bridge.js 里也是必然 403（见「发送工具仅限
+//     closed-agent / reserved2 模式使用」），注册了只会诱导误调。
+//
+// 所以只在 reserved2 下跳过它们。省下的是每轮固定重发的 schema，closed-agent 的管理能力
+// 一点没动。qq_send_burst 不在这一组：它走 /api/socialV2/send-burst，`仅 reserved2 可用`，
+// 且被 qq_send_message 的数组模式完全覆盖（连 splitBySpaces 分条规则都一样），
+// 所以在任何模式下都没有存在必要，直接删除（见那条注释）。
+const registerLegacySendTools = bootBridgeMode === '' || bootBridgeMode === 'closed-agent';
+if (!registerLegacySendTools) {
+  console.error(`[snowluma-safe] 当前桥接模式 ${bootBridgeMode}：不注册旧发送工具（qq_send_group_message / qq_reply / qq_send_private_message），统一用 qq_send_message`);
 }
 
 if (registerLegacyReadTools) {
@@ -515,9 +540,10 @@ server.tool(
 );
 }
 
+if (registerLegacySendTools) {
 server.tool(
   'qq_send_group_message',
-  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。reserved2 下优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
@@ -588,6 +614,7 @@ server.tool(
     }
   }
 );
+}
 
 // ── 二代仿真模式（reserved2）工具 ─────────────────────────────────────────
 server.tool(
@@ -709,47 +736,14 @@ server.tool(
   }
 );
 
-server.tool(
-  'qq_send_burst',
-  '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。注意：数组里的每个字符串就是一条 QQ 消息，字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。',
-  {
-    groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
-    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串')
-  },
-  async ({ groupId, token, messages }) => {
-    try {
-      const key = `group:${groupId}`;
-      let finalMessages = messages;
-      if (typeof finalMessages === 'string') {
-        const trimmed = finalMessages.trim();
-        // 兼容模型把数组序列化成 JSON 字符串传入的情况，例如 "[...]"。
-        if (trimmed.startsWith('[')) {
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (Array.isArray(parsed)) finalMessages = parsed.map(String);
-          } catch {}
-        } else if (trimmed.startsWith('"')) {
-          // 兼容模型把单条消息序列化成 JSON 字符串的情况，例如 "\"你好\"" → "你好"。
-          try {
-            const parsed = JSON.parse(trimmed);
-            if (typeof parsed === 'string') finalMessages = parsed;
-            else if (Array.isArray(parsed)) finalMessages = parsed.map(String);
-          } catch {}
-        }
-      }
-      const data = await agentApi('/api/socialV2/send-burst', {
-        method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages }),
-        headers: { 'x-agent-token': token },
-        timeoutMs: 300000
-      });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `分条发送失败：${error?.message ?? error}` }], isError: true };
-    }
-  }
-);
+// qq_send_burst 已删除（2026-10-30，省工具上下文）。
+//
+// 它走 /api/socialV2/send-burst，那个端点在 bridge.js 里写着「该接口仅 reserved2 模式可用」；
+// 而 reserved2 下 qq_send_message 的数组模式做的是同一件事：同样 splitBySpaces 按空格分条、
+// 同样 mergeTailToLimit 合并超限尾部、同样 computeGapsV2 算间隔，还多了 replyToMessageId 引用
+// 和 atUserId 点名——正是 qq_send_burst 明确不支持的两项（它自己都在报错里写"请使用 qq_reply"）。
+// 也就是说它在**任何**模式下都没有独有能力：reserved2 被 qq_send_message 完全覆盖，
+// 其它模式它必然 403。桥接侧的 /api/socialV2/send-burst 端点保留（控制台与旧调用仍可用）。
 
 server.tool(
   'qq_send_message',
@@ -873,23 +867,13 @@ server.tool(
   }
 );
 
-server.tool(
-  'qq_get_my_recent_messages',
-  '查看自己最近发过的消息（只读），避免重复/保持人设。',
-  {
-    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
-    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    limit: z.number().optional().describe('最多返回条数，默认 10，最大 50')
-  },
-  async ({ key, token, limit }) => {
-    try {
-      const data = await agentApi(`/api/socialV2/my-recent?key=${encodeURIComponent(key)}&limit=${limit ?? 10}`, { headers: { 'x-agent-token': token } });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `获取自己消息失败：${error?.message ?? error}` }], isError: true };
-    }
-  }
-);
+// qq_get_my_recent_messages 已删除（2026-10-30，省工具上下文）。
+//
+// bridge.js 的 /api/socialV2/my-recent 实现是 `st.recentMessages.filter(m => m.isSelf).slice(-limit)`，
+// 而 qq_get_recent_messages 走 /api/socialV2/recent，返回的就是同一个 recentMessages 数组
+// （每条都带 isSelf 标记，调用方自己筛即可）——两者是同一个数据源的子集/全集关系，
+// 单独留一个"只看自己"的入口只是让模型多一个选择、多一份 schema。
+// 端点与开关（getMyRecent）保留，控制台与旧调用仍可用。
 
 server.tool(
   'qq_get_message_detail',
@@ -1196,6 +1180,73 @@ server.tool(
 );
 
 server.tool(
+  'qq_diary_core',
+  '查看或补充「我该记住的」——从日记里提炼出的、不该被遗忘的事：答应过但没做的事、绝对不做的事、我们的关系、他的喜好。这一层常驻记忆、**不会随时间淡忘**（普通日记会）。用来确认「我到底答应过他什么」时查这里，比翻日记准。也可以在发现自己答应了新事情、或对方明确了新边界时主动补一条（**只能在私聊里用**）。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    action: z.enum(['list', 'add']).optional().describe('list=查看（默认），add=补充一条'),
+    kind: z.enum(['promise', 'boundary', 'relation', 'preference']).optional().describe('add 时必填：promise=答应过还没做的事，boundary=绝对不做的事，relation=我们的关系，preference=他的喜好'),
+    text: z.string().optional().describe('add 时必填。40 字以内，第一人称陈述，例：「答应给他发一条QQ空间说说」'),
+    status: z.enum(['open', 'done', 'dropped']).optional().describe('list 时可按状态过滤')
+  },
+  async ({ key, token, action, kind, text, status }) => {
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：核层只在私聊里可读写。群聊会话不提供日记能力。' }],
+        isError: true
+      };
+    }
+    try {
+      if (action === 'add') {
+        const data = await agentApi('/api/socialV2/diary/core', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'add', kind, text }),
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      }
+      const params = new URLSearchParams({ key });
+      if (kind) params.set('kind', kind);
+      if (status) params.set('status', status);
+      const data = await agentApi(`/api/socialV2/diary/core?${params.toString()}`, { headers: { 'x-agent-token': token } });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `核层操作失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_diary_promise_close',
+  '把一条「答应过的事」标成完成或不再做。**只有真的做完了才调用**——这条会从常驻记忆里撤下，之后你就不会再记得还欠着这件事。不确定做没做时先不要关，宁可留着。做法：先用 qq_diary_core 查到 id，再调用本工具。',
+  {
+    key: z.string().describe('会话 key，格式 private:QQ号'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    id: z.string().describe('要关闭的承诺 id（来自 qq_diary_core 的结果）'),
+    status: z.enum(['done', 'dropped']).optional().describe('done=做完了（默认），dropped=不做了')
+  },
+  async ({ key, token, id, status }) => {
+    if (!/^private:\d+$/.test(String(key ?? ''))) {
+      return {
+        content: [{ type: 'text', text: '拒绝：日记能力只在私聊中提供。' }],
+        isError: true
+      };
+    }
+    try {
+      const data = await agentApi('/api/socialV2/diary/core', {
+        method: 'POST',
+        body: JSON.stringify({ key, token, action: 'close', id, status: status || 'done' }),
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `关闭承诺失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'qq_slang_query',
   '查看当前已确认的群聊黑话/梗/网络表达（只读）。返回已确认词条列表和格式化黑话表；遇到不熟悉的词可先查这里，再决定是否搜索/使用。',
   {
@@ -1340,11 +1391,11 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人闲聊时常用表情包，自然就好；正事/严肃话题少发。',
+    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。**stickerId 直接填唤醒提示里【可用表情包】表上的别名就行（如 "木鱼"、"无语"、"啃西瓜"），不必先 qq_list_stickers**；也接受完整 emoji_id / md5 / URL。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人闲聊时常用表情包，自然就好；正事/严肃话题少发。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
+      stickerId: z.string().describe('表情标识：优先填【可用表情包】表里的别名；也接受 emoji_id / md5 / 图片 URL'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
@@ -1752,29 +1803,14 @@ if (cfg.socialV2?.tools?.roleEvolve !== false) {
     }
   );
 
-  server.tool(
-    'qq_role_observe',
-    '记下一条群友发言当学习素材（谁说的、说了什么、是不是在说我）。这只是素材，不会直接改你的人格。桥接已经在每条群消息上自动记录，**通常不需要手动调用**；只有在想补记一条特别值得留意的发言（例如某人对你风格的完整评价）时才用。',
-    {
-      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
-      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      speaker: z.string().describe('说话人的群名片/昵称'),
-      text: z.string().describe('发言原文（不要改写）'),
-      aimedAtBot: z.boolean().optional().describe('这句话是不是在说你（被@、被引用、点了你的名字）')
-    },
-    async ({ key, token, speaker, text, aimedAtBot }) => {
-      try {
-        const data = await agentApi('/api/roles/evo/observation', {
-          method: 'POST',
-          body: JSON.stringify({ key, token, speaker, text, aimedAtBot: Boolean(aimedAtBot) }),
-          headers: { 'x-agent-token': token }
-        });
-        return { content: [{ type: 'text', text: serializeModelData(data) }] };
-      } catch (error) {
-        return { content: [{ type: 'text', text: `记录观察失败：${error?.message ?? error}` }], isError: true };
-      }
-    }
-  );
+  // qq_role_observe 已删除（2026-10-30，省工具上下文）。
+  //
+  // 它唯一的用途是「手动补记一条群友发言」，但 bridge.js 在每条群消息到达时都会自动
+  // appendObservation（见 13918 附近的注释：异步、失败不影响投递），写入的字段
+  // （key/kind/speaker/speakerId/text/aimedAtBot/at）比手动调用还全，aimedAtBot 也是
+  // 由 isDirectAddress + quoteTargetIsSelf 自动判定的。也就是说它的能力被"自动记录"100% 覆盖，
+  // 手动调用只会在同一条消息上产生重复条目、污染观察样本。
+  // 服务端 /api/roles/evo/observation 保留（控制台与旧调用仍可用）。
 
   server.tool(
     'qq_role_feedback',
@@ -1853,6 +1889,42 @@ if (cfg.socialV2?.tools?.roleEvolve !== false) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `应用提案失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  // 「看看我自己现在怎么运转的」。
+  //
+  // 2026-10-29 扩权（主人选方案 A：开一部分，但不开 shell）。这不是让她读写配置文件，
+  // 而是给一个**只读、字段白名单**的自省窗口：
+  //   · 她能知道自己的发送上限在哪、还剩多少额度、主动模式开没开、人格卡占多少字符；
+  //   · 拿不到任何密钥、本机路径、模型凭据（那些在 config.json 里，这个端点压根不返回）；
+  //   · 只读，不改任何状态。
+  // 为什么值得单独做一个：以前她撞到发送频率上限时，只看到一句失败，不知道天花板是多少、
+  // 也不知道自己刚才发了几条——于是只能反复试探。有了这个，她可以自己判断"我是不是该慢点"。
+  server.tool(
+    'qq_self_runtime',
+    '查看你自己当前的运行状态（只读）：当前模式、是否为主人私聊、人格卡注入字符数、'
+    + '发送频率上限（每分钟/每小时/单条字数/连发条数）、你本会话最近一分钟和一小时已发多少条、'
+    + '唤醒与主动开口配置、工具开关数量。'
+    + '用途：撞到发送上限时先看这里，判断该慢一点还是等一会儿；不确定自己能不能主动开口时也可查。'
+    + '不返回任何密钥、路径或凭据；这是只读工具，不能改任何设置。'
+    + '可用 names 只取某几项（如 names="send,session"），不传则返回全部。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      names: z.string().optional().describe('可选：逗号分隔的字段名，如 "send,session,wake"；不传返回全部')
+    },
+    async ({ key, token, names }) => {
+      try {
+        const q = new URLSearchParams({ key });
+        if (names) q.set('names', names);
+        const data = await agentApi(`/api/socialV2/self-runtime?${q.toString()}`, {
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查询自身状态失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

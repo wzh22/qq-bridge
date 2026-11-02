@@ -471,3 +471,46 @@ export function readArchiveSince(file, offset = 0, { maxLines = 500 } = {}) {
   }
   return { records, nextOffset: start + slice.length, totalLines: lines.length };
 }
+
+/**
+ * 从共享归档里读取某个会话的一批记录。
+ *
+ * 归档按时间混合保存多个 key。只读一个固定窗口再过滤时，如果窗口里都是别的
+ * 会话，目标 key 的水位就会一直停在原地。这里持续向后扫描，直到攒够
+ * minRecords 条目标记录、读到文件尾，或触及防御性批次上限。
+ *
+ * nextOffset 始终是「本批实际扫描到的全局行号」，不是稍后的实时文件尾。
+ * 调用方在模型整理成功后应推进到这个位置，这样等待模型期间新追加的消息
+ * 会留给下一批，不会被悄悄跳过。
+ */
+export function readArchiveForKey(file, offset = 0, {
+  key,
+  maxLines = 100,
+  minRecords = 1,
+  predicate = () => true,
+  maxBatches = 1000,
+} = {}) {
+  const target = Math.max(1, Number(minRecords) || 1);
+  const batchSize = Math.max(1, Number(maxLines) || 100);
+  const batchLimit = Math.max(1, Number(maxBatches) || 1000);
+  const records = [];
+  let cursor = Math.max(0, Number(offset) || 0);
+  let nextOffset = cursor;
+  let totalLines = cursor;
+  let batches = 0;
+
+  while (batches < batchLimit) {
+    const batch = readArchiveSince(file, cursor, { maxLines: batchSize });
+    batches += 1;
+    nextOffset = batch.nextOffset;
+    totalLines = Number(batch.totalLines) || 0;
+    for (const record of batch.records) {
+      if (record && record.key === key && predicate(record)) records.push(record);
+    }
+    if (records.length >= target) break;
+    if (nextOffset >= totalLines || nextOffset <= cursor) break;
+    cursor = nextOffset;
+  }
+
+  return { records, nextOffset, totalLines, batches };
+}

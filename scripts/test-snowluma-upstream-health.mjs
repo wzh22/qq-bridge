@@ -119,11 +119,17 @@ test('good 取自心跳 status.good / get_status —— 绝不能取自 get_logi
   assert.match(bridgeCode, /meta_event_type === 'heartbeat'/, '必须识别 meta_event/heartbeat');
   assert.match(bridgeCode, /event\.status\?\.good/, '必须从心跳载荷读 status.good（主信号）');
   assert.match(bridgeCode, /noteReceiveHealth\(/, '心跳/轮询都必须经 noteReceiveHealth 归一记录');
-  // 反面：不得再从 get_login_info 取 good
-  const loginCall = bridgeCode.slice(
-    Math.max(0, bridgeCode.indexOf('/get_login_info') - 400),
-    bridgeCode.indexOf('/get_login_info') + 900,
-  );
+  // 反面：不得再从 get_login_info 取 good。
+  // 窗口要精确到「get_login_info 这一次请求自己的响应处理块」，否则会两头误伤：
+  //   · 早先用固定 900 字 → 圈进后面 get_status 里合法的 `good = b.data?.good`（假阳性）
+  //   · 改成截到下一个 /get_status → 又圈进两个调用共用的变量声明 `let ..., good = null`（同一类假阳性）
+  // 真正要防的是「把 get_login_info 的 data 当成有 good」，所以判据是：
+  // 它自己的 try 块里（到最近的 `} catch {}` 为止）不能出现 good 的赋值/读取。
+  const loginAt = bridgeCode.indexOf('/get_login_info');
+  assert.ok(loginAt >= 0, '应能定位 get_login_info 调用点');
+  const loginCatchAt = bridgeCode.indexOf('} catch {}', loginAt);
+  assert.ok(loginCatchAt > loginAt, '应能定位 get_login_info 的 catch 收尾');
+  const loginCall = bridgeCode.slice(loginAt, loginCatchAt + 12);
   assert.ok(loginCall.length > 0, '应能定位 get_login_info 调用点');
   assert.ok(
     !/good/.test(loginCall.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')),

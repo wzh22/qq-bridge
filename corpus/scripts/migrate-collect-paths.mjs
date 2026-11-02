@@ -45,7 +45,7 @@ const PLAN = {
 // 需要注入 import 的文件（用了 runtimeDir/ROOT 就必须 import）
 const NEED_PATH = new Set(['guard-longrun.mjs']);
 const SKIP_NOTE = {
-  'test-guard.mjs': '// 注：本文件里的 E:\\dsh\\... 是**测试输入数据**（模拟的进程命令行），\n// 故意保留绝对路径形态，不要替换成 ROOT/runtimeDir——\n// 换成动态路径会让测试输入随部署变化，度量意义就没了。\n',
+  'test-guard.mjs': '// 注：本文件里的固定绝对路径是**虚构测试输入**（模拟进程命令行），\n// 不要替换成 ROOT/runtimeDir——换成动态路径会让测试输入随部署变化。\n',
 };
 
 function ensureImports(src, file) {

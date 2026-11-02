@@ -2201,9 +2201,14 @@ button:active:not(:disabled) {
         <label style="flex:1">列表最大返回数</label><input type="number" id="v2StickerMaxList" min="1" max="500" style="width:90px">
       </div>
       <div class="row">
-        <label style="flex:1">提示中列出常用表情数</label><input type="number" id="v2StickerPromptMax" min="1" max="30" style="width:90px">
+        <label style="flex:1">提示中列出常用表情数</label><input type="number" id="v2StickerPromptMax" min="1" max="80" style="width:90px">
         <label style="flex:1">在 prompt/唤醒里附带表情摘要</label><input type="checkbox" id="v2StickerIncludePrompt" style="width:auto">
         <span class="meta" style="flex:2">关闭后 AI 仍可主动调用 qq_list_stickers，只是不主动喂到上下文。</span>
+      </div>
+      <div class="row">
+        <label style="flex:1">摘要字符上限</label><input type="number" id="v2StickerPromptMaxChars" min="200" max="20000" style="width:90px">
+        <label style="flex:1">超过多少条只列有备注的</label><input type="number" id="v2StickerNamedOnlyThreshold" min="1" max="1000" style="width:90px">
+        <span class="meta" style="flex:2">字符上限是硬闸。收藏总数超过阈值后，没起备注的表情不再进摘要（列出来 AI 也选不出来），要哪个现查现起备注。</span>
       </div>
       <div class="row">
         <label style="flex:1">AI 收藏表情</label><input type="checkbox" id="v2StickerCollectEnabled" style="width:auto">
@@ -3340,6 +3345,8 @@ async function loadV2Config() {
     document.getElementById('v2StickerSyncTtlSec').value = Math.round((stk.syncTtlMs || 60000) / 1000);
     document.getElementById('v2StickerMaxList').value = stk.maxListCount ?? 100;
     document.getElementById('v2StickerPromptMax').value = stk.promptMaxStickers ?? 8;
+    document.getElementById('v2StickerPromptMaxChars').value = stk.promptMaxChars ?? 1200;
+    document.getElementById('v2StickerNamedOnlyThreshold').value = stk.promptNamedOnlyThreshold ?? 40;
     document.getElementById('v2StickerIncludePrompt').checked = stk.includeInPrompt !== false;
     const stkCollect = stk.collect || {};
     document.getElementById('v2StickerCollectEnabled').checked = stkCollect.enabled !== false;
@@ -3433,7 +3440,9 @@ async function saveV2Config() {
       syncTtlMs: Math.max(1000, Math.round(Number(document.getElementById('v2StickerSyncTtlSec').value) || 60) * 1000),
       maxListCount: Math.min(500, Math.max(1, Math.round(Number(document.getElementById('v2StickerMaxList').value) || 100))),
       includeInPrompt: document.getElementById('v2StickerIncludePrompt').checked,
-      promptMaxStickers: Math.min(30, Math.max(1, Math.round(Number(document.getElementById('v2StickerPromptMax').value) || 8))),
+      promptMaxStickers: Math.min(80, Math.max(1, Math.round(Number(document.getElementById('v2StickerPromptMax').value) || 8))),
+      promptMaxChars: Math.min(20000, Math.max(200, Math.round(Number(document.getElementById('v2StickerPromptMaxChars').value) || 1200))),
+      promptNamedOnlyThreshold: Math.min(1000, Math.max(1, Math.round(Number(document.getElementById('v2StickerNamedOnlyThreshold').value) || 40))),
       collect: {
         enabled: document.getElementById('v2StickerCollectEnabled').checked,
         maxPerMinute: Math.max(0, Math.round(Number(document.getElementById('v2StickerCollectPerMin').value) || 0)),

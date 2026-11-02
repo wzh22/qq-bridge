@@ -125,6 +125,7 @@ test('qq_send_qzone 明确具备令牌入参与请求头（回归 2026-10 的「
   assert.match(block.text, /\btoken:\s*z\.string\(\)/, 'qq_send_qzone 必须声明 token 参数');
   assert.match(block.text, /['"]x-agent-token['"]\s*:\s*token/, 'qq_send_qzone 必须把 token 放进 x-agent-token 头');
   assert.match(block.text, /headers:\s*\{/, 'qq_send_qzone 必须带 headers 传给 agentApi');
+  assert.match(block.text, /ugcRight:\s*ugcRight\s*\?\?\s*4/, 'qq_send_qzone 未指定可见范围时必须默认好友可见');
 });
 
 test('qq_set_self_avatar / qq_set_self_nickname 同样具备令牌（同类漏传已修）', () => {

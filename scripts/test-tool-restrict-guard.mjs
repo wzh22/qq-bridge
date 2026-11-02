@@ -105,7 +105,11 @@ await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝
   mod.apply(ctx);
   assert.equal(typeof calls.guard, 'function', '必须注册执行期 guard');
   const guard = calls.guard;
-  for (const name of ['mcp__snowluma__qq_send_message', 'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_search', 'mcp__bilibili-safe__bilibili_video_learn', 'ask_user_question', 'todo_write']) {
+  // ⚠️ 这里写的是 DSH 实际注册的名字 `mcp__snowluma_host__`（下划线）。
+  // MCP server 名是 `snowluma-host`，但工具名会被规范化成下划线；旧断言写的是
+  // 连字符版本 `mcp__snowluma-host__`，它恰好"测过"了一个并不存在的工具名，
+  // 于是线上 `mcp__snowluma_host__snowluma_status` 一直被白名单拒绝却没被发现。
+  for (const name of ['mcp__snowluma__qq_send_message', 'mcp__snowluma_host__snowluma_status', 'mcp__web-search-safe__web_search', 'mcp__bilibili-safe__bilibili_video_learn', 'ask_user_question', 'todo_write']) {
     assert.equal(guard({ name }), undefined, `${name} 应放行`);
   }
   for (const name of ['dev_inject_plugin', 'dev_plugin_status', 'pwsh', 'read', 'write', 'dsh_snapshot', 'skill']) {

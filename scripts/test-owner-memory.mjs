@@ -20,6 +20,7 @@ import {
   parseFactJson,
   appendArchiveLine,
   readArchiveSince,
+  readArchiveForKey,
 } from '../src/owner-memory.js';
 
 let passed = 0;
@@ -272,6 +273,61 @@ test('readArchiveSince 跳过损坏行而不是整体失败', () => {
   fs.writeFileSync(file, '{"text":"ok"}\n这不是JSON\n{"text":"ok2"}\n', 'utf8');
   const r = readArchiveSince(file, 0);
   assert.equal(r.records.length, 2);
+});
+
+test('readArchiveForKey 扫过其他会话的稀疏归档并返回准确水位', () => {
+  const file = tmpFile('shared-archive.jsonl');
+  for (let i = 0; i < 30; i += 1) {
+    appendArchiveLine(file, { key: 'private:other', text: `other-${i}` });
+  }
+  for (let i = 0; i < 6; i += 1) {
+    appendArchiveLine(file, { key: 'private:owner', text: `owner-${i}`, isSelf: false });
+    appendArchiveLine(file, { key: 'private:other', text: `noise-${i}` });
+  }
+  const r = readArchiveForKey(file, 0, {
+    key: 'private:owner',
+    maxLines: 4,
+    minRecords: 5,
+    predicate: (m) => !m.isSelf,
+  });
+  assert.equal(r.records.length, 5);
+  assert.equal(r.records[0].text, 'owner-0');
+  assert.equal(r.nextOffset, 40, '应停在实际扫描完的批次，而非硬编码起点');
+  assert.equal(r.totalLines, 42);
+
+  const rest = readArchiveForKey(file, r.nextOffset, {
+    key: 'private:owner', maxLines: 4, minRecords: 1,
+  });
+  assert.deepEqual(rest.records.map((m) => m.text), ['owner-5']);
+});
+
+test('readArchiveForKey 的下一批包含读取后新追加的消息', () => {
+  const file = tmpFile('append-during-model.jsonl');
+  for (let i = 0; i < 10; i += 1) {
+    appendArchiveLine(file, { key: 'private:owner', text: `old-${i}` });
+  }
+  const first = readArchiveForKey(file, 0, {
+    key: 'private:owner', maxLines: 4, minRecords: 5,
+  });
+  assert.equal(first.nextOffset, 8);
+  // 模拟模型运行期间归档继续增长：水位只能用 first.nextOffset，不能改用实时 totalLines。
+  appendArchiveLine(file, { key: 'private:owner', text: 'arrived-while-waiting' });
+  appendArchiveLine(file, { key: 'private:owner', text: 'also-new' });
+  const second = readArchiveForKey(file, first.nextOffset, {
+    key: 'private:owner', maxLines: 10, minRecords: 1,
+  });
+  assert.deepEqual(second.records.map((m) => m.text), ['old-8', 'old-9', 'arrived-while-waiting', 'also-new']);
+});
+
+test('readArchiveForKey 支持 predicate 过滤 bot 自己的消息', () => {
+  const file = tmpFile('filter-self.jsonl');
+  appendArchiveLine(file, { key: 'private:owner', text: 'bot', isSelf: true });
+  appendArchiveLine(file, { key: 'private:owner', text: 'human', isSelf: false });
+  const r = readArchiveForKey(file, 0, {
+    key: 'private:owner', minRecords: 1, predicate: (m) => !m.isSelf && m.text,
+  });
+  assert.deepEqual(r.records.map((m) => m.text), ['human']);
+  assert.equal(r.nextOffset, 2);
 });
 
 // --- 汇总 ---

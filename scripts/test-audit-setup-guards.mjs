@@ -16,8 +16,19 @@ for (const preset of ['qq-chat', 'qq-chat-v2']) {
   assert.equal(typeof guard, 'function');
   assert.ok(restricted.includes('dev_install_package'));
   for (const name of ['ask_user_question', 'todo_write', 'mcp__snowluma__qq_send_message',
-    'mcp__snowluma-host__snowluma_status', 'mcp__web-search-safe__web_fetch']) {
+    // ⚠️ 是**下划线**不是连字符：MCP server 名配在 config 里写作 `snowluma-host`，
+    // 但 DSH 注册工具时会把名字规范化成 `mcp__snowluma_host__*`。
+    // 白名单早期写的是连字符那个，于是这条实际一直是坏的（2026-10-28 实测
+    // state/tool-calls.jsonl 里 snowluma_status 被本守卫拒绝）。
+    // 这个用例现在钉住的是**真实工具名**，别改回连字符。
+    'mcp__snowluma_host__snowluma_status', 'mcp__web-search-safe__web_fetch']) {
     assert.equal(guard({ name }), undefined, `${preset}: expected allowed ${name}`);
+  }
+  // 连字符形态不该被放行：DSH 不会注册这个名字，放行它只会扩大攻击面而不提供功能。
+  for (const presetUnused of [0]) {
+    void presetUnused;
+    assert.equal(typeof guard({ name: 'mcp__snowluma-host__snowluma_status' }), 'string',
+      `${preset}: 连字符形态不该在白名单里（真实名字是下划线）`);
   }
   for (const name of ['web_fetch', 'web_search', 'bash', 'read_file', 'dev_future_tool',
     'mcp__untrusted__web_fetch', '', null, undefined]) {

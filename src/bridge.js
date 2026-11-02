@@ -35,6 +35,7 @@ import { generateVoice, normalizeSynthesis } from './voice-synthesis.js';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, isHardened, manualDirCommand } from './state-acl.mjs';
+import { setLogger as setVectorLogger, configure as configureVector, syncIndex as syncVectorIndex, isAvailable as vectorAvailable, status as vectorStatus, hybridSearch as vectorHybridSearch } from './vector-recall.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 // 「她自己的状态」：作息 / 关系进度 / 会按天往前走的小生活（见 inner-life.js 顶部说明）。
 import { buildInnerLifeLines, proactiveFactor, tickLife } from './inner-life.js';
@@ -91,6 +92,7 @@ import {
   parseDiaryJson,
   parseQuery,
   recallEntries,
+  keywordScoresFor,
   renderEntryLine,
   capEntries,
   selectInjectedIds,
@@ -1839,6 +1841,40 @@ async function main() {
     diaryOthersWritable = false;
     log(`⚠️ 他人日记本加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
   }
+  // ── 向量检索初始化（语义记忆）─────────────────────────────────────────
+  //
+  // 时机必须放在日记本加载**之后**：索引是拿日记内容建的。
+  // 失败绝不阻断启动 —— 日记检索本身就是可选增强，向量只是再叠一层，
+  // 起不来就退回纯关键词，聊天完全不受影响。
+  //
+  // 索引重建是幂等的：服务端按文本 sha256 缓存，只有新增/修改过的日记
+  // 才会重新过 GPU（102 条约 1 秒，之后增量几乎为 0）。
+  setVectorLogger(log);
+  if (cfg.vectorRecall?.enabled !== false && diaryEntries.length) {
+    configureVector({
+      endpoint: cfg.vectorRecall?.endpoint,
+      enabled: true,
+      wVec: cfg.vectorRecall?.wVec,
+    });
+    vectorAvailable().then(async (ok) => {
+      if (!ok) {
+        log('ℹ️ 向量检索服务未就绪，日记将只用关键词检索（不影响聊天）');
+        return;
+      }
+      const allEntries = [...diaryEntries, ...diaryOthersEntries];
+      const r = await syncVectorIndex(allEntries);
+      if (r.ok) {
+        log(`🧠 向量索引已同步：${allEntries.length} 条（新算 ${r.computed ?? 0} 条）`);
+      } else {
+        log(`ℹ️ 向量索引同步未完成：${r.reason ?? '未知'}（日记仍可用关键词检索）`);
+      }
+    }).catch((error) => {
+      log(`ℹ️ 向量检索初始化异常（已忽略）：${error?.message ?? error}`);
+    });
+  } else if (cfg.vectorRecall?.enabled === false) {
+    log('ℹ️ 向量检索已在配置中关闭');
+  }
+
   // 记忆衰减状态。读失败**绝不**阻断日记功能：衰减状态丢了只是
   // 「所有记忆重新变新鲜」，比让桥接起不来、或让模型看不到日记强得多。
   // 所以这里只 log 一行，不设 writable 开关。
@@ -9099,7 +9135,7 @@ async function main() {
           // 查询理解（去噪/剥动词/同义扩展）在 diary.js 的 parseQuery 里做，
           // 不需要调用方自己拆词。parsed 一并回传，方便模型判断"为什么没查到"。
           const parsedQuery = parseQuery(q);
-          const hits = recallEntries(bookMine, {
+          const kwHits = recallEntries(bookMine, {
             q,
             limit,
             withinDays,
@@ -9108,12 +9144,68 @@ async function main() {
             people,
             minImportance,
           });
+
+          // 混合检索：关键词分 + 向量语义分加权融合。
+          // 实测（102 条真实日记 + 20 条人工标注查询）：
+          //   纯关键词 R@5=0.792 hard R@5=0.39
+          //   纯向量   R@5=0.575 hard R@5=0.56
+          //   融合 0.3 R@5=0.867 hard R@5=0.61
+          // 向量不可用 / 超时 / 查询为空时**静默回退**到纯关键词，
+          // 绝不能因为向量服务重启就让聊天检索失败。
+          let hits = kwHits;
+          let vectorUsed = false;
+          try {
+            const kwScores = keywordScoresFor(bookMine, {
+              q,
+              withinDays,
+              mood,
+              tag,
+              people,
+              minImportance,
+            });
+            if (kwScores.size > 0 && q) {
+              const poolIds = new Set(bookMine.map((e) => String(e.id)));
+              const fused = await vectorHybridSearch(q, {
+                keywordScores: kwScores,
+                poolIds,
+                topK: Math.max(limit, 10),
+              });
+              if (fused && fused.length) {
+                // 把融合结果映射回原条目，并保留 weak 语义：
+                // weak 表示"没有命中原词"，融合后仍然要如实标注，
+                // 否则模型会以为自己真的检索到了那条记忆。
+                const byId = new Map(bookMine.map((e) => [String(e.id), e]));
+                const kwWhy = new Map(kwHits.map((h) => [String(h.entry.id), h.why]));
+                const rebuilt = [];
+                for (const f of fused) {
+                  const entry = byId.get(f.id);
+                  if (!entry) continue;
+                  const why = kwWhy.get(f.id) ?? [];
+                  rebuilt.push({
+                    entry,
+                    score: f.score,
+                    why: why.length ? why : ['语义'],
+                    weak: !why.includes('关键词'),
+                  });
+                  if (rebuilt.length >= limit) break;
+                }
+                if (rebuilt.length) {
+                  hits = rebuilt;
+                  vectorUsed = true;
+                }
+              }
+            }
+          } catch (error) {
+            log(`日记混合检索失败，回退纯关键词：${error?.message ?? error}`);
+          }
+
           sendJson({
             ok: true,
             enabled: diaryEnabled(),
             scope: isOwnerBook ? 'owner' : 'other',
             total: bookMine.length,
             matched: hits.length,
+            vectorUsed,
             // 全是同义词沾边、没有一条命中原词时明确标出来。
             // 模型据此才能说「没记到这条」，而不是顺着编一段。
             exact: hits.some((h) => !h.weak),
@@ -9962,6 +10054,28 @@ async function main() {
   /** 上一批发往该会话的消息是否全部成功。 */
   function lastSendSucceeded(key) {
     return lastSendFailed.get(key) !== true;
+  }
+
+  /**
+   * 把「技术错误」转述到聊天窗口：**只发主人私聊**，其它会话一律静默。
+   *
+   * 2026-11-01 之前，这类消息无条件发到「触发错误的那个会话」，于是群友会收到
+   *   400: read body: read tcp 107.149.159.254:7863->108.186.222.154:59830: i/o timeout
+   * 这种原文。对收到的人来说，它看不懂、语气像在冲他发火，还把内部 IP/端口
+   * 暴露给与故障无关的人。故障本身与聊天对象没有关系，不该由他承担打扰。
+   *
+   * 静默**不等于**吞掉错误：调用方仍会写 bridge.log 与活动记录（全量保留），
+   * 主人私聊照常收到原文，排查链路不受影响。
+   *
+   * @returns {Promise<boolean>} 是否真的发出去了（false = 已静默）
+   */
+  async function notifyErrorToChat(key, text) {
+    if (isOwnerPrivateSession(key)) {
+      await sendToQQ(key, text);
+      return true;
+    }
+    log(`（非主人会话，错误不转述到聊天窗口）(${key})`);
+    return false;
   }
 
   // ── 真人式分条发送 ──────────────────────────────────────────────────────
@@ -10814,7 +10928,8 @@ async function main() {
       log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
       appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
       if (cfg.security?.interceptNotify !== false) {
-        await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
+        // 2026-11-02：拦截通知只发主人（管理员本人），不打扰被拦截会话里的其他人。
+        await notifyErrorToChat(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
       }
       return false;
     }
@@ -11953,7 +12068,7 @@ async function main() {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      if (!opts.silent) await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      if (!opts.silent) await notifyErrorToChat(key, `⚠️ 消息未被接受：${safeErrText}`);
       return { ok: false, error: safeErrText };
     }
     if (wakeSnapshot && isCurrentSession(key, sessionId)
@@ -14329,7 +14444,7 @@ async function main() {
     if (!accepted.result.ok) {
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
-      await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
+      await notifyErrorToChat(key, `⚠️ 消息未被接受：${safeErrText}`);
       return;
     }
     if (accepted.result.value.command) {
@@ -14386,13 +14501,13 @@ async function main() {
         if (pending.get(key) === p) pending.delete(key);
       } catch (error) {
         log('回答问题失败（保留挂起以便重试）:', error.message);
-        await sendToQQ(key, '⚠️ 回答提交失败，请再回复一次。');
+        await notifyErrorToChat(key, '⚠️ 回答提交失败，请再回复一次。');
       }
       return;
     }
     if (p.kind === 'approval') {
       if (!isOwner) {
-        await sendToQQ(key, '审批仅管理员可操作');
+        await notifyErrorToChat(key, '审批仅管理员可操作');
         return;
       }
       const t = answerText.trim().toLowerCase();
@@ -14415,7 +14530,7 @@ async function main() {
         if (pending.get(key) === p) pending.delete(key);
       } catch (error) {
         log('处理审批失败（保留挂起以便重试）:', error.message);
-        await sendToQQ(key, '⚠️ 审批回执提交失败，请再回复一次「通过」或「拒绝」。');
+        await notifyErrorToChat(key, '⚠️ 审批回执提交失败，请再回复一次「通过」或「拒绝」。');
       }
       return;
     }
@@ -14800,7 +14915,8 @@ async function main() {
                   log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
                   appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
                   if (cfg.security?.interceptNotify !== false) {
-                    await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
+                    // 2026-11-02：拦截通知只发主人（管理员本人），不打扰被拦截会话里的其他人。
+                    await notifyErrorToChat(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
                   }
                   if (isFarewell) {
                     const st = socialState(key);
@@ -14904,7 +15020,8 @@ async function main() {
                 // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
                 appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
-                await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                // 2026-11-01：技术错误细节只发主人私聊，其它会话静默（见 notifyErrorToChat）。
+                await notifyErrorToChat(key, `⚠️ agent 处理出错：${safeMsg}`);
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
@@ -14916,7 +15033,9 @@ async function main() {
                 }
               } else if (ended.reason.kind === 'aborted') {
                 log(`⏹️ 回合被中止 (${key})`);
-                await sendToQQ(key, '⏹️ 已停止');
+                // 2026-11-02：同 agent 处理出错，中止回执只发主人私聊。
+                // 群友看到「⏹️ 已停止」只会莫名其妙（往往是超时/主人手动停的）。
+                await notifyErrorToChat(key, '⏹️ 已停止');
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {

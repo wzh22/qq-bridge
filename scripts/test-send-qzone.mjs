@@ -53,13 +53,13 @@ const post = (body) => new Promise((resolve, reject) => {
 });
 
 console.log('\n=== 功能 ===');
-await tap('纯文字说说调 send_qzone_msg', async () => {
+await tap('纯文字说说默认好友可见并调 send_qzone_msg', async () => {
   const r = await post({ content: '今天天气不错' });
   assert.equal(r.body.ok, true, JSON.stringify(r.body));
   const up = h.calls.http.find((c) => String(c.url).endsWith('/send_qzone_msg'));
   assert.ok(up, '未调用 send_qzone_msg');
   assert.equal(up.body.content, '今天天气不错');
-  assert.equal(up.body.ugc_right, 1);
+  assert.equal(up.body.ugc_right, 4);
 });
 await tap('带图说说转成 file:// 且限制在目录内', async () => {
   const r = await post({ content: '配图', images: ['state/qzone/pic.png'], ugcRight: 64 });

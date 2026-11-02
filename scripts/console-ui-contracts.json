@@ -209,6 +209,8 @@
         "maxListCount": 100,
         "includeInPrompt": true,
         "promptMaxStickers": 8,
+        "promptMaxChars": 1200,
+        "promptNamedOnlyThreshold": 40,
         "collect": {
           "enabled": true,
           "maxPerMinute": 2,
@@ -328,6 +330,8 @@
         "maxListCount": 100,
         "includeInPrompt": true,
         "promptMaxStickers": 8,
+        "promptMaxChars": 1200,
+        "promptNamedOnlyThreshold": 40,
         "collect": {
           "enabled": true,
           "maxPerMinute": 2,

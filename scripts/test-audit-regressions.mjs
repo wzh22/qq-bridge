@@ -435,6 +435,66 @@ await test('R16 appendSocialV2Message 保留 kind/emojiId/summary/subType', asyn
   } finally { await h.close(); }
 });
 
+// ── R17. 关系计数必须单调不减 ────────────────────────────────────────────────
+// relationCount 决定她对一个人的语气从「客气」走到「熟人」。老版本代码没有这个字段，
+// 一次旧进程落盘就会把它写成 0（线上实测：主人私聊真实 737 条被写成 0）。
+// 所以加载时必须与归档取 max，任何一方变小都不能让档位倒退。
+await test('R17 relationCount 单调不减：文件写 0 时从归档补回，且不回退', async () => {
+  const archiveLines = Array.from({ length: 42 }, (_, i) =>
+    JSON.stringify({ key: 'group:456', isSelf: false, text: `m${i}`, time: 1700000000000 + i })).join('\n') + '\n';
+
+  // ① 文件里被写成 0，归档里有 42 条真实来信 → 必须补到 42
+  const h1 = await bridgeHarness({
+    config: { socialV2: { proactive: { enabled: false } } },
+    files: {
+      'state/social-v2.json': { conversations: { 'group:456': { relationCount: 0, agentToken: 'a'.repeat(32) } } },
+      'state/owner-chat.jsonl': archiveLines
+    }
+  });
+  try {
+    h1.setMode('reserved2');
+    assert.equal(h1.getSocialV2State('group:456').relationCount, 42,
+      '文件里是 0、归档有 42 条时必须补成 42，否则聊了很久的人被当成刚认识');
+  } finally { await h1.close(); }
+
+  // ② 文件里的值大于归档 → 保留文件值，不能因为归档条数少就倒退
+  const h2 = await bridgeHarness({
+    config: { socialV2: { proactive: { enabled: false } } },
+    files: {
+      'state/social-v2.json': { conversations: { 'group:456': { relationCount: 900, agentToken: 'b'.repeat(32) } } },
+      'state/owner-chat.jsonl': JSON.stringify({ key: 'group:456', isSelf: false }) + '\n'
+    }
+  });
+  try {
+    h2.setMode('reserved2');
+    assert.equal(h2.getSocialV2State('group:456').relationCount, 900, '不得倒退');
+  } finally { await h2.close(); }
+
+  // ③ 一条归档都没有 → 0，且不能抛（新会话是合法场景）
+  const h3 = await bridgeHarness({
+    config: { socialV2: { proactive: { enabled: false } } },
+    files: { 'state/social-v2.json': { conversations: { 'group:456': { relationCount: 0, agentToken: 'c'.repeat(32) } } } }
+  });
+  try {
+    h3.setMode('reserved2');
+    assert.equal(h3.getSocialV2State('group:456').relationCount, 0);
+  } finally { await h3.close(); }
+
+  // ④ 每来一条真实来信 +1，自己的发言与拍一拍不加
+  const h4 = await bridgeHarness({ config: { socialV2: { proactive: { enabled: false } } } });
+  try {
+    h4.setMode('reserved2');
+    const st = h4.getSocialV2State('group:456');
+    const base = st.relationCount;
+    h4.appendSocialV2Message('group:456', '小明', '在吗', '在吗', false, false, 1, [], null, []);
+    assert.equal(st.relationCount, base + 1, '真实来信应 +1');
+    // 自己没有 appendSocialV2Message 的入口（自己的发言走 recordSentMessagesV2），
+    // 这里断言它不碰计数器即可。
+    h4.recordSentMessagesV2('group:456', [{ text: '嗯' }]);
+    assert.equal(st.relationCount, base + 1, '自己的发言不得计入关系进度（否则奖励话痨）');
+  } finally { await h4.close(); }
+});
+
 if (failures) {
   console.error(`\n${failures} 项失败`);
   process.exitCode = 1;

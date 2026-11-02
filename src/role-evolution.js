@@ -24,6 +24,10 @@
 // 但不得据此推断、记录群友的敏感属性（身份、住址、健康状况等）。见 sanitize 里的过滤。
 import fs from 'node:fs';
 import path from 'node:path';
+// 人格卡解析的唯一真源在 role-card.js（模式标记 / 序号剥离都在那儿）。
+// 这个仓库踩过太多次「同源正则抄两份」的坑：两份一旦漂移，就会出现
+// 「按 A 判定能改、按 B 判定改不了」这种只在特定卡上复现的怪事。
+import { stripSectionOrdinal } from './role-card.js';
 
 /** 观察缓冲区/反馈/档案/提案的默认文件名（调用方传目录进来）。 */
 export const ROLE_EVOLUTION_FILES = {
@@ -209,6 +213,45 @@ export function normalizeProposal(raw) {
 }
 
 /**
+ * 去掉标题前的序号：`一、` `三·五、` `二.` `(3)` 等。
+ *
+ * ⚠️ 实现放在 role-card.js 里（人格卡解析的唯一真源），这里只做转出。
+ * 这个仓库踩过太多次「同源正则抄两份」的坑：两份一旦漂移，就会出现
+ * 「按 A 判定能改、按 B 判定改不了」这种只在特定卡上复现的怪事。
+ */
+export { stripSectionOrdinal } from './role-card.js';
+
+/** 标题比对用的规范形态：去模式标记（〔全部〕等）+ 去序号。 */
+function normalizeHeading(raw) {
+  const noTag = String(raw ?? '')
+    .replace(/[\[〔（(]\s*(?:二代|2\s*代|v2|reserved2|一代|1\s*代|v1|reserved|全部|both)\s*[\]〕）)]/gi, '')
+    .trim();
+  return stripSectionOrdinal(noTag);
+}
+
+/** 找出与 want 对应的小节标题行。返回候选列表（可能 0 个或多个，多于 1 个要报歧义）。 */
+function findSectionCandidates(lines, wantRaw) {
+  const want = normalizeHeading(wantRaw);
+  if (!want) return [];
+  const exact = [];
+  const prefix = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = /^(#{2,3})\s*(.+?)\s*$/.exec(lines[i]);
+    if (!m) continue;
+    const rawTitle = m[2].trim();
+    const norm = normalizeHeading(rawTitle);
+    if (rawTitle === wantRaw.trim() || norm === want) { exact.push({ index: i, level: m[1].length }); continue; }
+    // 副标题匹配：只认「want + 分隔符」开头，不做无分隔的包含匹配。
+    // 否则 want=「说话」会把「怎么说话」「说话的硬度」一起命中，等于随机改一节。
+    if (norm.startsWith(`${want}：`) || norm.startsWith(`${want}:`) || norm.startsWith(`${want} `)) {
+      prefix.push({ index: i, level: m[1].length });
+    }
+  }
+  if (exact.length) return exact;
+  return prefix;
+}
+
+/**
  * 把提案应用成新的人格卡文本。**纯函数**，便于单测。
  *
  * 规则：
@@ -225,20 +268,15 @@ export function applyProposalToText(currentText, proposal) {
 
   if (p.section) {
     const want = String(p.section).trim();
-    // 匹配 `## 标题` / `### 标题`，标题里允许有数字前缀（「一、」之类）
     const lines = text.split(/\r?\n/);
-    let start = -1;
-    let level = 0;
-    for (let i = 0; i < lines.length; i += 1) {
-      const m = /^(#{2,3})\s*(.+?)\s*$/.exec(lines[i]);
-      if (!m) continue;
-      const title = m[2].replace(/^[一二三四五六七八九十\d]+[、.．)]\s*/, '').trim();
-      if (title === want || m[2].trim() === want) {
-        start = i;
-        level = m[1].length;
-        break;
-      }
+    const candidates = findSectionCandidates(lines, want);
+    if (candidates.length > 1) {
+      const names = candidates.map((c) => lines[c.index].replace(/^#+\s*/, '')).join('」/「');
+      return { ok: false, error: `小节名「${want}」匹配到多个小节（${names}），请写得更具体` };
     }
+    const hit = candidates[0];
+    const start = hit ? hit.index : -1;
+    const level = hit ? hit.level : 0;
     if (start < 0) {
       return { ok: false, error: `人格卡里找不到小节「${want}」，请先读取当前内容确认标题` };
     }

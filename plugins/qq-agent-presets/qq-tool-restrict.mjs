@@ -317,6 +317,12 @@ export const THIRD_PARTY_PLUGIN_TOOL_NAMES = Object.freeze([...THIRD_PARTY_PLUGI
 //   明确报错并提示怎么开（不会静默失败、也不会绕路去爬）。
 const SAFE_PREFIXES = [
   'mcp__snowluma__',
+  // ⚠️ MCP server 名是 `snowluma-host`（连字符），但 DSH 规范化工具名时
+  // 不同版本表现不一样：本机实测是 `mcp__snowluma_host__*`（下划线），
+  // 云端实测 `state/tool-calls.jsonl` 里是 `mcp__snowluma-host__*`（连字符）。
+  // 两种写法必须都给，否则换一台机器网关状态查询就被本白名单挡掉，
+  // 而且报错是"不在 QQ 桥接白名单内"，看不出是规范化差异。
+  'mcp__snowluma_host__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
   'mcp__bilibili-safe__',
@@ -388,6 +394,29 @@ export function apply(ctx) {
   // 因此本名单主要防的是"别的 composition 把它们注册进全局层"这种回归，
   // 以及 MCP 之外的宿主工具（plugin-guard / cordis 检查工具等）。
   const stamp = new Date().toISOString()
+
+  // 读当前 scope 的运行时注册表：restrictableNames 只含**继承来的全局层工具**。
+  // 这正是 restrict() 唯一能作用到的集合（见 dsh-tools view()：own 层工具
+  // 只进 knownNames/visible，不进 restrictableNames）。
+  // 拿不到 view（老版本 DSH）时返回 undefined，下面退回逐个试的旧行为。
+  const registeredNames = (() => {
+    try {
+      const view = ctx.tools.view?.()
+      const set = view?.restrictableNames
+      return set instanceof Set ? set : undefined
+    } catch {
+      return undefined
+    }
+  })()
+
+  // 名单 ∩ 注册表 ⇒ 真正需要 deny 的；名单 − 注册表 ⇒ 本 composition 根本没有，
+  // 隐藏它是空操作，不该每条都产一行报错（2026-10-30 实测：138 个名字里绝大多数
+  // 属于后者，实测刷屏 139 条、把真正的失败原因淹没了）。
+  const targets = registeredNames === undefined
+    ? KNOWN_DANGEROUS_GLOBAL_TOOLS
+    : KNOWN_DANGEROUS_GLOBAL_TOOLS.filter((name) => registeredNames.has(name))
+  const skipped = KNOWN_DANGEROUS_GLOBAL_TOOLS.length - targets.length
+
   const failed = []
   const attempt = (names) => {
     let ok = 0
@@ -402,18 +431,18 @@ export function apply(ctx) {
     return ok
   }
 
-  const firstOk = attempt(KNOWN_DANGEROUS_GLOBAL_TOOLS)
+  const firstOk = attempt(targets)
   const firstFailed = failed.slice()
   failed.length = 0
 
   if (firstFailed.length > 0) {
-    // 逐个名字的报错收成一类，避免 18 行重复
+    // 只对「注册表里明明有、restrict 却失败」的真异常报警（这才是需要人看的）。
     const reasons = [...new Set(firstFailed.map((f) => f.message))]
     console.error(
-      `[qq-tool-restrict] restrict 失败 ${firstFailed.length}/${KNOWN_DANGEROUS_GLOBAL_TOOLS.length}：${reasons.join(' | ')}`
+      `[qq-tool-restrict] restrict 失败 ${firstFailed.length}/${targets.length}：${reasons.join(' | ')}`
     )
     writeDiagnostics([
-      `${stamp} restrict ok=${firstOk} failed=${firstFailed.length} 原因: ${reasons.join(' | ')}`,
+      `${stamp} restrict ok=${firstOk} failed=${firstFailed.length}${skipped ? ` skipped=${skipped}` : ''} 原因: ${reasons.join(' | ')}`,
       `${stamp} 失败样例: ${firstFailed.slice(0, 3).map((f) => f.name).join(', ')}`,
     ])
     // 时序兜底：注入器的工具可能在 preset apply 之后才注册进全局层。
@@ -430,6 +459,11 @@ export function apply(ctx) {
       ])
     }, 3000)
     timer?.unref?.()
+  } else if (registeredNames !== undefined) {
+    // 正常路径只留一行可审计的记录，不再刷屏。
+    writeDiagnostics([
+      `${stamp} restrict ok=${firstOk} failed=0 skipped=${skipped}（名单 ${KNOWN_DANGEROUS_GLOBAL_TOOLS.length}，本 composition 注册 ${registeredNames.size}）`,
+    ])
   }
 
   // 2) 执行期白名单：任何不在允许范围内的工具调用都会被拒绝。

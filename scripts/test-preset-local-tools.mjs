@@ -207,11 +207,18 @@ function collectDshToolNames() {
 /** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
 const DEV_TOOL_PREFIX = /^dev_/;
 
-/** 允许出现的 MCP 命名空间前缀（QQ 动作面）。 */
+/** 允许出现的 MCP 命名空间前缀（QQ 动作面）。
+ *
+ * ⚠️ 用 DSH 实际注册的名字：MCP server 名 `snowluma-host` 里的连字符在工具名里
+ * 会被规范化成下划线（`mcp__snowluma_host__*`）。旧版这里写的是连字符版本，
+ * 于是这条断言在测一个根本不存在的工具名，线上真实调用反而被 guard 拒绝。
+ */
 const EXPECTED_SAFE_PREFIXES = [
   'mcp__snowluma__',
-  'mcp__snowluma-host__',
+  'mcp__snowluma_host__',
   'mcp__web-search-safe__',
+  'mcp__bilibili-safe__',
+  'mcp__tieba-safe__',
 ];
 
 function readPreset(id) {

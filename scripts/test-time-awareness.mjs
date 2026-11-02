@@ -156,14 +156,28 @@ await test('快照头部带 now 与 newestAgo，消息体带 at/ago 且不再有
     append(h, '第一条');
     append(h, '第二条', { ageMs: 25 * MIN });
     const snapshot = h.buildWakeSnapshotV2(KEY);
-    assert.match(snapshot.now, /^\d{2}:\d{2}$/);
+    // ⚠️ `at` 的格式是「当天 HH:MM，跨天补 MM-DD」——因为快照里的消息可能是昨天甚至前天的。
+    // 早期这条断言写死 /^\d{2}:\d{2}$/，于是在 00:00~00:25 之间跑测试时，
+    // 「25 分钟前」那条自然落在昨天，at 变成 `10-28 23:42`，测试自己失败。
+    // 这不是回归，是断言把「当天」当成了隐含前提；跨零点的定时回归会误报。
+    // 现在两种合法形态都接受，并且**额外**校验跨天时确实带了日期（否则模型分不清是哪天）。
+    const AT_RE = /^(?:(\d{2})-(\d{2})\s)?(\d{2}):(\d{2})$/;
+    assert.match(snapshot.now, AT_RE);
     assert.equal(snapshot.newestAgo, '25m');
     for (const message of snapshot.messages) {
       assert.equal(message.time, undefined, '快照里不该再有裸 epoch');
-      assert.match(message.at, /^\d{2}:\d{2}$/);
+      assert.match(message.at, AT_RE, `at 格式不对：${message.at}`);
       assert.match(message.ago, /^\d+[smhd]$/);
     }
     assert.equal(snapshot.messages[1].ago, '25m');
+
+    // 真·跨天校验：戳一条 36 小时前的，它必须带月-日，不能只给 HH:MM。
+    append(h, '前天的', { ageMs: 36 * 3600 * 1000 });
+    const snap2 = h.buildWakeSnapshotV2(KEY);
+    const old = snap2.messages.find((m) => m.text === '前天的');
+    assert.ok(old, '应能找到那条旧消息');
+    assert.match(old.at, /^\d{2}-\d{2}\s\d{2}:\d{2}$/, `跨天必须带日期，实际：${old.at}`);
+    assert.equal(old.ago, '1d', '36 小时应归到 1d');
   });
 });
 

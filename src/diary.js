@@ -746,6 +746,90 @@ function jaccard(a, b) {
  * @param {number} [opts.minImportance]
  * @param {boolean} [opts.dedupe] 是否做话题去重，默认 true
  */
+/**
+ * 只算出「每个条目在本查询下的关键词分」，不做排序/过滤/去重。
+ *
+ * 为什么单独导出：混合检索（vector-recall.js）需要把关键词分和向量分
+ * 加权融合，而融合必须在**同一批候选**上做，所以得先拿到逐条分数。
+ * recallEntries 只返回过闸门后的结果，拿不到"没命中但有分"的条目。
+ *
+ * 关键：这里**故意不做 hasKeywords 的硬闸门**。闸门会让"词面零重叠"
+ * 的查询直接返回空数组，而那恰恰是向量检索最该补位的地方 ——
+ * 如果在这里就把候选清空，融合就没意义了。闸门仍由 recallEntries
+ * 在纯关键词路径上照常执行，行为不变。
+ *
+ * @returns {Map<string, number>} entry.id -> 关键词分（未归一化）
+ */
+export function keywordScoresFor(entries, opts = {}) {
+  const list = (Array.isArray(entries) ? entries : []).filter((e) => e && e.body);
+  const now = Number(opts.now) || Date.now();
+  const q = String(opts.q ?? '').trim();
+  const halfLifeDays = opts.halfLifeDays ?? 30;
+  const parsed = q
+    ? parseQuery(q)
+    : { words: [], terms: [], tokens: [], synonyms: [], core: '', withinDays: 0 };
+
+  const words = parsed.words?.length ? parsed.words : [];
+  const terms = parsed.terms.length
+    ? parsed.terms
+    : tokenize(parsed.core || '').filter((t) => t.length >= 1);
+  const synonyms = parsed.synonyms ?? [];
+  const hasKeywords = words.length > 0 || terms.length > 0;
+  const weightTerms = terms.length ? terms : words;
+
+  // 上下文过滤照常生效（这些是用户显式指定的约束，不该被融合绕过）
+  let pool = list;
+  const withinDays = Number(opts.withinDays) || parsed.withinDays || 0;
+  if (withinDays > 0) {
+    const from = now - withinDays * 86400000;
+    pool = pool.filter((e) => (Number(e.time) || 0) >= from);
+  }
+  if (opts.mood) pool = pool.filter((e) => e.mood === opts.mood);
+  if (opts.tag) {
+    const tag = String(opts.tag).toLowerCase();
+    pool = pool.filter((e) => (e.tags ?? []).some((t) => String(t).toLowerCase() === tag));
+  }
+  if (opts.people) {
+    const who = String(opts.people).toLowerCase();
+    pool = pool.filter((e) => (e.people ?? []).some((p) => String(p).toLowerCase().includes(who)));
+  }
+  const minImportance = Number(opts.minImportance) || 0;
+  if (minImportance > 0) pool = pool.filter((e) => (Number(e.importance) || 3) >= minImportance);
+
+  const out = new Map();
+  for (const entry of pool) {
+    let score = 0;
+    const importance = Number(entry.importance) || 3;
+    score += (importance - 3) * 0.6;
+    score += timeDecay(entry.time, now, halfLifeDays) * 1.2;
+    if (entry.corrections?.length) score += 0.3;
+
+    if (hasKeywords) {
+      const { weight, covered, total, titleHit } = fieldHits(
+        entry,
+        words.length ? words : weightTerms,
+        weightTerms
+      );
+      const coverage = total ? covered / total : (weight > 0 ? 1 : 0);
+      if (coverage >= 0.5 || titleHit) {
+        score += Math.log1p(weight) * 2.2 * (0.5 + 0.5 * coverage);
+      } else if (
+        weight > 0 &&
+        weightTerms.some((t) => t.length >= 3 && String(entry.title ?? '').toLowerCase().includes(t))
+      ) {
+        score += Math.log1p(weight) * 1.1;
+      }
+      if (synonyms.length) {
+        const hay = `${entry.title ?? ''} ${(entry.tags ?? []).join(' ')} ${entry.body ?? ''}`.toLowerCase();
+        const synHit = synonyms.filter((s) => hay.includes(s));
+        if (synHit.length) score += Math.log1p(synHit.length) * 0.45 * 2.2;
+      }
+    }
+    out.set(String(entry.id), score);
+  }
+  return out;
+}
+
 export function recallEntries(entries, opts = {}) {
   const list = (Array.isArray(entries) ? entries : []).filter((e) => e && e.body);
   const now = Number(opts.now) || Date.now();

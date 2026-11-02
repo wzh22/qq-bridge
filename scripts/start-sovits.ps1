@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
-$engineRoot = 'E:\dsh\qq-bridge\tools\gpt-sovits\GPT-SoVITS-v2pro-20250604'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$engineRoot = Join-Path $repoRoot 'tools\gpt-sovits\GPT-SoVITS-v2pro-20250604'
 if (Get-NetTCPConnection -LocalPort 9880 -State Listen -ErrorAction SilentlyContinue) {
   Write-Output 'Port 9880 already has a listener. No second service started.'
   exit 0

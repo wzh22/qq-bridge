@@ -82,9 +82,9 @@ if (diaryFn) {
   ok('不再无条件共用主人学习会话',
     !/sessionId\s*=\s*await ensureOwnerLearnerSession\(\);/.test(diaryFn[0]),
     '又退回共用了');
-  ok('出错时只作废对应那条',
-    /if \(forOwner\) ownerLearnerSessionId = null; else diaryOthersSessionId = null;/.test(diaryFn[0]),
-    '连带作废会把另一条无辜会话也拆掉');
+  ok('出错时只作废对应且仍为当前的那条',
+    /if \(forOwner\) invalidateOwnerLearnerSession\(sessionId\); else diaryOthersSessionId = null;/.test(diaryFn[0]),
+    '旧任务失败时不能误清另一条队列刚创建的新会话');
 }
 
 const othersFn = src.match(/async function ensureDiaryOthersSession\(\) \{[\s\S]*?\n  \}/);
