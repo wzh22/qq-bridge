@@ -272,7 +272,18 @@
       "ffmpegPath": "",
       "autoReadback": true,
       "synthesis": {
-        "enabled": false
+        "enabled": false,
+        "provider": "gpt-sovits",
+        "url": "http://127.0.0.1:9880",
+        "refAudioPath": "",
+        "promptText": "",
+        "temperature": 0.7,
+        "topK": 15,
+        "topP": 0.9,
+        "repetitionPenalty": 1.35,
+        "speedFactor": 1,
+        "seed": -1,
+        "textSplitMethod": "cut2"
       }
     },
     "proactive": {

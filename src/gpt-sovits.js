@@ -24,11 +24,32 @@ const SPLIT_METHODS = new Set(['cut0', 'cut1', 'cut2', 'cut3', 'cut4', 'cut5']);
  * temperature=0.7 / top_p=0.9（收紧采样，减少破音与忽高忽低）。
  * 越界值会被夹到合法区间，非法值回落到默认，绝不把脏参数发给服务端。
  */
-export function sovitsTuning(synthesis = {}) {
-  // 空值（null / undefined / 空串）一律当作「没配」，回落默认值。
-  // 不这样分的话 `Number(null)` 是 0，会被当成显式给了 0 而夹到下界，
+// GPT-SoVITS 的种子取值受底层 torch/numpy 限制：只接受 [0, 2**32-1] 的整数，
+// 其中 -1 是约定的「随机」。越界**不是被夹紧，而是服务端直接 400**
+// （实测 seed=2**32、-5、2**53-1 都返回 "Seed must be between 0 and 2**32 - 1"），
+// 所以这里必须自己拦住：不合法一律回落 -1（随机），绝不把脏种子发出去。
+const SEED_MAX = 4294967295;
+/** 只把「数值」和「非空数字串」当作候选；数组/布尔/对象/空白一律不是。 */
+const isSeedCandidate = (v) => typeof v === 'number'
+  || (typeof v === 'string' && v.trim() !== '');
+
+function seedOf(raw) {
+  if (!isSeedCandidate(raw)) return -1;   // 缺省 / 空白 / 数组 / 布尔 / 对象
+  const n = Number(raw);
+  if (!Number.isInteger(n)) return -1;    // 小数、NaN、Infinity
+  if (n === -1) return -1;                // 显式声明随机
+  if (n < 0 || n > SEED_MAX) return -1;   // 服务端硬约束：越界不发，回落随机
+  return n;
+}
+
+export function sovitsTuning(synthesis) {
+  // 默认参数只对 undefined 生效，null 会一路炸到 .textSplitMethod（见复查发现）。
+  const s = synthesis && typeof synthesis === 'object' ? synthesis : {};
+  // 空值一律当作「没配」，回落默认值。除 null/undefined 外，**纯空白字符串**也算没配：
+  // `Number('   ')` 是 0，会被当成显式给了 0 而夹到下界，
   // 于是「配置里留空」反而变成一个极端的采样参数。
-  const missing = (v) => v === null || v === undefined || v === '';
+  const missing = (v) => v === null || v === undefined
+    || (typeof v === 'string' && v.trim() === '');
   const num = (value, fallback, { min, max } = {}) => {
     if (missing(value)) return fallback;
     const n = Number(value);
@@ -37,18 +58,14 @@ export function sovitsTuning(synthesis = {}) {
     if (max !== undefined && n > max) return max;
     return n;
   };
-  const method = String(synthesis.textSplitMethod ?? '').trim();
-  const seedRaw = synthesis.seed;
-  const seedNum = Number(seedRaw);
+  const method = String(s.textSplitMethod ?? '').trim();
   return {
-    temperature: num(synthesis.temperature, 0.7, { min: 0.05, max: 2 }),
-    topK: Math.round(num(synthesis.topK, 15, { min: 1, max: 100 })),
-    topP: num(synthesis.topP, 0.9, { min: 0.05, max: 1 }),
-    repetitionPenalty: num(synthesis.repetitionPenalty, 1.35, { min: 1, max: 2 }),
-    speedFactor: num(synthesis.speedFactor, 1, { min: 0.5, max: 2 }),
-    // -1 是 GPT-SoVITS 约定的「随机种子」。只有显式填了安全整数才锁定，
-    // 其余（缺省、null、小数、字符串）一律回落 -1，避免把脏种子发给服务端。
-    seed: missing(seedRaw) || !Number.isSafeInteger(seedNum) ? -1 : Math.trunc(seedNum),
+    temperature: num(s.temperature, 0.7, { min: 0.05, max: 2 }),
+    topK: Math.round(num(s.topK, 15, { min: 1, max: 100 })),
+    topP: num(s.topP, 0.9, { min: 0.05, max: 1 }),
+    repetitionPenalty: num(s.repetitionPenalty, 1.35, { min: 1, max: 2 }),
+    speedFactor: num(s.speedFactor, 1, { min: 0.5, max: 2 }),
+    seed: seedOf(s.seed),
     textSplitMethod: SPLIT_METHODS.has(method) ? method : 'cut2',
   };
 }
@@ -78,7 +95,14 @@ export async function requestGptSovits(text, config, {maxBytes,maxSeconds,timeou
   let response;
   try {
     response=await fetch(url,{method:'POST',redirect:'error',signal:controller.signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({text,text_lang:'zh',ref_audio_path:config.refAudioPath,prompt_text:config.promptText,prompt_lang:'zh',text_split_method:tuning.textSplitMethod,batch_size:1,speed_factor:tuning.speedFactor,media_type:'wav',streaming_mode:false,seed:tuning.seed,temperature:tuning.temperature,top_k:tuning.topK,top_p:tuning.topP,repetition_penalty:tuning.repetitionPenalty})});
-    if(!response.ok)throw Error(`GPT-SoVITS 服务错误 (${response.status})`);
+    if(!response.ok){
+      // 必须读 body 再抛：GPT-SoVITS 把真正的原因放在 body 里
+      // （例如种子越界会返回 "Seed must be between 0 and 2**32 - 1"），
+      // 只报状态码的话操作者只能去翻服务端控制台才知道哪里配错了。
+      let detail='';
+      try{ detail=(await response.text()).replace(/\s+/g,' ').trim().slice(0,200); }catch{}
+      throw Error(`GPT-SoVITS 服务错误 (${response.status})${detail?`：${detail}`:''}`);
+    }
     if(Number(response.headers.get('content-length'))>maxBytes)throw Error('生成语音超过文件大小上限');
     const parts=[];let bytes=0;
     for await(const chunk of response.body){bytes+=chunk.length;if(bytes>maxBytes)throw Error('生成语音超过文件大小上限');parts.push(chunk);}

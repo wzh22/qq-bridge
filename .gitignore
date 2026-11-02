@@ -81,6 +81,11 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+# 本机语音数据集（owner-voice 切片 + 转写清单）：数百个 wav 切片，且 owner.list
+# 里逐行写着**本机绝对路径**。属于「现场用脚本重切」的产物，不入库；入库既撑大
+# 仓库又会让 privacy-scan 一直报警。
+/datasets/
+
 # 便携版 ffmpeg（约 77 MB，跨平台二进制不入库；用 `npm run fetch:ffmpeg` 现场下载）
 # 缺失时桥接仍有纯 JS 的 GIF 解码兜底，但语音音量处理会不可用。
 /tools/ffmpeg/

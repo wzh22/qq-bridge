@@ -47,10 +47,18 @@ for (const [label, re] of clearSites) {
 }
 
 // 兜底路径必须过安全审计，不能把含令牌/本机路径的正文直接发出去。
-assert(
-  /if \(replyExpected && !shouldBlockSilentReply\(key\)\)[\s\S]{0,700}?SENSITIVE_RE\.test\(plain\)/.test(src),
-  '兜底转发前执行敏感信息审计'
-);
+// 断言方式：不限定「离块首多少字符」，而是要求审计判断确实出现在 sendToQQ **之前**。
+// 原来写的是 {0,700} 距离上限；2026-11-02 在兜底路径前段插入了内部独白检测
+// （detectNarration / NARRATION_NUDGE，见 narration-guard.js），审计被推到约 1300
+// 字符处就误报了 —— 但逻辑并没变（if 独白 / else if 审计 / else 发送，三者互斥）。
+// 距离约束是脆的，位置先后才是真正要保证的东西。
+{
+  const fbStart = src.indexOf('if (replyExpected && !shouldBlockSilentReply(key))');
+  const auditIdx = fbStart < 0 ? -1 : src.indexOf('SENSITIVE_RE.test(plain)', fbStart);
+  const sendIdx = fbStart < 0 ? -1 : src.indexOf('await sendToQQ(key, plain)', fbStart);
+  assert(fbStart >= 0 && auditIdx > fbStart && sendIdx > auditIdx,
+    '兜底转发前执行敏感信息审计');
+}
 // 发送失败不能假装修复过（lastSendSucceeded 是现成的判定）。
 assert(
   /await sendToQQ\(key, plain\);[\s\S]{0,200}?if \(lastSendSucceeded\(key\)\)/.test(src),

@@ -51,8 +51,34 @@ test('sovitsTuning 给默认值，并把越界与非法输入收敛到合法区�
   assert.equal(blank.seed,-1);
   assert.equal(blank.textSplitMethod,'cut2');
 
-  // 小数种子也收敛为 -1，避免把非整数种子发给服务端
-  assert.equal(sovitsTuning({seed:1.5}).seed,-1);
+  // 纯空白同样算「没配」。曾漏掉这一档：Number('   ')===0 会被当成显式 0，
+  // 于是 temperature 被夹到 0.05、seed 变成 0 —— 正是要避免的「留空变极端参数」。
+  const ws=sovitsTuning({temperature:'   ',topK:'   ',topP:'   ',speedFactor:'   ',repetitionPenalty:'   ',seed:'   '});
+  assert.equal(ws.temperature,0.7);
+  assert.equal(ws.topK,15);
+  assert.equal(ws.topP,0.9);
+  assert.equal(ws.speedFactor,1);
+  assert.equal(ws.repetitionPenalty,1.35);
+  assert.equal(ws.seed,-1);
+
+  // 整个对象传 null / undefined 不能炸（默认参数只挡 undefined，null 会一路炸到 .textSplitMethod）
+  assert.equal(sovitsTuning(null).seed,-1);
+  assert.equal(sovitsTuning(undefined).temperature,0.7);
+
+  // 种子区间：GPT-SoVITS 底层只接受 -1 或 [0, 2**32-1]。越界**不会被夹紧，
+  // 而是服务端直接 400**（2026-11-02 实测 2**32 / -5 / 2**53-1 均返回
+  // "Seed must be between 0 and 2**32 - 1"），所以必须自己拦下并回落 -1，
+  // 否则「配置里填了个负数」等于整条语音发不出去。
+  for(const badSeed of [-5,-2,4294967296,2**33,2**53-1,3.5]){
+    assert.equal(sovitsTuning({seed:badSeed}).seed,-1,`seed=${badSeed} 应回落 -1`);
+  }
+  assert.equal(sovitsTuning({seed:-1}).seed,-1);                   // 显式随机
+  assert.equal(sovitsTuning({seed:0}).seed,0);                     // 下边界合法
+  assert.equal(sovitsTuning({seed:4294967295}).seed,4294967295);   // 上边界合法
+  assert.equal(sovitsTuning({seed:'42'}).seed,42);                 // 非空数字串可用
+  for(const junk of [[],[7],true,{},'abc']){
+    assert.equal(sovitsTuning({seed:junk}).seed,-1,`seed=${JSON.stringify(junk)} 不是候选`);
+  }
 });
 
 test('local API request, output limits, malformed WAV, timeout and redirect rejection',async()=>{
@@ -90,13 +116,23 @@ test('local API request, output limits, malformed WAV, timeout and redirect reje
     assert.equal(sent2.top_p,0.4);
     assert.equal(sent2.text_split_method,'cut0');
 
-    // 不同输入的产出必须不再被同一个种子钉死
-    assert.notEqual(sent.seed,sent2.seed);
+    // 同一个 config 连发两次，种字段都应原样是 -1，由服务端决定随机 ——
+    // 而不是被我们钉成某个固定数字。
+    // ⚠️ 不要写成 notEqual(sent.seed,sent2.seed)：那是拿 -1 和 3 比字段值，恒真、什么都没测。
+    // 「两次产出真的不同」必须在真实 TTS 上比对字节，假服务覆盖不了。
+    // 2026-11-02 手工实测：旧参数(seed=42+cut5) 两次字节完全相同(160044B×2)，
+    // 新参数(seed=-1+cut2) 两次不同(170284B / 177964B)。
+    await requestGptSovits('你好',config,options);
+    assert.equal(JSON.parse(body).seed,-1);
 
     await assert.rejects(requestGptSovits('你好',config,{...options,maxBytes:100}),/大小/);
     await assert.rejects(requestGptSovits('你好',config,{...options,maxSeconds:0.5}),/时长/);
     mode='bad';await assert.rejects(requestGptSovits('你好',config,options),/WAV/);
-    mode='error';await assert.rejects(requestGptSovits('你好',config,options),/500/);
+    // 非 2xx 的 body 必须被读出来带进错误消息：GPT-SoVITS 把真正原因放在 body 里
+    //（例如种子越界返回 "Seed must be between 0 and 2**32 - 1"），
+    // 只报状态码的话操作者只能去翻服务端控制台才知道哪里配错。
+    mode='error';await assert.rejects(requestGptSovits('你好',config,options),
+      (e)=>/500/.test(e.message)&&/internal path/.test(e.message));
     mode='redirect';await assert.rejects(requestGptSovits('你好',config,options));
     mode='timeout';await assert.rejects(requestGptSovits('你好',config,{...options,timeoutMs:50}),/超时/);
     await assert.rejects(requestGptSovits('你好',{...config,url:'https://example.com'},options),/本机/);
