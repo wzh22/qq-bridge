@@ -13,6 +13,91 @@ import { StringDecoder } from 'node:string_decoder';
 
 const dnsLookup = dns.promises.lookup;
 
+/*
+ * fake-IP 子网白名单（可选，默认空 = 完全保持原有行为）。
+ *
+ * 为什么需要它：本机若开着 Clash/Mihomo 的 TUN 模式（fake-ip），DNS 会把**所有**公网域名
+ * 解析成 198.18.0.0/15 段里的假地址（实测 github.com -> 198.18.0.130），真正的连接由 TUN
+ * 设备按这个假地址转发。这样的地址落在本机的「私网/本机地址」判定里，会被 isPrivateIp()
+ * 一律拦掉，于是本模块支撑的 web_search / web_fetch 会对所有正常网站间歇性失效。
+ *
+ * 配置入口：环境变量 SAFE_FETCH_FAKE_IP_CIDRS，逗号分隔的 IPv4 CIDR（如
+ * "198.18.0.0/15"）。设计约束：
+ * - 默认空列表 => 不放行任何私网地址，行为与加此机制之前完全一致（不能默认放行）。
+ * - 先按原有逻辑判定为「私网」之后，才查白名单；命中白名单且不在 NEVER_ALLOW_CIDRS 里才放行。
+ * - 环回 / 链路本地（含 169.254.169.254 云 metadata）/ RFC1918 / CGNAT / 预留 / 组播
+ *   无论白名单怎么写都继续拦截，见 NEVER_ALLOW_CIDRS。
+ * - 只支持 IPv4 字面量；IPv6（包括内嵌 IPv4 的 ::ffff:198.18.0.130 之类写法）维持原有拦截。
+ * - 加了 /0 这类过宽前缀也放不出真正内网：NEVER_ALLOW_CIDRS 是在地址级别二次拦截的。
+ */
+const FAKE_IP_CIDRS_ENV = 'SAFE_FETCH_FAKE_IP_CIDRS';
+
+/** 把点分 IPv4 转成无符号 32 位整数；不是合法 IPv4 返回 null。 */
+function ipv4ToInt(address) {
+  const text = String(address ?? '').trim();
+  if (net.isIP(text) !== 4) return null;
+  const parts = text.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0);
+}
+
+/** 解析 IPv4 CIDR（允许省略前缀，按 /32 处理）；非法输入返回 null。 */
+function parseIpv4Cidr(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return null;
+  const slash = raw.indexOf('/');
+  const address = slash === -1 ? raw : raw.slice(0, slash);
+  const bitsText = slash === -1 ? '32' : raw.slice(slash + 1);
+  if (!/^\d{1,2}$/.test(bitsText)) return null;
+  const bits = Number(bitsText);
+  if (bits > 32) return null;
+  const value = ipv4ToInt(address);
+  if (value === null) return null;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return { cidr: raw, network: (value & mask) >>> 0, mask };
+}
+
+// 安全底线：这些网段里的地址永远不能被 fake-IP 白名单放行。
+const NEVER_ALLOW_CIDRS = [
+  '0.0.0.0/8',      // 本机网络
+  '10.0.0.0/8',     // RFC1918
+  '100.64.0.0/10',  // CGNAT
+  '127.0.0.0/8',    // 环回
+  '169.254.0.0/16', // 链路本地（含云 metadata 169.254.169.254）
+  '172.16.0.0/12',  // RFC1918
+  '192.0.0.0/24',   // IETF 协议分配
+  '192.168.0.0/16', // RFC1918
+  '224.0.0.0/4',    // 组播
+  '240.0.0.0/4',    // 保留 + 广播
+].map(parseIpv4Cidr).filter(Boolean);
+
+function isNeverAllowIpv4(value) {
+  return NEVER_ALLOW_CIDRS.some((range) => ((value & range.mask) >>> 0) === range.network);
+}
+
+// 按环境变量原串做缓存，便于运行时改配置（测试无需重新 import 模块）而不必每次重新解析。
+let fakeIpCidrsRaw = null;
+let fakeIpCidrs = [];
+
+function fakeIpCidrsFromEnv() {
+  const raw = typeof process.env[FAKE_IP_CIDRS_ENV] === 'string' ? process.env[FAKE_IP_CIDRS_ENV] : '';
+  if (raw === fakeIpCidrsRaw) return fakeIpCidrs;
+  fakeIpCidrsRaw = raw;
+  fakeIpCidrs = raw.split(',').map((item) => parseIpv4Cidr(item)).filter(Boolean);
+  return fakeIpCidrs;
+}
+
+/**
+ * 该 IPv4 字面量是否被显式配置的 fake-IP 白名单放行。
+ * 白名单命中但落在 NEVER_ALLOW_CIDRS 里的地址仍返回 false（继续拦截）。
+ */
+export function isConfiguredFakeIp(ip) {
+  const value = ipv4ToInt(ip);
+  if (value === null) return false;
+  if (isNeverAllowIpv4(value)) return false;
+  return fakeIpCidrsFromEnv().some((range) => ((value & range.mask) >>> 0) === range.network);
+}
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -63,7 +148,8 @@ function parseEmbeddedIpv4(h) {
   return null;
 }
 
-export function isPrivateIp(ip) {
+/** 原有私网判定逻辑（不含 fake-IP 白名单），递归时也只走它本身。 */
+function isPrivateIpCore(ip) {
   let h = String(ip || '').toLowerCase().replace(/^\[|\]$/g, '');
   const family = net.isIP(h);
   // DNS 返回值也必须是有效 IP；不能把非法地址当成公网地址。
@@ -93,20 +179,35 @@ export function isPrivateIp(ip) {
     // 本地 NAT64 前缀的 IPv4 位布局不等同 /96；整个本地前缀均不可供公网抓取。
     if (h.startsWith('64:ff9b:1:')) return true;
     const embedded = parseEmbeddedIpv4(h);
-    if (embedded) return isPrivateIp(embedded);
+    if (embedded) return isPrivateIpCore(embedded);
     if (h.startsWith('2001:db8')) return true;
     if (h.startsWith('2001:2:') || h.startsWith('2001:10:') || h.startsWith('2001:20:')) return true;
     const sixth4 = h.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4}):/i);
     if (sixth4) {
       const num = (parseInt(sixth4[1], 16) << 16) + parseInt(sixth4[2], 16);
       const ipv4 = `${(num >>> 24) & 255}.${(num >>> 16) & 255}.${(num >>> 8) & 255}.${num & 255}`;
-      if (isPrivateIp(ipv4)) return true;
+      if (isPrivateIpCore(ipv4)) return true;
     }
     if (h.startsWith('ff')) return true;
     return false;
   }
 
   return true;
+}
+
+/**
+ * 判定地址是否必须拦截（true = 私网/本机/不可抓取）。
+ *
+ * 判断顺序：先按原有逻辑判私网 -> 若命中私网，再看是否落在显式配置的 fake-IP 白名单里
+ * -> 白名单命中且不属于 NEVER_ALLOW_CIDRS 才放行，否则维持拦截。
+ * 签名保持不变：其它文件继续按 `isPrivateIp(ip)` 调用。
+ */
+export function isPrivateIp(ip) {
+  const raw = String(ip || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!isPrivateIpCore(raw)) return false;
+  // 白名单只对 IPv4 字面量生效；IPv6（含内嵌/映射私网 IPv4 的写法）一律维持拦截。
+  if (raw.includes('%') || net.isIP(raw) !== 4) return true;
+  return !isConfiguredFakeIp(raw);
 }
 
 /**
