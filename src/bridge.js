@@ -39,6 +39,17 @@ import { setLogger as setVectorLogger, configure as configureVector, syncIndex a
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 // 「她自己的状态」：作息 / 关系进度 / 会按天往前走的小生活（见 inner-life.js 顶部说明）。
 import { buildInnerLifeLines, proactiveFactor, tickLife } from './inner-life.js';
+import { detectNarration, NARRATION_NUDGE } from './narration-guard.js';
+import { TONE_ANCHOR } from './tone-anchor.js';
+import {
+  createStore as createRelationalStore,
+  loadStore as loadRelationalStore,
+  saveStore as saveRelationalStore,
+  noteInteraction,
+  recordMessage as recordRelationalMessage,
+  enrichFromMessages as enrichRelationalFromMessages,
+  renderRelationalBlock
+} from './relational-memory.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import {
@@ -156,6 +167,10 @@ const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 // 她自己的小生活（农场/海/爬塔）。单独存：这是「角色自己的一天」，不属于任何一个会话，
 // 也不该随 /api/socialV2/reset 被清掉——清掉一次上下文不等于她今天没种地。
 const INNER_LIFE_FILE = path.join(STATE_DIR, 'inner-life.json');
+// 跨会话关系记忆：她跟每个人/每个群相处到哪一步了。
+// 与 inner-life 的区别：那个是"她自己的生活"，这个是"她和谁的关系"。
+// 与 diary 的区别：日记按 key 隔离、存的是"发生了什么"，这里存的是"她自己的印象"。
+const RELATIONAL_FILE = path.join(STATE_DIR, 'relational-memory.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 // 主人长期记忆：跨会话有效的人物画像，与会话级的 activeTopic/pendingThought 严格分开存。
 const OWNER_MEMORY_FILE = path.join(STATE_DIR, 'owner-memory.json');
@@ -190,6 +205,13 @@ const DIARY_OTHERS_DECAY_FILE = path.join(STATE_DIR, 'diary-others-decay.json');
 // 混在一起就没法「重跑提炼」了。同样一人一本。
 const DIARY_CORE_FILE = path.join(STATE_DIR, 'diary-core.jsonl');
 const DIARY_OTHERS_CORE_FILE = path.join(STATE_DIR, 'diary-others-core.jsonl');
+// 会话级备忘（qq_memo）：一个文件、按会话 key 逻辑隔离。
+// 为什么不塞进 social-v2.json：那份状态会被 /api/socialV2/reset 与「会话退役」整体重置，
+// 而备忘是模型主动记下的东西，重置一次上下文不该把它一起抹掉。
+const MEMOS_FILE = path.join(STATE_DIR, 'memos.json');
+// 到点提醒（qq_remind）：桥接**自己**要在到点时主动发消息，所以提醒必须落在桥接里，
+// 不能只存在 MCP 进程（DSH 重启即丢）。重启时按这个文件把未到期的重新挂上定时器。
+const REMINDERS_FILE = path.join(STATE_DIR, 'reminders.json');
 
 /**
  * 记忆衰减状态的写盘注册表。挂在模块顶层是刻意的：
@@ -1189,6 +1211,28 @@ function loadConfig() {
     cfg.socialV2.proactive.quietRanges = normalizeQuietRanges(cfg.socialV2.proactive.quietRanges);
   }
 
+  // socialV2.rotation：自动会话轮换（见 maybeRotateSession 的说明）。
+  // 与 proactive 同一个理由必须在这里兜底：外层 `...(file.socialV2 ?? {})` 是浅覆盖，
+  // config.json 里只要写过一次 `rotation: { enabled: false }`，阈值/间隔就全丢了。
+  // 默认值从宽（150 轮 / 30 分钟空闲），宁可少换。
+  cfg.socialV2.rotation = {
+    enabled: true,
+    // 触发阈值：两条满足任意一条即可（另有「空闲 + 没在跑 + 不处于免打扰」三道闸门）。
+    minTurns: 150,
+    minMessages: 600,
+    // 距离该会话最后一条消息至少这么久才换；绝不在对话进行中换。
+    idleMs: 30 * 60 * 1000,
+    // 扫描间隔：每 5 分钟看一眼，不逐消息判定。
+    checkIntervalMs: 5 * 60 * 1000,
+    // 免打扰时段（默认沿用 socialV2.proactive.quietRanges）里不换。
+    respectQuietHours: true,
+    // 显式覆盖免打扰时段；null = 沿用 proactive 那一份。支持数组或 "22:00-06:30" 文本。
+    quietRanges: null,
+    // 记忆写入失败后的退避：这段时间内不再为同一个会话尝试（只记日志，不重试到烧钱）。
+    memoryFailureBackoffMs: 6 * 60 * 60 * 1000,
+    ...(cfg.socialV2.rotation ?? {})
+  };
+
   // socialV2.tools 需要与默认值深度合并：旧 config.json 若缺少新增工具开关，
   // 不能因为外层 spread 覆盖而丢失默认开关。
   cfg.socialV2.tools = {
@@ -1922,6 +1966,58 @@ async function main() {
   }, 15 * 60 * 1000);
   if (typeof vectorSyncInterval.unref === 'function') vectorSyncInterval.unref();
 
+  // ── 跨会话关系记忆 ────────────────────────────────────────────────────
+  //
+  // 存「她跟每个人/每个群处到哪一步」，与 diary 的按 key 隔离不冲突：
+  //   diary 存「发生了什么」（原文级，严格隔离，各人一本）
+  //   这里存「她自己的印象」（话题类别、次数、气氛，无原文）
+  // 隐私闸门在 relational-memory.js 里，落盘前已过滤，这里只管读写。
+  const relationalStore = createRelationalStore(RELATIONAL_FILE);
+  let relationalWritable = true;
+  try {
+    loadRelationalStore(relationalStore, {
+      onCorrupt: (m) => log(`⚠️ 关系记忆库读取失败（已降级为只读，避免覆盖）: ${m}`)
+    });
+  } catch (error) {
+    relationalWritable = false;
+    log(`⚠️ 关系记忆库加载失败：${error?.message ?? error}`);
+  }
+  function relationalMemoryEnabled() {
+    return cfg.relationalMemory?.enabled !== false && relationalWritable;
+  }
+
+  /**
+   * 关系记忆里怎么称呼一个人。
+   *
+   * 刻意**不用**对方昵称/群名片：那是对方随时可改的、也可能含隐私信息，
+   * 而且跨会话展示时容易撞车（好几个人都叫「小明」）。
+   * 用脱敏尾巴（…1798）+ 群号后四位，和 owner-inbox.js 的 maskQQ 同一思路。
+   */
+  function displayLabelFor(key, sender) {
+    const m = /^(group|private):(\d+)$/.exec(String(key ?? ''));
+    if (!m) return '';
+    const tail = m[2].slice(-4);
+    const kind = m[1] === 'group' ? `群…${tail}` : `…${tail}`;
+    // 主人自己单独标出来，模型据此知道他分量不同
+    if (isOwnerPrivateSession(key)) return '主人';
+    // 群聊里带上说话人，但同样只留尾巴
+    const s = String(sender ?? '').trim();
+    if (m[1] === 'group' && s) return `${kind}·${s.slice(0, 8)}`;
+    return kind;
+  }
+  let relationalSaveTimer = null;
+  function scheduleRelationalSave() {
+    if (!relationalWritable) return;
+    if (relationalSaveTimer) clearTimeout(relationalSaveTimer);
+    // 防抖 3 秒：一轮对话可能多次触发，合并成一次落盘
+    relationalSaveTimer = setTimeout(() => {
+      relationalSaveTimer = null;
+      const r = saveRelationalStore(relationalStore);
+      if (!r.ok) log(`⚠️ 关系记忆库写入失败（不影响聊天）: ${r.error}`);
+    }, 3000);
+  }
+  if (typeof relationalSaveTimer?.unref === 'function') relationalSaveTimer.unref();
+
   // 记忆衰减状态。读失败**绝不**阻断日记功能：衰减状态丢了只是
   // 「所有记忆重新变新鲜」，比让桥接起不来、或让模型看不到日记强得多。
   // 所以这里只 log 一行，不设 writable 开关。
@@ -2319,10 +2415,22 @@ async function main() {
         volume: audio?.volume ?? vc.defaultVolume,
         normalize: audio?.normalize === true,
         loudness: audio?.loudness ?? vc.loudness,
-        ffmpegPath: vc.ffmpegPath
+        ffmpegPath: vc.ffmpegPath,
+        // 临时目录必须落在仓库内，不能用 os.tmpdir()。
+        // 2026-11-03 事故：bridge 进程对 %TEMP%\voice-processed 报 Permission denied，
+        // 后处理一启用就全盘发不出语音。state/ 是 bridge 自己恒定可写、且随仓库一起迁移的位置。
+        tmpDir: path.join(STATE_DIR, 'tmp', 'voice')
       });
     } catch (error) {
-      throw new Error(`音量处理失败：${error?.message ?? error}`);
+      // 后处理（音量/归一化/句尾渐弱留白）属于增强项，不该让整条语音发不出去。
+      // 2026-11-03 事故：加了句尾渐弱后 ffmpeg 在 bridge 环境里退出码 1，
+      // 语音直接被这个 catch 拦死、一条都发不出去 —— 而用户只想知道 bot 能不能说话。
+      // 现在的规则：操作者显式要求音量/归一化时，失败仍然冒泡（那是他明确的指令）；
+      // 默认参数下的后处理失败则降级为原文件发送，并把原因写进日志。
+      const explicitAudio = audio && (audio.volume !== undefined || audio.normalize === true || audio.loudness !== undefined);
+      if (explicitAudio) throw new Error(`音量处理失败：${error?.message ?? error}`);
+      log(`[voice] 后处理失败，降级发送原文件：${error?.message ?? error}`);
+      processed = { path: filePath, converted: false, applied: false, volume: 1, loudness: null, mode: 'original', detail: '原始（后处理失败已降级）' };
     }
     const sendPath = processed.path;
 
@@ -3154,11 +3262,24 @@ async function main() {
    * 共用一条会让主人的私聊内容留在别人整理日记时可见的上下文里。
    * 水位与冷却各自独立 —— 事实提炼失败不该让日记也停摆。
    */
-  async function runDiaryWrite(key) {
-    if (!diaryEnabled()) return;
-    if (!dshReady) return;
+  async function runDiaryWrite(key, opts = {}) {
+    // opts.force=true：自动会话轮换前的「最后一次整理」。把 min 降到 1 条，
+    // 让只差几条就够一批的尾巴也能落盘；仍受 batchMessages 约束，
+    // 没读完的留在归档里、水位不推进，下次照常整理（不会丢）。
+    const force = opts?.force === true;
+    // 返回值从 2026-11-03 起改成结构化结果：轮换必须知道「记忆到底写没写成」。
+    // 旧调用方（queueDiaryTask(() => runDiaryWrite(key))）不看返回值，行为不变。
+    if (!diaryEnabled()) return { ok: false, reason: 'diary-disabled', written: 0 };
+    if (!dshReady) return { ok: false, reason: 'dsh-not-ready', written: 0 };
     const batchSize = Math.max(5, Number(cfg.diary?.batchMessages ?? 30));
-    const min = Math.max(5, Number(cfg.diary?.minMessages ?? 15));
+    const min = force ? 1 : Math.max(5, Number(cfg.diary?.minMessages ?? 15));
+    const forOwner = isOwnerPrivateSession(key);
+    // 日记本处于「只读降级」（启动时加载失败）时 writeDiaryEntry 会全部失败，
+    // 但函数整体仍会“成功”走到结尾。轮换必须能识别这种静默失败，
+    // 否则退役等于把记忆丢掉却记成成功——这正是本功能最不能出的错。
+    if (forOwner ? !diaryWritable : !diaryOthersWritable) {
+      return { ok: false, reason: 'diary-readonly', written: 0 };
+    }
     const offset = ownerArchiveOffset(`diary:${key}`);
     // 共享归档里可能连续很多行都是其他会话。按 key 向后扫到攒够一批，
     // 避免他人日记的水位因固定窗口里全是主人消息而永远卡在 0。
@@ -3169,16 +3290,23 @@ async function main() {
     });
     if (mine.length < min) {
       diaryWriteCooldowns.delete(key);
-      return;
+      if (force) {
+        // 没有待整理的新消息 = 这段对话已经写完了。
+        // 只有水位 > 0 时才敢这么断言：水位 0 表示从未写过这个会话，
+        // 此时退役等于把整段对话扔掉 —— 轮换必须拒绝。
+        return offset > 0
+          ? { ok: true, reason: 'up-to-date', written: 0, offset: nextOffset }
+          : { ok: false, reason: 'no-archive', written: 0 };
+      }
+      return { ok: true, reason: 'below-min', written: 0, offset: nextOffset };
     }
 
-    const forOwner = isOwnerPrivateSession(key);
     let sessionId;
     try {
       sessionId = forOwner ? await ensureOwnerLearnerSession() : await ensureDiaryOthersSession();
     } catch (error) {
       log(`日记整理会话创建失败 (${key}):`, error?.message ?? error);
-      return;
+      return { ok: false, reason: 'session-create-failed', written: 0 };
     }
 
     // 「最近写过的日记（避免重复）」这份上下文也必须按归属取：
@@ -3192,7 +3320,7 @@ async function main() {
       const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
       if (!accepted.result.ok) {
         log(`日记整理被拒 (${key}): ${accepted.result.error.code}: ${accepted.result.error.message}`);
-        return;
+        return { ok: false, reason: 'prompt-rejected', written: 0 };
       }
       output = await waitLearnerTurn(sessionId);
     } catch (error) {
@@ -3201,7 +3329,7 @@ async function main() {
         if (forOwner) invalidateOwnerLearnerSession(sessionId); else diaryOthersSessionId = null;
       }
       log(`日记整理失败 (${key}):`, error?.message ?? error);
-      return;
+      return { ok: false, reason: 'prompt-failed', written: 0 };
     }
 
     const parsed = parseDiaryJson(output);
@@ -3226,6 +3354,9 @@ async function main() {
     if (writtenEntries.length) {
       consolidateDiaryCore(key, forOwner, writtenEntries);
     }
+
+    // 走到这里 = 模型这一批真的处理完了（写没写入条目都算成功）。
+    return { ok: true, reason: 'written', written, offset: nextOffset, total: mine.length };
   }
 
   /**
@@ -4334,7 +4465,7 @@ async function main() {
     markReadCalledKeys.delete(key);
   }
 
-  function retireSession(key) {
+  function retireSession(key, reason = '会话权限已变化') {
     const sessionId = state.sessions[key];
     delete state.sessions[key];
     delete state.sessionPolicies[key];
@@ -4375,7 +4506,7 @@ async function main() {
     saveState();
     saveSocialV2State();
     stopRetiredSessionWork(sessionId, key);
-    log(`会话权限已变化，停用旧映射 ${key} -> ${sessionId}`);
+    log(`${reason}，停用旧映射 ${key} -> ${sessionId}`);
   }
 
   function reconcileSessionPolicies() {
@@ -4393,6 +4524,386 @@ async function main() {
       if (!isCurrentSession(key, sessionId)) retireSession(key);
     }
   }
+
+  // ── 自动会话轮换（按轮次/消息数优雅退役旧 DSH 会话） ───────────────────────
+  //
+  // 要解决的问题：QQ 会话的 DSH session 只增不减。最大的一条实测 27.78 MB（压缩后），
+  // 而 DSH 的压缩阈值实际约 64 万 tokens（contextWindow 90 万 − 输出预留 25.6 万 −
+  // headroomTokens），几乎永不触发。结果是「聊得越久 → 每轮请求的上下文越大 →
+  // 延迟越高 → 越容易顶到上限」。换个新会话 = 上下文归零重新累积。
+  //
+  // 换会话的顺序**写死**在 maybeRotateSession 里：
+  //   ① 判定三条触发条件（够长 / 空闲 / 没在跑）
+  //   ② 等记忆写入真正完成（复用 runDiaryWrite，不另造一套通道）
+  //   ③ 写完再核对一次（期间来了消息/开了新回合 → 放弃）
+  //   ④ retireSession() 退役旧会话（新会话由下一条消息经 ensureSession 懒创建）
+  //   ⑤ 记账 + 记日志
+  // 任何一步失败一律「宁可不换」：只记日志并退避，不重试到烧钱。
+  //
+  // 记账落 state/session-rotation.json（tmp+rename 原子写），重启后计数继续有效。
+  const ROTATION_FILE = path.join(STATE_DIR, 'session-rotation.json');
+  // 有界：只保留最近活跃的若干个会话的记账，长期运行不会自己膨胀。
+  const ROTATION_MAX_KEYS = 200;
+  let rotationStore = null;
+  let rotationSaveWarned = false;
+  const rotationInFlight = new Set(); // key：正在判定/换会话（防并发重复换）
+
+  function rotationNumber(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  /** 归一化轮换配置：缺省值、下限、以及「免打扰从哪来」。 */
+  function rotationCfg() {
+    const raw = (cfg.socialV2 && cfg.socialV2.rotation && typeof cfg.socialV2.rotation === 'object')
+      ? cfg.socialV2.rotation : {};
+    // 免打扰默认沿用主动冒泡那一份（那边有完整默认值），也允许 rotation 自己覆盖。
+    const quietRaw = raw.quietRanges ?? cfg.socialV2?.proactive?.quietRanges ?? [];
+    return {
+      enabled: raw.enabled !== false,
+      minTurns: Math.max(1, Math.floor(rotationNumber(raw.minTurns, 150))),
+      minMessages: Math.max(1, Math.floor(rotationNumber(raw.minMessages, 600))),
+      idleMs: Math.max(0, rotationNumber(raw.idleMs, 30 * 60 * 1000)),
+      // 下限 30s：扫描再密也没有意义，还会白读盘。
+      checkIntervalMs: Math.max(30000, rotationNumber(raw.checkIntervalMs, 5 * 60 * 1000)),
+      respectQuietHours: raw.respectQuietHours !== false,
+      // 统一过一遍规范化：既接受 [{start,end}]，也接受 ["22:00-06:30"] 这类简写，
+      // 与 socialV2.proactive.quietRanges 的加载口径保持一致（配错一格不该整段失效）。
+      quietRanges: normalizeQuietRanges(quietRaw),
+      memoryFailureBackoffMs: Math.max(0, rotationNumber(raw.memoryFailureBackoffMs, 6 * 60 * 60 * 1000))
+    };
+  }
+
+  function rotationRecordFrom(val) {
+    const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0; };
+    return {
+      sessionId: String(val?.sessionId ?? ''),
+      turns: num(val?.turns),
+      messages: num(val?.messages),
+      lastActivityAt: num(val?.lastActivityAt),
+      firstSeenAt: num(val?.firstSeenAt),
+      rotations: num(val?.rotations),
+      lastRotatedAt: num(val?.lastRotatedAt),
+      lastRotationReason: String(val?.lastRotationReason ?? '').slice(0, 160),
+      lastMemoryFailureAt: num(val?.lastMemoryFailureAt),
+      memoryFailureCount: num(val?.memoryFailureCount)
+    };
+  }
+
+  function loadRotationStore() {
+    if (rotationStore) return rotationStore;
+    const store = { version: 1, keys: Object.create(null) };
+    try {
+      const raw = readJsonSafe(ROTATION_FILE, null);
+      const keys = raw && typeof raw === 'object' && raw.keys && typeof raw.keys === 'object' ? raw.keys : null;
+      if (keys) {
+        for (const [key, val] of Object.entries(keys)) {
+          // 只接受内部约定的会话 key，防止状态文件被塞进任意键（与 social-v2 加载一致）。
+          if (!/^(group|private):\d+$/.test(key)) continue;
+          if (!val || typeof val !== 'object') continue;
+          store.keys[key] = rotationRecordFrom(val);
+        }
+      }
+    } catch (error) {
+      log('会话轮换记账读取失败，按空表启动（不影响对话）:', error?.message ?? error);
+    }
+    rotationStore = store;
+    return rotationStore;
+  }
+
+  function saveRotationStore() {
+    if (!rotationStore) return;
+    try {
+      const entries = Object.entries(rotationStore.keys);
+      if (entries.length > ROTATION_MAX_KEYS) {
+        entries.sort((a, b) => (Number(b[1].lastActivityAt) || 0) - (Number(a[1].lastActivityAt) || 0));
+        const kept = Object.create(null);
+        for (const [k, v] of entries.slice(0, ROTATION_MAX_KEYS)) kept[k] = v;
+        rotationStore.keys = kept;
+      }
+      atomicWriteJson(ROTATION_FILE, { version: 1, keys: rotationStore.keys });
+    } catch (error) {
+      // 记账写不进去最多是「重启后从 0 重新累计」，绝不能影响对话或轮换判定本身。
+      if (!rotationSaveWarned) {
+        rotationSaveWarned = true;
+        log('⚠️ 会话轮换记账写入失败（下次再试；不影响对话）:', error?.message ?? error);
+      }
+    }
+  }
+
+  /**
+   * 取（必要时建）某个会话的轮换记账，并保证「计数只属于当前这条 DSH 会话」。
+   * 会话换了（退役/重置/DSH 重建）→ 轮次归零；累计轮换次数与时间保留。
+   */
+  function rotationRecordFor(key, sessionId) {
+    const store = loadRotationStore();
+    let rec = store.keys[key];
+    if (!rec) {
+      rec = rotationRecordFrom({ sessionId: String(sessionId || '') });
+      rec.firstSeenAt = Date.now();
+      store.keys[key] = rec;
+      return rec;
+    }
+    const wanted = String(sessionId || '');
+    if (wanted && rec.sessionId !== wanted) {
+      // 只有「已经记着一条 DSH 会话、现在换成了另一条」才算会话变了 → 计数归零。
+      // rec.sessionId 为空有两种来源，都**不能**清计数：
+      //   ① 刚轮换完（记账已把 sessionId 置空，但轮换后、新会话建立前收到的来信
+      //      已经累加到 messages 上了）；
+      //   ② 这个 key 还没建过会话（先来了消息、后建会话）。
+      // 这里若一律归零，会把「换会话后第一段消息」的计数悄悄抹掉 —— 方向虽然偏保守
+      // （少算 → 换得更晚），但记账不该在无声处丢数。
+      if (rec.sessionId) {
+        rec.turns = 0;
+        rec.messages = 0;
+      }
+      rec.sessionId = wanted;
+      rec.firstSeenAt = Date.now();
+    }
+    return rec;
+  }
+
+  /** 一个回合正常收尾（turn/end）记一次。只记当前 QQ 会话自己的回合。 */
+  function noteRotationTurn(sessionId) {
+    try {
+      const key = reverse.get(sessionId);
+      if (!key || state.sessions[key] !== sessionId) return;
+      if (!/^(group|private):\d+$/.test(key)) return;
+      const rec = rotationRecordFor(key, sessionId);
+      rec.turns += 1;
+      rec.lastActivityAt = Date.now();
+      saveRotationStore();
+    } catch (error) {
+      log('会话轮换记账（回合）失败（不影响对话）:', error?.message ?? error);
+    }
+  }
+
+  /** 收到一条来信记一次（只在 appendSocialV2Message 里调用，拍一拍不算）。 */
+  function noteRotationMessage(key) {
+    try {
+      const k = String(key ?? '');
+      if (!/^(group|private):\d+$/.test(k)) return;
+      const rec = rotationRecordFor(k, state.sessions[k] || '');
+      rec.messages += 1;
+      rec.lastActivityAt = Date.now();
+      saveRotationStore();
+    } catch (error) {
+      log('会话轮换记账（消息）失败（不影响对话）:', error?.message ?? error);
+    }
+  }
+
+  /** 「最后活跃时刻」取三者最大：记账、最后来信、最后一次 AI 发言。 */
+  function rotationLastActivity(key, st, rec) {
+    return Math.max(
+      Number(rec?.lastActivityAt) || 0,
+      Number(st?.lastIncomingAt) || 0,
+      Number(st?.lastAiReplyAt) || 0
+    );
+  }
+
+  /**
+   * 判定一次「该不该换这个会话的 DSH 会话」，该换就换。
+   *
+   * 纯判定 + 一次受控副作用（记忆写入 → retireSession）。返回结构化结果，
+   * 供控制台手动触发与自动扫描共用；**不做重试**（失败退避见配置）。
+   */
+  async function maybeRotateSession(key, opts = {}) {
+    const source = String(opts?.source || 'timer');
+    const result = {
+      ok: false, key: String(key ?? ''), rotated: false, source,
+      skipped: '', reason: '', at: new Date().toISOString()
+    };
+    const conf = rotationCfg();
+    if (!conf.enabled) { result.skipped = 'disabled'; return result; }
+    const k = canonicalV2Key(key);
+    if (!k) { result.skipped = 'invalid-key'; return result; }
+    result.key = k;
+    const sessionId = state.sessions[k];
+    if (!sessionId) { result.skipped = 'no-session'; return result; }
+    if (!isCurrentSession(k, sessionId)) { result.skipped = 'session-not-current'; return result; }
+    if (!isSessionAllowedInCurrentMode(k)) { result.skipped = 'not-allowed'; return result; }
+    if (rotationInFlight.has(k)) { result.skipped = 'in-flight'; return result; }
+    // 前提：必须有可用的日记通道。没有「先写记忆」这一步就不换 —— 宁可不换。
+    if (!diaryEnabled()) {
+      result.skipped = 'diary-disabled';
+      result.reason = '日记本关闭，无法在退役前保存记忆，拒绝轮换';
+      return result;
+    }
+    if (!dshReady) { result.skipped = 'dsh-not-ready'; return result; }
+
+    const st = socialV2.conversations.get(k) ?? null;
+    const rec = rotationRecordFor(k, sessionId);
+    result.turns = rec.turns;
+    result.messages = rec.messages;
+
+    // ① 够长：轮次或消息数任意一条达标即可。
+    if (rec.turns < conf.minTurns && rec.messages < conf.minMessages) {
+      result.skipped = 'not-long-enough';
+      result.reason = `轮次 ${rec.turns}/${conf.minTurns}，消息 ${rec.messages}/${conf.minMessages}`;
+      return result;
+    }
+    // ② 空闲：距最后一条消息至少 idleMs。绝不在对话进行中换。
+    const lastActivity = rotationLastActivity(k, st, rec);
+    if (!lastActivity) { result.skipped = 'unknown-activity'; return result; }
+    const idleMs = Date.now() - lastActivity;
+    result.idleMs = idleMs;
+    if (idleMs < conf.idleMs) {
+      result.skipped = 'not-idle';
+      result.reason = `距最后一条消息 ${Math.round(idleMs / 1000)}s < ${Math.round(conf.idleMs / 1000)}s`;
+      return result;
+    }
+    // 免打扰时段不换：轮换要先跑一次「整理日记」的模型调用，别在人家睡觉时做。
+    if (conf.respectQuietHours) {
+      const quiet = matchQuietRange(conf.quietRanges, new Date());
+      if (quiet) {
+        result.skipped = 'quiet-hours';
+        result.reason = `当前处于免打扰时段 ${quiet.label}`;
+        return result;
+      }
+    }
+    // ③ 没在跑：没有在途 turn / 工具调用 / 排队中的投递 / 等回答的挂起请求。
+    if (pending.has(k) || activeWaits.has(k) || isConversationBusyV2(k, st)) {
+      result.skipped = 'busy';
+      result.reason = pending.has(k) ? 'pending-question'
+        : (activeWaits.has(k) ? 'active-wait' : busyReasonV2(k, st));
+      return result;
+    }
+    // 还有未读消息 = 还有话没回，换会话等于把它们扔掉。
+    if (Array.isArray(st?.unread) && st.unread.length > 0) {
+      result.skipped = 'unread-pending';
+      result.reason = `${st.unread.length} 条未读消息未处理`;
+      return result;
+    }
+    // 记忆写入失败后的退避：只记日志，不每 5 分钟重试一次烧钱。
+    if (conf.memoryFailureBackoffMs > 0 && rec.lastMemoryFailureAt
+      && Date.now() - rec.lastMemoryFailureAt < conf.memoryFailureBackoffMs) {
+      result.skipped = 'memory-backoff';
+      result.reason = `上次记忆写入失败于 ${Math.round((Date.now() - rec.lastMemoryFailureAt) / 60000)} 分钟前，退避中`;
+      return result;
+    }
+
+    rotationInFlight.add(k);
+    try {
+      // ② 先把这段对话的要点写进日记，并且**等它真的写完**。
+      // 走同一条 queueDiaryTask 串行链：不会和其他日记/事实任务并发写盘。
+      const memory = await queueDiaryTask(() => runDiaryWrite(k, { force: true }));
+      result.memory = memory
+        ? { ok: memory.ok === true, reason: String(memory.reason ?? ''), written: Number(memory.written) || 0 }
+        : null;
+      if (!memory || memory.ok !== true) {
+        // 最重要的一条安全断言：记忆没写成 → 绝不退役。
+        rec.lastMemoryFailureAt = Date.now();
+        rec.memoryFailureCount = (rec.memoryFailureCount || 0) + 1;
+        saveRotationStore();
+        result.skipped = 'memory-write-failed';
+        result.reason = `记忆写入未成功（${memory?.reason ?? 'unknown'}）`;
+        log(`[rotation] ${k} 放弃轮换：记忆写入未成功（${memory?.reason ?? 'unknown'}），退避 ${Math.round(conf.memoryFailureBackoffMs / 60000)} 分钟`);
+        return result;
+      }
+      // ③ 写记忆期间世界可能变了：会话被重置 / 又开了新回合 / 又来了消息 → 放弃。
+      if (state.sessions[k] !== sessionId) { result.skipped = 'session-changed-during-write'; return result; }
+      const st2 = socialV2.conversations.get(k) ?? null;
+      if (pending.has(k) || activeWaits.has(k) || isConversationBusyV2(k, st2)) {
+        result.skipped = 'busy-during-write';
+        result.reason = busyReasonV2(k, st2);
+        return result;
+      }
+      if (Array.isArray(st2?.unread) && st2.unread.length > 0) {
+        result.skipped = 'unread-during-write';
+        result.reason = `${st2.unread.length} 条未读消息未处理`;
+        return result;
+      }
+      const lastActivity2 = rotationLastActivity(k, st2, rec);
+      if (!lastActivity2 || Date.now() - lastActivity2 < conf.idleMs) {
+        result.skipped = 'activity-during-write';
+        return result;
+      }
+
+      // ④ 退役旧会话。新会话由下一轮消息经 ensureSession() 懒创建（不在这里预建，
+      //    预建会在 DSH 里留下一条空转会话，而且失败时还得再处理一次）。
+      retireSession(k, '会话轮换');
+      const rotatedAt = Date.now();
+      rec.sessionId = '';
+      rec.turns = 0;
+      rec.messages = 0;
+      rec.lastActivityAt = rotatedAt;
+      rec.rotations = (rec.rotations || 0) + 1;
+      rec.lastRotatedAt = rotatedAt;
+      rec.lastMemoryFailureAt = 0;
+      rec.memoryFailureCount = 0;
+      rec.lastRotationReason = `turns=${result.turns},messages=${result.messages},idle=${Math.round(idleMs / 1000)}s,memory=${Number(memory.written) || 0}`;
+      saveRotationStore();
+
+      // ⑤ 补回「还没到期的有限潜水唤醒」。retireSession 会清掉这个 key 的所有 v2 定时器
+      // （clearSocialV2Timers），不补的话她跟人约好的「过会儿我再来找你」就永远等不到
+      // 那次 timeout 唤醒了 —— 会话换新，但约定不该丢。wakeConfig 本身是持久化的，
+      // 这里只是按它重新挂一次定时器（无限潜水时会自动 no-op）。
+      if (currentMode === 'reserved2') {
+        try { setupSleepTimerV2(k); } catch (error) {
+          log(`[rotation] ${k} 恢复潜水定时器失败（不影响已完成的轮换）:`, error?.message ?? error);
+        }
+      }
+
+      result.ok = true;
+      result.rotated = true;
+      result.oldSessionId = sessionId;
+      result.memoryWritten = Number(memory.written) || 0;
+      result.reason = 'rotated';
+      const memNote = result.memoryWritten
+        ? `日记写入 ${result.memoryWritten} 条`
+        : `日记已是最新（${memory.reason}）`;
+      log(`[rotation] 已换会话 ${k}：旧会话 ${sessionId}，${result.turns} 轮/${result.messages} 条消息，空闲 ${Math.round(idleMs / 1000)}s，${memNote}；新会话将在下一条消息时创建`);
+      appendActivity(`${k} 自动会话轮换：旧会话 ${sessionId}，${result.turns} 轮/${result.messages} 条消息，${memNote}`);
+      return result;
+    } catch (error) {
+      // 兜底：任何异常都不换，只记日志（宁可不换）。
+      result.error = error?.message ?? String(error);
+      result.skipped = result.skipped || 'error';
+      log(`[rotation] ${k} 轮换判定异常（本次不换）:`, result.error);
+      return result;
+    } finally {
+      rotationInFlight.delete(k);
+    }
+  }
+
+  /** 定时扫描：对每条仍有映射的会话各判定一次（串行，避免并发写日记）。 */
+  async function sweepSessionRotation() {
+    const conf = rotationCfg();
+    if (!conf.enabled) return { ok: true, skipped: 'disabled', checked: 0, rotated: [] };
+    const rotated = [];
+    let checked = 0;
+    for (const key of Object.keys(state.sessions)) {
+      if (!state.sessions[key]) continue;
+      checked += 1;
+      try {
+        const r = await maybeRotateSession(key, { source: 'timer' });
+        if (r.rotated) rotated.push(key);
+      } catch (error) {
+        log(`[rotation] ${key} 扫描异常（本次不换）:`, error?.message ?? error);
+      }
+    }
+    return { ok: true, checked, rotated };
+  }
+
+  /** 控制台 /api/session/rotation：看配置与每个会话的累计量。 */
+  function buildRotationStatus() {
+    const conf = rotationCfg();
+    const store = loadRotationStore();
+    const keys = Object.create(null);
+    for (const [key, rec] of Object.entries(store.keys)) {
+      const sid = state.sessions[key];
+      keys[key] = {
+        ...rec,
+        mapped: !!sid,
+        idleMs: sid ? Math.max(0, Date.now() - rotationLastActivity(key, socialV2.conversations.get(key), rec)) : null
+      };
+    }
+    return { ok: true, config: conf, keys };
+  }
+
+  // 定时器只跑一次扫描；间隔由配置决定（默认 5 分钟）。
+  const rotationTimer = setInterval(() => { void sweepSessionRotation(); }, rotationCfg().checkIntervalMs);
+  rotationTimer.unref?.();
 
   let flushingQueue = false;
   let flushQueueAgain = false;
@@ -7767,7 +8278,7 @@ async function main() {
             voiceBudgetCheck(key, voice);
             let voiceRef = ref;
             if (synthesizing) {
-              if (cfg.socialV2?.voice?.synthesis?.enabled !== true) { sendJson({ok:false,error:'文字语音与短歌合成未启用'},403); return; }
+              if (cfg.socialV2?.voice?.synthesis?.enabled !== true) { sendJson({ok:false,error:'语音合成未启用'},403); return; }
               const request = normalizeSynthesis({text:body.text,mode:body.mode,song:body.song,notes:body.notes});
               assertOutboundAuditOk(key, request.text);
               if (body.dryRun === true) { sendJson({ok:true,dryRun:true,key,mode:request.mode,characters:[...request.text].length}); return; }
@@ -9004,6 +9515,48 @@ async function main() {
           sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
           return;
         }
+        // ── 生活工具：会话级备忘（qq_memo）与到点提醒（qq_remind） ───────────
+        //
+        // 两个端点共用一套前置校验，理由与 memory/diary 完全相同：
+        //   ① 令牌必须能反查到**这个**会话（agentTokenOk）——备忘/提醒按会话隔离，
+        //      如果只信 body.key，模型填一个别人的 key 就能读到别人的备忘；
+        //   ② 会话必须仍在当前模式的白名单内（v2SessionAllowed）；
+        //   ③ 工具开关打开（v2ToolEnabled）——关掉的工具在 MCP 侧也已不注册，这里再兜一道。
+        //
+        // 备忘是纯本地数据（不外发）；提醒到点由桥接自己发一条纯文本，
+        // 走 auditAndSend（敏感信息审计 + 令牌脱敏 + 白名单复查），不是绕过发送层。
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/memo' || url.pathname === '/api/socialV2/remind')) {
+          const isMemo = url.pathname === '/api/socialV2/memo';
+          let body;
+          try {
+            body = await readBody();
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? '请求体解析失败' }, error?.statusCode || 400);
+            return;
+          }
+          const key = canonicalV2Key(String(body.key ?? '').trim());
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '');
+          const action = String(body.action ?? 'list').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: '会话令牌无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled(isMemo ? 'memo' : 'remind')) {
+            sendJson({ ok: false, error: `工具未启用：${isMemo ? 'qq_memo' : 'qq_remind'}` }, 403);
+            return;
+          }
+          if (isMemo) {
+            if (action === 'set') { const r = memoSet(key, body); sendJson(r, r.ok ? 200 : (r.code || 400)); return; }
+            if (action === 'delete') { const r = memoDelete(key, body.id); sendJson(r, r.ok ? 200 : (r.code || 400)); return; }
+            if (action === 'list') { sendJson(memoSummary(key)); return; }
+            sendJson({ ok: false, error: 'action 必须是 set / list / delete' }, 400);
+            return;
+          }
+          if (action === 'add') { const r = addReminder(key, body); sendJson(r, r.ok ? 200 : (r.code || 400)); return; }
+          if (action === 'delete') { const r = deleteReminder(key, body.id); sendJson(r, r.ok ? 200 : (r.code || 400)); return; }
+          if (action === 'list') { sendJson(reminderSummary(key)); return; }
+          sendJson({ ok: false, error: 'action 必须是 add / list / delete' }, 400);
+          return;
+        }
         // 主人长期记忆（只读）。
         //
         // 刻意**只提供 GET**：没有任何写/删端点。长期记忆由后台提炼流程写入，
@@ -9955,6 +10508,26 @@ async function main() {
           try { await withTimeout(api.workspace.archiveSession({ sessionId: oldSessionId }), DSH_CONTROL_TIMEOUT_MS, 'archiveSession'); } catch {}
           log(`控制台：已清除会话上下文 ${key}（旧会话 ${oldSessionId} 已停止并归档）`);
           sendJson({ ok: true, key, archived: oldSessionId });
+          return;
+        }
+        // ── 自动会话轮换：手动触发一次判定 ──────────────────────────────────
+        // 自动路径是 sweepSessionRotation 的定时器；这里只是把同一条判定暴露给运维，
+        // 也便于“刚调完配置想立刻确认”时不必等 5 分钟。
+        // 条件不满足或记忆没写成 → 409 + skipped 原因（区分「拒绝」与「异常」）。
+        if (req.method === 'POST' && url.pathname === '/api/session/rotate') {
+          try {
+            const body = await readBody();
+            const key = String(body.key ?? url.searchParams.get('key') ?? '').trim();
+            if (!key) { sendJson({ ok: false, error: '缺少 key' }, 400); return; }
+            const result = await maybeRotateSession(key, { source: 'console' });
+            sendJson(result, result.rotated ? 200 : 409);
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/session/rotation') {
+          sendJson(buildRotationStatus());
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/workspace/reset') {
@@ -11850,6 +12423,619 @@ async function main() {
   // 操作者预写的会话初始提示词（与控制台入口同样在 main() 里；损坏时只读降级，不阻塞启动）。
   loadInitialPrompts();
 
+  // ── 生活工具：会话级备忘（qq_memo）与到点提醒（qq_remind） ────────────────
+  //
+  // 为什么这两样放在桥接而不是 MCP 进程里（MCP 进程只有 HTTP 代理、没有存储）：
+  //   ① 提醒必须由**宿主**在到点主动发一条消息 —— 不是等模型下次开口。MCP 进程是
+  //      DSH 的子进程，DSH 一重启就没了；桥接是常驻进程，重启后还能按
+  //      state/reminders.json 把未到期的重新挂上定时器。
+  //   ② 会话隔离只能按「令牌反查出的会话」来判，不能信模型自己填的 key。只有桥接
+  //      握有 agentToken ↔ key 的绑定（agentTokenOk），MCP 侧无法自证身份。
+  //   ③ 落盘只有一个写者，配合 atomicWriteJson 才谈得上原子写；多进程读改写会互相覆盖。
+  //
+  // 安全边界（与本文件开头「只暴露安全动作子集」一致）：
+  //   · 两个端点都在 /api/socialV2/ 下，走与 memory/diary 相同的三道闸：
+  //     令牌绑定会话 → 会话在当前模式允许范围 → 工具开关打开。
+  //   · 备忘是**纯本地**数据，不产生任何外发；提醒外发的是一条固定格式的纯文本，
+  //     仍然经过 auditAndSend（敏感信息审计、令牌脱敏、白名单复查）才发。
+  //   · 不存在「任意目标」：key 只能是 group:数字 / private:数字，且必须命中白名单。
+  const MEMO_LIMITS = Object.freeze({ perSession: 50, total: 500, maxTextLen: 500 });
+  const REMIND_LIMITS = Object.freeze({
+    perSession: 10,
+    total: 100,
+    maxTextLen: 200,
+    maxHorizonMs: 7 * 24 * 60 * 60 * 1000,
+    // 顺延上限：提醒撞上免打扰/静默时会被推迟而不是丢弃（见 requeueReminder）。
+    // 20 次 ≈ 免打扰最长 8 小时按 10 分钟一轮 + 静默模式的零星顺延，够用；
+    // 超过就说明哪里配错了（比如免打扰区间写成了全天），宁可放弃也不要无限循环。
+    maxDeferrals: 20,
+  });
+  // 重启时「已经过点但还没过多久」的提醒直接补发；超过这个宽限就丢掉，避免僵尸提醒
+  // 在几小时后突然冒出来（用户早就不记得自己设过它了）。
+  const REMIND_MISFIRE_GRACE_MS = 5 * 60 * 1000;
+
+  let memos = Object.create(null); // key -> [{ id, text, createdAt, updatedAt }]（按 updatedAt 升序）
+  let memosWritable = true;
+  let reminders = [];              // [{ id, key, text, when, dueAt, createdAt }]
+  let remindersWritable = true;
+  const reminderTimers = new Map(); // id -> Timeout
+
+  function memoTotal() {
+    let n = 0;
+    for (const list of Object.values(memos)) n += Array.isArray(list) ? list.length : 0;
+    return n;
+  }
+
+  function memoListFor(key) {
+    if (!Array.isArray(memos[key])) memos[key] = [];
+    return memos[key];
+  }
+
+  /**
+   * 读取备忘库。
+   *
+   * ENOENT（首次运行）才返回空；**其它读失败一律不当成空库**，而是置为只读并抛给调用方 ——
+   * 否则下一次保存就会把磁盘上那份真实的备忘覆盖成空。这是 src/slang-learner.js 的
+   * loadSlang 立下的规矩（那边注释里写了完整理由），这里照抄同一口径。
+   */
+  function loadMemos() {
+    let text;
+    try {
+      text = fs.readFileSync(MEMOS_FILE, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      // 与 loadSlang 同一口径：抛给调用方，由调用方降级为只读 —— 绝不能返回空库。
+      throw new Error(`备忘库读取失败（${error?.code || 'unknown'}）：${error?.message ?? error}`);
+    }
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    if (!text.trim()) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      const quarantine = `${MEMOS_FILE}.corrupt-${Date.now()}`;
+      try { fs.writeFileSync(quarantine, text, { encoding: 'utf8', mode: 0o600 }); } catch {}
+      throw new Error(`备忘库 JSON 解析失败，原文已另存为 ${quarantine}：${error?.message ?? error}`);
+    }
+    const raw = parsed && typeof parsed === 'object' ? (parsed.memos ?? parsed) : null;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error(`备忘库顶层结构异常（应为 { memos: { "group:群号": [...] } }）：${MEMOS_FILE}`);
+    }
+    let loaded = 0;
+    for (const [rawKey, list] of Object.entries(raw)) {
+      const key = canonicalV2Key(rawKey);
+      if (!key || !Array.isArray(list)) continue;
+      const clean = [];
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id ?? '').trim();
+        const body = String(item.text ?? '').trim();
+        if (!id || !body) continue;
+        clean.push({
+          id: id.slice(0, 40),
+          text: body.slice(0, MEMO_LIMITS.maxTextLen),
+          createdAt: Number(item.createdAt) || 0,
+          updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0
+        });
+      }
+      if (!clean.length) continue;
+      clean.sort((a, b) => (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt));
+      memos[key] = clean.slice(-MEMO_LIMITS.perSession);
+      loaded += memos[key].length;
+    }
+    log(`备忘库已加载：${loaded} 条，覆盖 ${Object.keys(memos).length} 个会话`);
+  }
+
+  function saveMemos() {
+    if (!memosWritable) return false;
+    try {
+      const out = { version: 1, memos: Object.create(null) };
+      for (const [key, list] of Object.entries(memos)) {
+        if (!canonicalV2Key(key) || !Array.isArray(list) || !list.length) continue;
+        out.memos[key] = list.map((m) => ({ id: m.id, text: m.text, createdAt: m.createdAt, updatedAt: m.updatedAt }));
+      }
+      atomicWriteJson(MEMOS_FILE, out);
+      return true;
+    } catch (error) {
+      log('保存备忘库失败:', error?.message ?? error);
+      return false;
+    }
+  }
+
+  /**
+   * 超限淘汰：先按会话上限 50 条，再按总量上限 500 条，都按「最近使用」（updatedAt）淘汰最旧的。
+   * @returns {Array} 被淘汰的条目（调用方必须把它们明确告知模型，不能静默丢数据）
+   */
+  function evictMemos(key) {
+    const evicted = [];
+    const list = memoListFor(key);
+    while (list.length > MEMO_LIMITS.perSession) evicted.push(list.shift());
+    let total = memoTotal();
+    while (total > MEMO_LIMITS.total) {
+      let oldestKey = null;
+      let oldestAt = Infinity;
+      for (const [k, l] of Object.entries(memos)) {
+        if (!Array.isArray(l) || !l.length) continue;
+        const at = Number(l[0]?.updatedAt ?? l[0]?.createdAt) || 0;
+        if (at < oldestAt) { oldestAt = at; oldestKey = k; }
+      }
+      if (!oldestKey) break;
+      evicted.push(memos[oldestKey].shift());
+      if (!memos[oldestKey].length) delete memos[oldestKey];
+      total = memoTotal();
+    }
+    return evicted.filter(Boolean);
+  }
+
+  function memoSummary(key) {
+    const list = Array.isArray(memos[key]) ? memos[key] : [];
+    const sorted = list.slice().sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+    return {
+      ok: true,
+      key,
+      count: list.length,
+      total: memoTotal(),
+      // 存储只读时必须让模型看见：否则它会把「读失败后的空视图」当成「本会话没有备忘」，
+      // 然后重新记一遍（重复内容），或者对用户说「没有这条」（事实错误）。
+      writable: memosWritable,
+      note: memosWritable ? '' : '⚠️ 备忘库上次读取失败，当前只读：这份列表可能不是全部，写入会被拒绝。',
+      limits: { perSession: MEMO_LIMITS.perSession, total: MEMO_LIMITS.total, maxTextLen: MEMO_LIMITS.maxTextLen },
+      memos: sorted.map((m) => ({
+        id: m.id,
+        text: m.text,
+        createdAt: m.createdAt ? new Date(m.createdAt).toISOString() : null,
+        updatedAt: m.updatedAt ? new Date(m.updatedAt).toISOString() : null
+      }))
+    };
+  }
+
+  function memoSet(key, { id, text }) {
+    if (!memosWritable) return { ok: false, code: 503, error: '备忘库当前只读（上次读取失败），已拒绝写入以免覆盖磁盘数据' };
+    const body = redactKnownTokensOnly(String(text ?? '').trim());
+    if (!body) return { ok: false, code: 400, error: '备忘内容不能为空' };
+    if (body.length > MEMO_LIMITS.maxTextLen) {
+      return { ok: false, code: 400, error: `备忘内容过长（${body.length} 字，上限 ${MEMO_LIMITS.maxTextLen} 字）` };
+    }
+    const wanted = String(id ?? '').trim();
+    if (wanted && !/^[A-Za-z0-9_-]{1,40}$/.test(wanted)) {
+      return { ok: false, code: 400, error: 'id 只能由字母/数字/下划线/连字符组成（1~40 字符）' };
+    }
+    const list = memoListFor(key);
+    const now = Date.now();
+    const existing = wanted ? list.find((m) => m.id === wanted) : null;
+    let memo;
+    if (existing) {
+      existing.text = body;
+      existing.updatedAt = now;
+      memo = existing;
+    } else {
+      memo = { id: wanted || `m_${crypto.randomBytes(4).toString('hex')}`, text: body, createdAt: now, updatedAt: now };
+      list.push(memo);
+    }
+    list.sort((a, b) => (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt));
+    const evicted = evictMemos(key);
+    if (!saveMemos()) {
+      return { ok: false, code: 500, error: '备忘已写入内存但落盘失败，请检查 state/memos.json 的写权限' };
+    }
+    return {
+      ok: true,
+      key,
+      memo: { id: memo.id, text: memo.text, createdAt: new Date(memo.createdAt).toISOString(), updatedAt: new Date(memo.updatedAt).toISOString() },
+      count: memoListFor(key).length,
+      total: memoTotal(),
+      limits: { perSession: MEMO_LIMITS.perSession, total: MEMO_LIMITS.total },
+      // 淘汰必须明确告知：模型以为记下了、实际被扔掉，是最容易让用户失望的静默失败。
+      evicted: evicted.map((m) => ({ id: m.id, text: m.text })),
+      note: evicted.length
+        ? `超出上限，已按最近使用淘汰 ${evicted.length} 条（${evicted.map((m) => m.id).join(', ')}）。被淘汰的内容不会自动恢复。`
+        : ''
+    };
+  }
+
+  function memoDelete(key, id) {
+    if (!memosWritable) return { ok: false, code: 503, error: '备忘库当前只读（上次读取失败），已拒绝写入' };
+    const wanted = String(id ?? '').trim();
+    if (!wanted) return { ok: false, code: 400, error: 'id 不能为空' };
+    const list = memoListFor(key);
+    const idx = list.findIndex((m) => m.id === wanted);
+    if (idx < 0) return { ok: false, code: 404, error: `本会话没有 id=${wanted} 的备忘` };
+    const removed = list.splice(idx, 1)[0];
+    if (!list.length) delete memos[key];
+    if (!saveMemos()) return { ok: false, code: 500, error: '备忘已从内存删除但落盘失败，请检查 state/memos.json 的写权限' };
+    return { ok: true, key, deleted: { id: removed.id, text: removed.text }, count: memoListFor(key).length, total: memoTotal() };
+  }
+
+  // ── 提醒：时间解析 ───────────────────────────────────────────────────────
+  //
+  // 支持的格式（工具描述里逐条写清，模型照此填）：
+  //   · 相对：30m / 2h / 45s / 1d / 1h30m（s=秒、m=分、h=时、d=天，可组合）
+  //   · 当天/次日：今天21点 / 明天9点 / 明天 9:30 / 后天8点 / 9点（今天已过则顺延到明天）
+  //   · 绝对：2026-11-05 09:30（本机本地时间，不带时区）
+  // 为什么解析放在桥接：时间基准必须与「真正发消息的那一刻」同一个时钟；
+  // 由 MCP 侧算好 dueAt 传过来，多一层时钟/时区口径就多一处对不上的可能。
+  function parseReminderTime(when, now = Date.now()) {
+    const raw = String(when ?? '').trim();
+    if (!raw) return { ok: false, error: 'when 不能为空（例：30m、2h、明天9点、2026-11-05 09:30）' };
+    if (raw.length > 40) return { ok: false, error: 'when 过长（上限 40 字符）' };
+    const absolute = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})$/.exec(raw);
+    if (absolute) {
+      const [, y, mo, d, hh, mm] = absolute;
+      const month = Number(mo);
+      const day = Number(d);
+      const hour = Number(hh);
+      const minute = Number(mm);
+      // Date 构造函数会把 13 月 / 32 日「进位」成别的日期，必须自己先拒，
+      // 否则 2026-13-01 会静默变成 2027-01-01（用户看到的时间凭空错一年）。
+      if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) {
+        return { ok: false, error: `时间不合法：${raw}（月 1-12、日 1-31、小时 0-23、分钟 0-59）` };
+      }
+      const dueAt = new Date(Number(y), month - 1, day, hour, minute, 0, 0).getTime();
+      if (!Number.isFinite(dueAt)) return { ok: false, error: `无法解析时间：${raw}` };
+      return { ok: true, dueAt, normalized: raw };
+    }
+    const dayTime = /^(今天|今日|明天|明日|后天)?\s*(\d{1,2})\s*[点时]\s*(?:(\d{1,2})\s*分?)?$/.exec(raw);
+    if (dayTime) {
+      const word = dayTime[1] || '';
+      const hour = Number(dayTime[2]);
+      const minute = Number(dayTime[3] || 0);
+      if (hour > 23 || minute > 59) return { ok: false, error: `时间不合法：${raw}（小时 0-23、分钟 0-59）` };
+      const base = new Date(now);
+      const dayOffset = word === '明天' || word === '明日' ? 1 : word === '后天' ? 2 : 0;
+      const make = (offset) => new Date(base.getFullYear(), base.getMonth(), base.getDate() + offset, hour, minute, 0, 0).getTime();
+      const dueAt = make(dayOffset);
+      // 没写「今天/明天」且那个点已经过了（留 1 分钟余量）→ 顺延到明天。
+      if (!word && dueAt <= now + 60 * 1000) return { ok: true, dueAt: make(1), normalized: `${raw}（已顺延到明天）` };
+      return { ok: true, dueAt, normalized: raw };
+    }
+    const rel = /^(?:(\d+)\s*(?:d|天))?(?:(\d+)\s*(?:h|小时|时))?(?:(\d+)\s*(?:m|分钟|分))?(?:(\d+)\s*(?:s|秒))?$/i.exec(raw);
+    if (rel && rel.slice(1).some((v) => v !== undefined)) {
+      const [, d, h, m, s] = rel;
+      const ms = (Number(d || 0) * 86400 + Number(h || 0) * 3600 + Number(m || 0) * 60 + Number(s || 0)) * 1000;
+      if (!ms) return { ok: false, error: '提醒时间不能是 0（例：30m、2h）' };
+      return { ok: true, dueAt: now + ms, normalized: raw };
+    }
+    return { ok: false, error: `看不懂的时间格式：${raw}。支持 30m / 2h / 45s / 1d / 1h30m、今天21点 / 明天9点 / 后天8点 / 9点、以及 2026-11-05 09:30` };
+  }
+
+  function reminderSummary(key) {
+    const mine = reminders.filter((r) => r.key === key).sort((a, b) => a.dueAt - b.dueAt);
+    const now = Date.now();
+    return {
+      ok: true,
+      key,
+      count: mine.length,
+      total: reminders.length,
+      writable: remindersWritable,
+      note: remindersWritable ? '' : '⚠️ 提醒库上次读取失败，当前只读：这份列表可能不是全部，新建/取消都会被拒绝。',
+      limits: { perSession: REMIND_LIMITS.perSession, total: REMIND_LIMITS.total, maxTextLen: REMIND_LIMITS.maxTextLen, maxHorizonDays: 7 },
+      reminders: mine.map((r) => ({
+        id: r.id,
+        text: r.text,
+        when: r.when,
+        dueAt: r.dueAt,
+        dueAtIso: new Date(r.dueAt).toISOString(),
+        dueInMs: Math.max(0, r.dueAt - now),
+        createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : null
+      }))
+    };
+  }
+
+  function saveReminders() {
+    if (!remindersWritable) return false;
+    try {
+      atomicWriteJson(REMINDERS_FILE, { version: 1, reminders });
+      return true;
+    } catch (error) {
+      log('保存提醒失败:', error?.message ?? error);
+      return false;
+    }
+  }
+
+  /**
+   * 到点发送。**只做一次，永不重试**：
+   *   · 先把这条从内存与磁盘里摘掉再发（at-most-once）——发到一半进程崩了，
+   *     重启后也不会重复轰炸；
+   *   · 失败只记一行日志（sendToQQ 内部已吞掉网络错误并打日志），不排下一次；
+   *   · 会话已经不在白名单/模式里、或处于静默模式时，直接丢弃并记日志。
+   */
+  async function fireReminder(id) {
+    const idx = reminders.findIndex((r) => r.id === id);
+    if (idx < 0) return;
+    const reminder = reminders.splice(idx, 1)[0];
+    reminderTimers.delete(id);
+    saveReminders();
+    const key = reminder.key;
+    const lateMs = Date.now() - Number(reminder.dueAt || 0);
+    if (!isSessionAllowedInCurrentMode(key)) {
+      log(`⏰ 提醒未发送：会话 ${key} 已不在当前模式/白名单允许范围内（已丢弃）`);
+      appendActivity(`${key} 到点提醒因会话不再被允许而丢弃`);
+      return;
+    }
+    if (shouldBlockSilentReply(key)) {
+      // 静默是操作者**主动**要求的安静，不是用户丢掉提醒的意愿。直接丢弃会让
+      // 「我让他 9 点提醒我」永久失效且用户不知道；顺延只是晚一点说，语义还在。
+      // 顺延用 10 分钟一轮的复查，解除静默后立刻发（不按免打扰算）。
+      log(`⏰ 提醒撞上静默模式（${key}），顺延 10 分钟后再试，不丢弃`);
+      appendActivity(`${key} 到点提醒因静默模式顺延`);
+      requeueReminder(reminder, Date.now() + 10 * 60 * 1000);
+      return;
+    }
+    const quietLeft = quietMillisLeft(cfg.socialV2?.proactive?.quietRanges, new Date());
+    if (quietLeft > 0) {
+      // 免打扰时段（当前配置 22:00–06:30 与 12:50–13:50）是睡眠/午休。
+      // 原先「按用户指定时间照常发」——但用户说的是「9 点叫我」，不是「凌晨 3 点叫我」，
+      // 真在夜里响会把人吵醒，而提醒本身没重要到那个程度。
+      // 改为顺延到免打扰结束：仍然会发，只是落在可打扰的时段。
+      const resumeAt = Date.now() + quietLeft;
+      const clock = new Date(resumeAt);
+      log(`⏰ 提醒落在免打扰时段（${key}），顺延到 ${String(clock.getHours()).padStart(2, '0')}:${String(clock.getMinutes()).padStart(2, '0')} 发送`);
+      appendActivity(`${key} 到点提醒撞上免打扰，顺延至免打扰结束`);
+      requeueReminder(reminder, resumeAt);
+      return;
+    }
+    try {
+      const delivered = await auditAndSend(key, `⏰ 提醒：${reminder.text}`);
+      if (!delivered) {
+        log(`⏰ 提醒被安全策略拦截（${key}），已丢弃不重试`);
+        return;
+      }
+      if (!lastSendSucceeded(key)) {
+        log(`⏰ 提醒发送失败（${key}），已丢弃不重试：${reminder.text.slice(0, 40)}`);
+        return;
+      }
+      // 让 AI 自己也知道「我发过这条提醒」。提醒文本不是模型发言时生成的，不会自动进它的
+      // 对话上下文；不记进 recentMessages 的话，用户回一句「谢谢」它会一脸茫然，甚至把这条
+      // 当成别人说的话。同时刷新 lastAiReplyAt：否则主动搭话逻辑会以为它刚没说过话，
+      // 可能紧接着又主动开一个话题（提醒 + 主动搭话连发，很吵）。
+      if (currentMode === 'reserved2') {
+        try {
+          const st = getSocialV2State(key);
+          const line = `⏰ 提醒：${reminder.text}`;
+          st.recentMessages.push({
+            messageId: null,
+            sender: '我',
+            text: truncateText(line, 200),
+            plain: truncateText(line, 200),
+            quoteTargetIsSelf: false,
+            isOwner: true,
+            ownerLabel: '我',
+            isSelf: true,
+            media: [],
+            hasMedia: false,
+            forwardIds: [],
+            hasForward: false,
+            time: Date.now()
+          });
+          const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+          if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+          // 计入发送预算的统计口径（只记账、不设闸：提醒是用户明确要的，不该被频率上限吞掉）。
+          if (!Array.isArray(st.sendTimes)) st.sendTimes = [];
+          st.sendTimes.push(Date.now());
+          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+          st.lastAiReplyAt = Date.now();
+          st.lastActionAt = Date.now();
+          if (st.wakeConfig) st.wakeConfig.noActionCount = 0;
+          st.preSleepWaitSatisfiedAt = 0;
+          st.preSleepWaitObservedAt = 0;
+          st.preSleepWaitAccumMs = 0;
+          saveSocialV2State();
+        } catch (error) {
+          log(`⏰ 提醒已发出，但写入会话上下文失败（不影响发送本身）：${error?.message ?? error}`);
+        }
+      }
+      log(`⏰ 提醒已发送（${key}${lateMs > 60000 ? `，迟到 ${Math.round(lateMs / 1000)}s` : ''}）：${reminder.text.slice(0, 60)}`);
+      appendActivity(`${key} 到点提醒已发送：${reminder.text.slice(0, 60)}`);
+    } catch (error) {
+      log(`⏰ 提醒发送异常（${key}），已丢弃不重试：${error?.message ?? error}`);
+    }
+  }
+
+  /**
+   * 把一条**已到点但当前不该发**的提醒放回队列，改到 nextDueAt 再触发。
+   *
+   * 为什么需要它：`fireReminder` 一进来就 `splice` + `saveReminders`（at-most-once 的
+   * 前提）。所以「顺延」不能只是不清定时器——那条记录已经从内存和磁盘里摘掉了，
+   * 必须显式放回去，否则这次顺延等于静默丢弃。
+   *
+   * 顺延是**有代价**的：at-most-once 保证被放宽成 at-least-once 的那一小段窗口
+   * （放回磁盘后、下一次触发前若进程崩溃，重启会重挂，不会丢）。这正是想要的：
+   * 宁可晚点发一次，也不要用户永远收不到。
+   */
+  function requeueReminder(reminder, nextDueAt) {
+    if (!remindersWritable) {
+      log(`⏰ 提醒库只读，无法顺延 ${reminder.id}（已丢弃）`);
+      return;
+    }
+    const revived = {
+      ...reminder,
+      dueAt: Number(nextDueAt),
+      // 记录顺延次数：给「是不是哪里配错了」留一个可查的痕迹，也防止无限顺延。
+      deferred: Number(reminder.deferred || 0) + 1,
+    };
+    if (revived.deferred > REMIND_LIMITS.maxDeferrals) {
+      log(`⏰ 提醒 ${reminder.id} 已顺延 ${revived.deferred - 1} 次，超过上限，放弃`);
+      appendActivity(`${reminder.key} 提醒顺延次数超限，已放弃：${reminder.text.slice(0, 40)}`);
+      return;
+    }
+    reminders.push(revived);
+    saveReminders();
+    scheduleReminderTimer(revived);
+  }
+
+  function scheduleReminderTimer(reminder, { minDelayMs = 0 } = {}) {
+    const id = reminder.id;
+    const existing = reminderTimers.get(id);
+    if (existing) {
+      clearTimeout(existing);
+      reminderTimers.delete(id);
+    }
+    const delay = Math.max(minDelayMs, Number(reminder.dueAt) - Date.now(), 0);
+    const timer = setTimeout(() => {
+      reminderTimers.delete(id);
+      fireReminder(id).catch((error) => log(`⏰ 提醒触发异常 ${id}: ${error?.message ?? error}`));
+    }, delay);
+    // 绝不能阻止进程退出：桥接是 24/7 常驻进程，但重启/退出流程不该被几十个提醒拖住。
+    timer.unref?.();
+    reminderTimers.set(id, timer);
+  }
+
+  function addReminder(key, { when, dueAt, text }) {
+    if (!remindersWritable) return { ok: false, code: 503, error: '提醒库当前只读（上次读取失败），已拒绝写入以免覆盖磁盘数据' };
+    const body = redactKnownTokensOnly(String(text ?? '').trim());
+    if (!body) return { ok: false, code: 400, error: '提醒内容不能为空' };
+    if (body.length > REMIND_LIMITS.maxTextLen) {
+      return { ok: false, code: 400, error: `提醒内容过长（${body.length} 字，上限 ${REMIND_LIMITS.maxTextLen} 字）` };
+    }
+    const now = Date.now();
+    let due = Number(dueAt);
+    let normalized = '';
+    if (!Number.isFinite(due) || due <= 0) {
+      const parsed = parseReminderTime(when, now);
+      if (!parsed.ok) return { ok: false, code: 400, error: parsed.error };
+      due = parsed.dueAt;
+      normalized = parsed.normalized || '';
+    }
+    if (!Number.isFinite(due) || due <= now) {
+      return { ok: false, code: 400, error: '提醒时间必须晚于现在（例：30m、2h、明天9点）' };
+    }
+    if (due - now > REMIND_LIMITS.maxHorizonMs) {
+      return { ok: false, code: 400, error: `提醒最多只能安排 7 天内（你给的时间是 ${Math.ceil((due - now) / 3600000)} 小时后）` };
+    }
+    const mine = reminders.filter((r) => r.key === key);
+    if (mine.length >= REMIND_LIMITS.perSession) {
+      return { ok: false, code: 409, error: `本会话已有 ${mine.length} 条待发提醒（上限 ${REMIND_LIMITS.perSession} 条）。先删掉几条再设，或等它们发完。` };
+    }
+    if (reminders.length >= REMIND_LIMITS.total) {
+      return { ok: false, code: 409, error: `待发提醒总数已达上限 ${REMIND_LIMITS.total} 条，请先删掉一些再设。` };
+    }
+    const reminder = {
+      id: `r_${crypto.randomBytes(4).toString('hex')}`,
+      key,
+      text: body,
+      when: String(when ?? '').slice(0, 40),
+      dueAt: Math.round(due),
+      createdAt: now
+    };
+    reminders.push(reminder);
+    saveReminders();
+    scheduleReminderTimer(reminder);
+    return {
+      ok: true,
+      key,
+      reminder: {
+        id: reminder.id,
+        text: reminder.text,
+        when: reminder.when,
+        dueAt: reminder.dueAt,
+        dueAtIso: new Date(reminder.dueAt).toISOString(),
+        dueInMs: Math.max(0, reminder.dueAt - now)
+      },
+      count: mine.length + 1,
+      limits: { perSession: REMIND_LIMITS.perSession, maxTextLen: REMIND_LIMITS.maxTextLen },
+      note: normalized ? `已按「${normalized}」安排` : ''
+    };
+  }
+
+  function deleteReminder(key, id) {
+    if (!remindersWritable) return { ok: false, code: 503, error: '提醒库当前只读（上次读取失败），已拒绝写入' };
+    const wanted = String(id ?? '').trim();
+    if (!wanted) return { ok: false, code: 400, error: 'id 不能为空' };
+    const idx = reminders.findIndex((r) => r.id === wanted && r.key === key);
+    if (idx < 0) return { ok: false, code: 404, error: `本会话没有 id=${wanted} 的待发提醒` };
+    const removed = reminders.splice(idx, 1)[0];
+    const timer = reminderTimers.get(removed.id);
+    if (timer) { clearTimeout(timer); reminderTimers.delete(removed.id); }
+    saveReminders();
+    return { ok: true, key, deleted: { id: removed.id, text: removed.text, dueAt: removed.dueAt }, count: reminders.filter((r) => r.key === key).length };
+  }
+
+  /**
+   * 启动恢复：把 state/reminders.json 里未到期的重新挂上定时器。
+   *
+   * 口径与 loadMemos 一致：ENOENT 才当空库；其它读失败一律只读降级（不写回）。
+   * 已经过点的：5 分钟宽限内立刻补发（进程刚重启，用户其实还在等这条），
+   *    超过宽限的直接丢弃并记日志 —— 避免几小时前的僵尸提醒突然冒出来。
+   */
+  function loadReminders() {
+    let text;
+    try {
+      text = fs.readFileSync(REMINDERS_FILE, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw new Error(`提醒库读取失败（${error?.code || 'unknown'}）：${error?.message ?? error}`);
+    }
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    if (!text.trim()) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      const quarantine = `${REMINDERS_FILE}.corrupt-${Date.now()}`;
+      try { fs.writeFileSync(quarantine, text, { encoding: 'utf8', mode: 0o600 }); } catch {}
+      throw new Error(`提醒库 JSON 解析失败，原文已另存为 ${quarantine}：${error?.message ?? error}`);
+    }
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.reminders) ? parsed.reminders : null);
+    if (!list) {
+      throw new Error(`提醒库顶层结构异常（应为 { reminders: [...] }）：${REMINDERS_FILE}`);
+    }
+    const now = Date.now();
+    const kept = [];
+    let dropped = 0;
+    for (const item of list) {
+      const key = canonicalV2Key(item?.key);
+      const body = String(item?.text ?? '').trim();
+      const due = Number(item?.dueAt);
+      const id = String(item?.id ?? '').trim();
+      if (!key || !body || !id || !Number.isFinite(due) || due <= 0) { dropped += 1; continue; }
+      if (due < now - REMIND_MISFIRE_GRACE_MS) {
+        dropped += 1;
+        log(`⏰ 过期提醒已丢弃（${key}，原定 ${new Date(due).toISOString()}）：${body.slice(0, 40)}`);
+        continue;
+      }
+      kept.push({
+        id: id.slice(0, 40),
+        key,
+        text: body.slice(0, REMIND_LIMITS.maxTextLen),
+        when: String(item.when ?? '').slice(0, 40),
+        dueAt: Math.round(due),
+        createdAt: Number(item.createdAt) || now
+      });
+    }
+    reminders = kept.slice(0, REMIND_LIMITS.total);
+    const overflow = kept.length - reminders.length;
+    if (overflow > 0) log(`⚠️ 提醒文件条目超过上限 ${REMIND_LIMITS.total}，已忽略 ${overflow} 条`);
+    if (dropped > 0 || overflow > 0) saveReminders();
+    // 已经过点、但还在 5 分钟宽限内的一律「补发」。补发必须**错开**：重启瞬间同时冒出
+    // 十几条提醒，在群里就是一次刷屏（还会绕过正常发送节奏）。给每条加一点先后差，
+    // 会话内最多 10 条，最坏也就十来秒内发完。
+    let catchUpIndex = 0;
+    for (const reminder of reminders) {
+      if (reminder.dueAt <= Date.now()) {
+        catchUpIndex += 1;
+        scheduleReminderTimer(reminder, { minDelayMs: 500 + catchUpIndex * 1500 });
+        log(`⏰ 补发重启期间过点的提醒（${reminder.key}，第 ${catchUpIndex} 条，约 ${(500 + catchUpIndex * 1500) / 1000}s 后）`);
+      } else {
+        scheduleReminderTimer(reminder);
+      }
+    }
+    if (reminders.length) log(`提醒已恢复：${reminders.length} 条待发（丢弃 ${dropped} 条过期/非法）`);
+  }
+
+  // 两个库都在启动时加载。加载器对「文件存在但读不出来」是**抛错**的（与 loadSlang 同一口径），
+  // 这里降级为只读 + 明确日志：绝不因为一次读失败就把真实的 memos/reminders 覆盖成空。
+  try {
+    loadMemos();
+  } catch (error) {
+    memosWritable = false;
+    log(`⚠️ ${error?.message ?? error}；已暂停写入以免覆盖磁盘数据，修好后重启即可恢复`);
+  }
+  try {
+    loadReminders();
+  } catch (error) {
+    remindersWritable = false;
+    log(`⚠️ ${error?.message ?? error}；已暂停写入以免覆盖磁盘数据（未到期的提醒本次不会恢复），修好后重启即可恢复`);
+  }
+
   function isSocialEnabled() {
     return currentMode === 'reserved' && cfg.social?.enabled !== false;
   }
@@ -12674,7 +13860,10 @@ async function main() {
   // Compact persona reminder injected on non-bootstrap wakes: only the role-card
   // sections tagged persistent. Keeps the sharpest lines in context every turn
   // without re-sending the whole card (which would grow linearly with turns).
-  const PERSISTENT_ROLE_MAX_CHARS = 1400;
+  // 上限按「禁用词表 + 主人教的说话方式」的实测长度留余量：
+  // 2026-11-03 实测两者合计 1409 字符，1400 会把最后一条规则截掉。
+  // 这个数字再涨就要回头精简规则，而不是无限调高——每轮都要付这份 token。
+  const PERSISTENT_ROLE_MAX_CHARS = 1500;
   let persistentRoleCache = { key: '', text: '' };
   function currentPersistentRoleHintV2() {
     const raw = roleRawContent();
@@ -12995,9 +14184,30 @@ async function main() {
     st.preSleepWaitSatisfiedAt = 0; // 有新消息进来，之前的“沉睡前已等待/已观察”作废
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
+    // 自动会话轮换的消息计数（持久化）。只数真实来信：拍一拍与自己的发言不算。
+    noteRotationMessage(key);
     // 关系进度的**唯一**累加点：只统计真实来信。自己的发言不计数（那会奖励话痨），
     // 拍一拍也不计数（戳一下不等于聊了一句，见 appendSocialV2Poke）。
     st.relationCount = (Number(st.relationCount) || 0) + 1;
+
+    // 跨会话关系记忆：记「跟这个人的相处进度」。
+    // 只累加次数与最近时间，不落任何原文 —— 话题与气氛由定时提炼补，
+    // 这里只保证「换会话时她仍知道跟对方熟不熟」这个最基本的事实不丢。
+    // 异常一律吞掉：关系记忆是加成，不能因为它把一条正常消息处理搞挂。
+    try {
+      if (relationalMemoryEnabled()) {
+        // texts 只用于推断话题/气氛，函数内部会转成固定标签再落盘，
+        // 原文不会进入 relational-memory.json。
+        recordRelationalMessage(relationalStore, key, {
+          texts: [String(plainContent ?? textContent ?? '').slice(0, 200)],
+          label: displayLabelFor(key, sender)
+        });
+        scheduleRelationalSave();
+      }
+    } catch (error) {
+      log(`关系记忆记录失败（不影响消息）${key}:`, error?.message ?? error);
+    }
+
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
@@ -13607,10 +14817,28 @@ async function main() {
     // 【你自己的状态】【你们的关系】放在时间感前面：先让她知道"我是谁、现在几点、跟这人多熟"，
     // 再读"这条消息多旧"。顺序反了的话，模型容易先按消息年龄决定语气，把自己此刻的状态丢掉。
     const { selfLine, relationLine } = buildInnerLifeLinesSafe(key, st);
+    // 【你与这些人的相处史】：跨会话的关系记忆。
+    // 与上面的 relationLine 不重复 —— 那个只看**当前这条会话**的消息数分档，
+    // 换个会话就归零；这一段是**跨会话**的「跟每个人各聊过什么」，换会话仍然认得。
+    // 只含她自己的印象（聊过几次、常聊哪类话题、气氛），绝不含对方原话。
+    // 任何异常都降级成空串，理由同 inner-life：不能因为一段加成把回复弄丢。
+    let relationalLine = '';
+    try {
+      if (relationalMemoryEnabled()) {
+        relationalLine = renderRelationalBlock(relationalStore, key);
+        if (relationalLine) relationalLine += '\n\n';
+      }
+    } catch (error) {
+      log(`生成【相处史】失败 ${key}:`, error?.message ?? error);
+    }
     // Non-bootstrap wakes carry only the role name above; append the persistent sections.
     const persistentRoleText = roleCardBody ? '' : currentPersistentRoleHintV2();
     const persistentRoleLine = persistentRoleText ? `【人设要点·常驻】\n${persistentRoleText}\n\n` : '';
-    const base = roleLine + persistentRoleLine + identityLine + tokenLine + privilegeLine + closenessLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + selfLine + relationLine + timeSenseLine;
+    // 语气锚点：每轮都带一小段示范对话，把被上下文压缩稀释掉的语气拉回来。
+    // 依据见 tone-anchor.js 顶部（ContextEcho：~110 token 的锚点回合即可恢复，撑 20+ 轮）。
+    // 例外：bootstrap 那轮已经注入了完整人格卡，不必再叠一段示范。
+    const toneAnchorLine = (roleCardBody || cfg.toneAnchor?.enabled === false) ? '' : `${TONE_ANCHOR}\n\n`;
+    const base = roleLine + persistentRoleLine + toneAnchorLine + identityLine + tokenLine + privilegeLine + closenessLine + initialPromptLine + sendRuleLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + selfLine + relationLine + relationalLine + timeSenseLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -13642,12 +14870,15 @@ async function main() {
     // used to carry the role name, so the persona vanished on retry prompts.
     const persistentRoleText = currentPersistentRoleHintV2();
     const persistentRoleLine = persistentRoleText ? `【人设要点·常驻】\n${persistentRoleText}\n\n` : '';
+    // 收尾提醒这条路径同样补上语气锚点：它往往发生在长会话末尾，
+    // 正是语气最容易散掉的位置。
+    const toneAnchorLine = cfg.toneAnchor?.enabled === false ? '' : `${TONE_ANCHOR}\n\n`;
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${persistentRoleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${persistentRoleLine}${toneAnchorLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   async function sendWakePromptV2(key, reason) {
@@ -14690,6 +15921,9 @@ async function main() {
       // 回合正常收尾：collector 立刻释放。v2TurnStartAt 留给调用方（无行动判定要用它），
       // 调用方在 `if (ended)` 分支里用完再删。
       collectors.delete(sessionId);
+      // 自动会话轮换的轮次计数（持久化）：只在**真正结束**的回合上 +1，
+      // 重复的 turn/end 因 collector 已删除不会再被算一次。
+      noteRotationTurn(sessionId);
     } else if (event?.type === 'turn/end' && (!collector || collector.size?.() === 0)) {
       collectors.delete(sessionId);
       v2TurnStartAt.delete(sessionId);
@@ -15036,7 +16270,40 @@ async function main() {
                   // replyExpected 为 false，仍然只记日志、不发送。
                   if (replyExpected && !shouldBlockSilentReply(key)) {
                     const hasKnownTokenFb = [...KNOWN_AGENT_TOKENS].some((t) => t && plain.includes(t));
-                    if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownTokenFb)) {
+                    // 内部独白检测：AI 有时输出的不是要发给对方的话，而是它自己的复盘叙述
+                    // （「他没再接话，观察满五分钟就收尾了」）。这类文本发出去对方会看到
+                    // "bot 在跟谁汇报"，非常出戏。检测规则见 narration-guard.js。
+                    const narr = detectNarration(plain);
+                    if (narr.isNarration) {
+                      log(
+                        `[reserved2] ⏭️ 判定为内部独白，不转发 (${key}) 命中[${narr.hits.join(',')}]: ${plain.slice(0, 60)}`
+                      );
+                      appendActivity(
+                        `${key} [reserved2] 内部独白已拦截（${narr.hits.join('/')}）：${plain.slice(0, 60)}`
+                      );
+                      // 不静默丢弃：回灌一条提醒，让它下一轮正常说话。
+                      // 否则这轮就白跑了，对方什么都没收到。
+                      //
+                      // 会话 id 要从 state.sessions[key] 取，不能用 `sessionId`：
+                      // 这个作用域里没有那个变量名（2026-11-03 实测报了
+                      // `sessionId is not defined`，回灌一直失败但只留一行日志，
+                      // 于是「拦截生效了、但模型不知道自己那段被拦」—— 它会以为已经发出去了）。
+                      const nudgeSid = state.sessions[key];
+                      if (!nudgeSid) {
+                        log(`内部独白提醒无法回灌：${key} 尚未建立会话`);
+                      } else {
+                        try {
+                          await api.sessions.prompt({
+                            sessionId: nudgeSid,
+                            mode: 'queue',
+                            content: [{ type: 'text', text: NARRATION_NUDGE }]
+                          });
+                          log(`[reserved2] 已回灌内部独白提醒 (${key})`);
+                        } catch (error) {
+                          log(`内部独白提醒回灌失败（不影响主流程）: ${error?.message ?? error}`);
+                        }
+                      }
+                    } else if (shouldAuditKey(key) && (SENSITIVE_RE.test(plain) || hasKnownTokenFb)) {
                       log(`[reserved2] ⚠️ 兜底转发被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownTokenFb ? '（含会话令牌）' : ''}`);
                       appendActivity(`${key} [reserved2] 兜底转发被拦截（疑似敏感信息）`);
                     } else {
@@ -15059,6 +16326,15 @@ async function main() {
                   if (shouldBlockSilentReply(key)) {
                     log(`静默模式，拦截在途回复 (${key})`);
                     appendActivity(`${key} 静默模式，拦截在途回复`);
+                    continue;
+                  }
+                  // 非 reserved2 模式的自动转发同样要过内部独白检测：
+                  // 这个判断与发送路径无关，是「这段文本是不是说给人听」的问题。
+                  // 当前运行在 reserved2（不走这里），但模式可切换，不该留死角。
+                  const narrAuto = detectNarration(plain);
+                  if (narrAuto.isNarration) {
+                    log(`⏭️ 判定为内部独白，不转发 (${key}) 命中[${narrAuto.hits.join(',')}]: ${plain.slice(0, 60)}`);
+                    appendActivity(`${key} 内部独白已拦截（${narrAuto.hits.join('/')}）`);
                     continue;
                   }
                   log(`agent 回复 (${key}) ${plain.length} 字`);

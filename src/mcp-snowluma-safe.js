@@ -337,6 +337,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_diary_promise_close: 'diary',
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
+  qq_memo: 'memo',
+  qq_remind: 'remind',
   qq_send_voice: 'sendVoice',
   qq_list_voices: 'sendVoice',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
@@ -423,7 +425,13 @@ server.tool(
 const bootBridgeMode = (() => {
   try {
     const raw = fs.readFileSync(path.join(ROOT, 'state', 'mode.json'), 'utf8');
-    const parsed = JSON.parse(raw);
+    // 去 BOM：这个文件可能被 PowerShell 侧写过（5.1 的 Set-Content / Out-File
+    // 默认带 BOM），而 JSON.parse 遇到 BOM 会直接抛 —— 被下面的 catch 吞掉后
+    // bootBridgeMode 变成空串，于是误判成「unknown 模式」、**把 reserved2 下
+    // 本不该注册的旧只读工具（qq_list_groups / qq_get_group_history）注册出来**。
+    // 这是安全边界，不能靠「文件碰巧没有 BOM」来保证。2026-11-03 实测确实踩到过。
+    const text = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+    const parsed = JSON.parse(text);
     return String(parsed?.mode ?? '').trim();
   } catch { return ''; }
 })();
@@ -1284,6 +1292,77 @@ server.tool(
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `提交黑话失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+// ── 生活工具：会话级备忘 / 到点提醒（2026-11-03 新增）──────────────────────
+//
+// 这两个是「消息、记忆、表情」之外缺的那一类：备忘（记一条具体的事）和提醒
+// （到点**宿主主动发消息**，不是等模型下次开口）。都由桥接持久化，MCP 侧只做薄代理：
+//   · 会话隔离按令牌反查出的会话判（服务端 agentTokenOk），不信模型自己填的 key；
+//   · 备忘落 state/memos.json，提醒落 state/reminders.json（桥接单写者 + 原子写）；
+//   · 提醒的定时器在桥接进程里，重启后会自动把未到期的重新挂上（MCP 进程重启不丢）。
+server.tool(
+  'qq_memo',
+  '本会话的备忘（会话级，只有当前这个会话看得见；跨轮、重启都不丢）。'
+    + 'action=set 记一条（同 key 同 id 再写就是覆盖），action=list 列出本会话的备忘（带时间），action=delete 按 id 删。'
+    + '什么时候用：对方说「记一下/别忘了/存起来」这类具体事项，或你想在下次被唤醒时确认某件具体的东西（比 qq_memory_ 的轻量记忆更结构化、可删）。'
+    + '上限：每个会话 50 条、全库 500 条；超了会按「最近使用」淘汰最旧的，并在返回的 evicted/note 里明确告诉你被淘汰了哪几条。'
+    + 'token 必填（服务端按令牌校验这就是当前会话，别填别的会话的 key）。'
+    + '这是纯本地存储：不会发到 QQ，也不会外传。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（必须是当前会话）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    action: z.enum(['set', 'list', 'delete']).optional().describe('set=记一条（默认 list）、list=列出、delete=按 id 删除'),
+    text: z.string().optional().describe('action=set 时必填：备忘内容，最多 500 字'),
+    id: z.string().optional().describe('备忘 id：set 时可选（传了就覆盖同一条，不传自动生成）；delete 时必填（用 list 返回的 id）')
+  },
+  async ({ key, token, action, text, id }) => {
+    try {
+      const data = await agentApi('/api/socialV2/memo', {
+        method: 'POST',
+        headers: { 'x-agent-token': token },
+        body: JSON.stringify({ key, token, action: action || 'list', text, id })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `备忘操作失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_remind',
+  '到点提醒：在指定时间由宿主（桥接进程）**主动发一条消息**到当前会话，不依赖你下次被唤醒——到点就是真的发出去。'
+    + 'action=add 新建（action 省略且给了 when 也按 add 处理），action=list 看本会话待发的提醒，action=delete 按 id 取消。'
+    + 'when 支持的写法（照着填，别自己发明格式）：'
+    + '① 相对：30m / 2h / 45s / 1d / 1h30m（s=秒、m=分、h=时、d=天，可组合）；'
+    + '② 当天/次日：今天21点 / 明天9点 / 明天 9:30 / 后天8点 / 9点（没写今天明天、且这个点今天已经过了，就顺延到明天）；'
+    + '③ 绝对：2026-11-05 09:30（本机本地时间）。'
+    + '到点发出的内容固定是「⏰ 提醒：<text>」。'
+    + '上限：每个会话最多 10 条待发提醒、单条内容最多 200 字、最多只能安排到 7 天内（更远会被拒绝，避免僵尸定时器）。'
+    + '发送失败（断网、白名单被移除、静默模式）只记日志、不会无限重试，也不会等你下次开口时补发。'
+    + '什么时候用：对方明确让你「X 分钟后/明天X点提醒我」，或你们约好某个时间点。不要用它替自己排「待会儿要不要说话」——那是唤醒配置的事。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（提醒会发回这个会话）'),
+    token: z.string().min(1).describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    action: z.enum(['add', 'list', 'delete']).optional().describe('add=新建、list=看待发提醒、delete=按 id 取消；省略时：有 when 按 add，否则按 list'),
+    when: z.string().optional().describe('action=add 时必填：提醒时间，例 30m / 2h / 明天9点 / 2026-11-05 09:30'),
+    text: z.string().optional().describe('action=add 时必填：提醒内容，最多 200 字（会原样出现在「⏰ 提醒：」后面）'),
+    id: z.string().optional().describe('action=delete 时必填：要取消的提醒 id（用 list 返回的 id）')
+  },
+  async ({ key, token, action, when, text, id }) => {
+    try {
+      const resolvedAction = action || (when ? 'add' : 'list');
+      const data = await agentApi('/api/socialV2/remind', {
+        method: 'POST',
+        headers: { 'x-agent-token': token },
+        body: JSON.stringify({ key, token, action: resolvedAction, when, text, id })
+      });
+      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `提醒操作失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

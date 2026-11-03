@@ -293,6 +293,17 @@
       "idleThresholdMs": 900000,
       "probability": 0.3
     },
+    "rotation": {
+      "enabled": true,
+      "minTurns": 150,
+      "minMessages": 600,
+      "idleMs": 1800000,
+      "checkIntervalMs": 300000,
+      "respectQuietHours": true,
+      "quietRanges": null,
+      "memoryFailureBackoffMs": 21600000,
+      "note": "自动会话轮换：某会话累计轮次≥minTurns 或累计来信≥minMessages，且距最后一条消息≥idleMs、当前没有在跑的回合、不在免打扰时段时，先把这段对话整理进日记（等它真正写完），再退役旧 DSH 会话；下一条消息会自动换新会话，避免上下文无限增长。记忆写入失败则不换（宁可不换）。quietRanges 为 null 时沿用 socialV2.proactive.quietRanges；enabled:false 完全关闭。"
+    },
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false
