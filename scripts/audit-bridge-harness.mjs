@@ -54,6 +54,14 @@ import * as vectorRecall from '../src/vector-recall.js';
 // detectNarration / NARRATION_NUDGE（没有 as 别名），同名绑定即可。
 // 纯字符串规则判断，不碰网络/文件，接真实现。
 import * as narrationGuard from '../src/narration-guard.js';
+// 原文库（SQLite + FTS5 trigram）：bridge.js 顶层按原名导入 5 个函数。
+// ⚠️ 这里**必须打桩**，不能接真实现：真实现会 fs 打开/创建 state/memory/messages.sqlite，
+// 而 harness 每次给的是临时 state 目录 —— 接真的会给每个用例造一个 SQLite 库
+// （含 -wal/-shm 三个文件），既拖慢测试，也会让「临时目录清理」在 Windows 上
+// 因句柄未释放而 EPERM。原文库是纯本地存储，测试里没有「必须验证真实落盘」的用例
+// （存储层本身由 scripts/test-memory-store.mjs 直接测），所以桩掉是对的。
+// 需要真实验证原文库的用例，用 globals 覆盖（同 processAudioVolume 的约定）。
+import * as memoryStore from '../src/memory-store.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 
@@ -368,6 +376,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 驱动「先写记忆再退役」这条链路（学习会话的 turn 结束信号只在 pumpMux 里发出）。
     // 只影响 harness，不影响线上执行路径。
     maybeRotateSession, sweepSessionRotation, buildRotationStatus, runDiaryWrite, learnerWaiters,
+    // 原文库（2026-11-03）：同样是 main() 内的闭包。测试要验证「消息真的进了缓冲、
+    // flush 真的落到 store、检索端点真的按会话过滤」，必须在 VM 里拿到这几个。
+    // 注意：memory-store 的**函数**在本文件里是桩，但 recordMemoryMessage / flushMemoryBuffer
+    // 是 bridge 侧的闭包逻辑（缓冲、批量、上限），它们会调到桩上 —— 所以测试可以用
+    // globals 覆盖 openMemoryStore/appendMessages/searchMessages 来观察真实调用。
+    recordMemoryMessage, flushMemoryBuffer, getMemoryStore, memoryBuffer, memoryStoreConfig,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
     setMode(value) { currentMode = value; },
@@ -577,6 +591,21 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     sniffImage: mediaNormalize.sniffImage,
     planNormalization: mediaNormalize.planNormalization,
     planAnimation: mediaNormalize.planAnimation,
+    // ── 原文库（memory-store.js）——全部打桩 ────────────────────────────────
+    // bridge.js 顶层按**原名**导入这 5 个（openMemoryStore / appendMessages /
+    // searchMessages / countMessages / pruneMessages），同名绑定即可。
+    // 桩的理由见文件头 import 处的注释：接真实现会给每个用例造一个 SQLite 库，
+    // 并在 Windows 上留下未释放的句柄让临时目录删不掉。
+    //   · openMemoryStore 返回一个假 store（truthy 即可，让 getMemoryStore 认为成功）；
+    //   · appendMessages / pruneMessages 记为 no-op；
+    //   · searchMessages 返回空数组（原文库在测试里没有数据）；
+    //   · countMessages 返回 0。
+    // 需要真实行为的用例用 globals 覆盖这几个名字。
+    openMemoryStore: () => ({ __stub: true, close: () => {} }),
+    appendMessages: () => ({ inserted: 0, skipped: 0 }),
+    searchMessages: () => [],
+    countMessages: () => 0,
+    pruneMessages: () => 0,
     // 向量召回：bridge.js 顶层是**别名**导入（`setLogger as setVectorLogger`、
     // `configure as configureVector` …）。所以这里必须按别名逐个绑定，不能展开：
     // 展开注入的是 setLogger / configure / status 这些通用名，既对不上 bridge.js
