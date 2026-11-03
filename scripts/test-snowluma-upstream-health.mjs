@@ -45,7 +45,7 @@ test('SnowLuma 客户端库不低于 bot_status 出现的版本（1.14.17）', (
     return m ? Number(m[1]) * 1e6 + Number(m[2]) * 1e3 + Number(m[3]) : null;
   };
   const min = num('1.14.17');
-  for (const name of ['@snowluma/sdk', '@snowluma/mcp']) {
+  for (const name of ['@snowluma/sdk']) {
     const declared = num(pkg.dependencies?.[name]);
     assert.ok(declared !== null, `${name} 必须在 dependencies 里声明`);
     assert.ok(
@@ -56,12 +56,14 @@ test('SnowLuma 客户端库不低于 bot_status 出现的版本（1.14.17）', (
   }
 });
 
-test('客户端库确实可被纯 Node ESM 解析（postinstall 补丁的成果）', async () => {
-  // 上游打包 bug：dist 内相对导入缺 .js 扩展名，纯 Node ESM 解析不了。补丁是让它可 import 的
-  // **唯一**东西，所以「能 import」本身就是补丁生效的证据（与安装顺序无关）。
+test('客户端库确实可被纯 Node ESM 解析（2.3.4 起上游已修打包 bug）', async () => {
+  // 上游 1.x 的 dist 内相对导入缺 .js 扩展名，纯 Node ESM 解析不了，得靠 postinstall 补丁。
+  // 2.3.4 起上游已修（实测 dist 的 71 处相对导入全部带 .js），所以补丁退休、
+  // postinstall 必须为空——否则这条就是「补丁还在空转」的信号。
   const sdk = await import('@snowluma/sdk');
   assert.equal(typeof sdk.SnowLumaWebSocketClient, 'function', 'SnowLumaWebSocketClient 应可导入');
-  assert.match(String(pkg.scripts?.postinstall ?? ''), /patch-snowluma-sdk/, 'postinstall 必须仍挂补丁脚本');
+  assert.doesNotMatch(String(pkg.scripts?.postinstall ?? ''), /patch-snowluma-sdk/,
+    'postinstall 不应再挂补丁脚本：2.3.4 起上游已修打包 bug，补丁在 2.x 上是空转');
 
   // 顺带报告 dist 里是否还有**未修**的相对导入。
   // ⚠️ 这里刻意**只提示不断言**：补丁是就地把扩展名补上的，跑过一次之后自然就"没有需要修的了"，

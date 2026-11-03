@@ -73,7 +73,9 @@ ok('无真实隐私进注入', leaked.length === 0, leaked.join(','));
 console.log('\n=== 6. 整理会话：他人日记必须与主人记忆物理分开 ===');
 // 这是"草稿纸同一张"那类泄漏：文件分开了，但生成内容时上下文串了人。
 // sessions.prompt 是往同一个 sessionId 排队，上下文累积 —— 共用会话等于共用上下文。
-const diaryFn = src.match(/async function runDiaryWrite\(key\) \{[\s\S]*?\n  \}/);
+// 参数表不要钉死在「只有 key」：并发改动把签名扩成了 runDiaryWrite(key, opts = {})，
+// 这条正则原本只认 runDiaryWrite(key)，于是测试红在「有没有这个函数」而不是隐私逻辑本身。
+const diaryFn = src.match(/async function runDiaryWrite\(key[^)]*\) \{[\s\S]*?\n  \}/);
 ok('runDiaryWrite 存在', Boolean(diaryFn), diaryFn ? '' : '没找到');
 if (diaryFn) {
   ok('按归属选会话（含三元分支）',
